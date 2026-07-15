@@ -1,0 +1,25 @@
+[project]
+name = "quantum-chat"
+version = "3.1.0"
+description = "Single-file post-quantum end-to-end encrypted peer-to-peer chat with a browser UI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "cryptography>=42.0.0",
+  "websockets>=12.0",
+  "pqcrypto>=0.3.0",
+]
+
+[project.scripts]
+quantum-chat = "chat:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
