@@ -116,6 +116,53 @@ def safe_filename(filename: Any) -> str:
     return name or "download.bin"
 
 
+def safe_content_type(value: Any, filename: str = "") -> str:
+    content_type = str(value or "").split(";", 1)[0].strip().lower()
+    if (not content_type or len(content_type) > 100
+            or not re.fullmatch(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*", content_type)):
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return content_type
+
+
+def files_dir_for_db(db_path: str) -> Path:
+    """Return a node-local attachment root while preserving the legacy default."""
+    return Path(FILES_DIR) if db_path == DB_FILE else Path(f"{Path(db_path)}.files")
+
+
+def parse_http_range(value: str, size: int) -> Optional[Tuple[int, int]]:
+    """Parse one RFC 7233 byte range and return inclusive offsets.
+
+    Multiple ranges are intentionally unsupported because media elements only
+    need a single range and multipart responses would add substantial surface
+    area to the local file server.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if size < 0 or not value.startswith("bytes=") or "," in value:
+        raise ValueError("Invalid byte range")
+    spec = value[6:].strip()
+    if "-" not in spec:
+        raise ValueError("Invalid byte range")
+    start_text, end_text = spec.split("-", 1)
+    try:
+        if not start_text:
+            suffix = int(end_text)
+            if suffix <= 0 or size == 0:
+                raise ValueError("Unsatisfiable byte range")
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+            if start < 0 or start >= size or end < start:
+                raise ValueError("Unsatisfiable byte range")
+            end = min(end, size - 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid byte range") from exc
+    return start, end
+
+
 def utc_ts() -> int:
     return int(time.time())
 
@@ -514,6 +561,7 @@ class Database:
                     sha256 TEXT NOT NULL,
                     storage_path TEXT NOT NULL,
                     uploaded_at INTEGER NOT NULL,
+                    mime_type TEXT,
                     file_nonce BLOB,
                     key_version INTEGER NOT NULL DEFAULT 0
                 );
@@ -597,7 +645,8 @@ class Database:
             "group_members": [("role", "TEXT NOT NULL DEFAULT 'member'")],
             "messages": [("status", "TEXT NOT NULL DEFAULT 'sent'"), ("body_nonce", "BLOB"),
                          ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("read_at", "INTEGER")],
-            "files": [("file_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
+            "files": [("file_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0"),
+                      ("mime_type", "TEXT")],
             "file_chunks": [("chunk_nonce", "BLOB")],
             "friends": [("unread", "INTEGER NOT NULL DEFAULT 0"),
                         ("verified", "INTEGER NOT NULL DEFAULT 0"),
@@ -1100,7 +1149,8 @@ class Database:
 
     def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str,
                   path: str, recipient: Optional[str] = None, group_id: Optional[str] = None,
-                  file_nonce: Optional[bytes] = None, replace: bool = False) -> bool:
+                  file_nonce: Optional[bytes] = None, replace: bool = False,
+                  mime_type: Optional[str] = None) -> bool:
         file_id = validate_file_id(file_id)
         filename = safe_filename(filename)
         sql = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
@@ -1108,10 +1158,11 @@ class Database:
             cur = self.conn.execute(
                 f"{sql} INTO files "
                 "(file_id, filename, sender_pubkey, recipient_pubkey, group_id, "
-                "size, sha256, storage_path, uploaded_at, file_nonce, key_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "size, sha256, storage_path, uploaded_at, file_nonce, key_version, mime_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (file_id, filename, sender, recipient, group_id, size, sha256, path,
-                 utc_ts(), file_nonce, 1 if file_nonce else 0),
+                 utc_ts(), file_nonce, 1 if file_nonce else 0,
+                 safe_content_type(mime_type, filename)),
             )
             self.conn.commit()
             return cur.rowcount > 0
@@ -1219,6 +1270,10 @@ class QuantumNode:
                  direct_url: Optional[str] = None, enable_direct: bool = True,
                  max_storage_bytes: int = DEFAULT_MAX_STORAGE_MB * 1024 * 1024) -> None:
         self.crypto = QuantumCrypto()
+        # Separate nodes commonly run from one checkout during local testing.
+        # Giving every custom database its own file root prevents one node from
+        # overwriting another node's encrypted copy of the same transfer.
+        self.files_dir = files_dir_for_db(db_path)
         self.local_master_key = LocalKeyStore(db_path).load_or_create()
         self.db = Database(db_path, master_key=self.local_master_key)
         identity = self.db.load_identity()
@@ -1284,6 +1339,22 @@ class QuantumNode:
             m["read_at"] = read_receipts.get(m["msg_id"])
         return msgs
 
+    def _public_file(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the stable, non-sensitive file shape consumed by the UI."""
+        return {
+            "file_id": row["file_id"],
+            "filename": row["filename"],
+            "sender_pubkey": row["sender_pubkey"],
+            "recipient_pubkey": row.get("recipient_pubkey"),
+            "group_id": row.get("group_id"),
+            "size": int(row["size"]),
+            "sha256": row["sha256"],
+            "mime_type": safe_content_type(row.get("mime_type"), row["filename"]),
+            "uploaded_at": int(row["uploaded_at"]),
+            "direction": "out" if row["sender_pubkey"] == self.public_key else "in",
+            "url": f"/files/{row['file_id']}",
+        }
+
     def state_payload(self) -> Dict[str, Any]:
         msgs = self._with_message_metadata(self.db.recent_messages())
         has_more = bool(msgs) and self.db.has_messages_before(msgs[0]["id"])
@@ -1299,7 +1370,7 @@ class QuantumNode:
             "groups": self.db.group_details_for(self.public_key),
             "messages": msgs,
             "has_more_messages": has_more,
-            "files": self.db.recent_files(),
+            "files": [QuantumNode._public_file(self, f) for f in self.db.recent_files()],
             "sessions": self.db.session_summary(),
             "storage_bytes": self._storage_bytes_used(),
             "max_storage_bytes": self.max_storage_bytes,
@@ -1414,7 +1485,9 @@ class QuantumNode:
         never been initialized (e.g. upgrading from an older database)."""
         metrics = self.db.metrics()
         if "storage_bytes" not in metrics:
-            total = sum(p.stat().st_size for p in Path(FILES_DIR).glob("**/*") if p.is_file()) if Path(FILES_DIR).exists() else 0
+            files_dir = getattr(self, "files_dir", Path(FILES_DIR))
+            total = (sum(p.stat().st_size for p in files_dir.glob("**/*") if p.is_file())
+                     if files_dir.exists() else 0)
             self.db.metric_inc("storage_bytes", total)
             return total
         return metrics["storage_bytes"]
@@ -1899,14 +1972,16 @@ class QuantumNode:
             "delivered": int(actually_sent > 0), "status": "sent_to_group", "reactions": [], "read_at": None,
         }})
 
-    async def send_group_file(self, group_id: str, filename: str, encoded: str) -> None:
+    async def send_group_file(self, group_id: str, filename: str, encoded: str,
+                              content_type: Optional[str] = None) -> None:
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
         sent = 0
         for peer in members - {self.public_key}:
             if self.db.is_friend(peer):
-                await self.send_file(peer, filename, encoded, group_id=group_id)
+                await self.send_file(peer, filename, encoded, group_id=group_id,
+                                     content_type=content_type)
                 sent += 1
         if not sent:
             raise ValueError("No group members with active friend records available")
@@ -1914,7 +1989,8 @@ class QuantumNode:
     # ── File transfer ─────────────────────────────────────────────────────────
 
     async def send_file(self, peer_pubkey: str, filename: str, encoded: str,
-                        group_id: Optional[str] = None) -> None:
+                        group_id: Optional[str] = None,
+                        content_type: Optional[str] = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         raw = b64d(encoded)
         if len(raw) > MAX_FILE_BYTES:
@@ -1923,18 +1999,20 @@ class QuantumNode:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         file_id = str(uuid.uuid4())
         safe_name = safe_filename(filename)
+        mime_type = safe_content_type(content_type, safe_name)
         sha = hashlib.sha256(raw).hexdigest()
-        Path(FILES_DIR).mkdir(exist_ok=True)
-        storage = str(Path(FILES_DIR) / file_id)
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        storage = str(self.files_dir / file_id)
         stored, file_nonce = self.encrypt_for_disk(raw, file_id)
         Path(storage).write_bytes(stored)
         self.db.save_file(file_id, safe_name, self.public_key, len(raw), sha, storage,
                           recipient=peer_pubkey, group_id=group_id,
-                          file_nonce=file_nonce, replace=False)
+                          file_nonce=file_nonce, replace=False, mime_type=mime_type)
         self._track_storage(len(stored))
         total_chunks = max(1, (len(raw) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES)
         manifest = {"file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
                     "from": self.public_key, "to": peer_pubkey, "group_id": group_id,
+                    "mime_type": mime_type,
                     "total_chunks": total_chunks, "chunk_size": MAX_CHUNK_BYTES, "sent_at": utc_ts()}
         await self.send_relay(peer_pubkey, self.signed_payload("file_manifest", manifest), queue_on_failure=True)
         for idx in range(total_chunks):
@@ -1945,9 +2023,10 @@ class QuantumNode:
             msg_key = self.crypto.derive_message_key(session_key, self.public_key, peer_pubkey, counter, "file-chunk")
             packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
             await self.send_relay(peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet}, queue_on_failure=True)
+        saved_file = self.db.get_file(file_id)
         await self.broadcast_ui({
             "type": "file",
-            "file": {**manifest, "direction": "out", "url": f"/files/{file_id}"},
+            "file": self._public_file(saved_file) if saved_file else {},
             "storage_bytes": self._storage_bytes_used(),
         })
 
@@ -1971,9 +2050,16 @@ class QuantumNode:
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
             raise ValueError("File manifest routing mismatch")
         validate_file_id(meta.get("file_id", ""))
-        if int(meta.get("size", 0)) > MAX_FILE_BYTES:
+        size = int(meta.get("size", -1))
+        total_chunks = int(meta.get("total_chunks", 0))
+        expected_chunks = max(1, (size + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES) if size >= 0 else 0
+        if size < 0 or size > MAX_FILE_BYTES:
             raise ValueError("File exceeds configured limit")
-        self._check_storage_quota(int(meta.get("size", 0)))
+        if total_chunks != expected_chunks or int(meta.get("chunk_size", 0)) != MAX_CHUNK_BYTES:
+            raise ValueError("Invalid file manifest chunk layout")
+        safe_filename(meta.get("filename"))
+        safe_content_type(meta.get("mime_type"), str(meta.get("filename") or ""))
+        self._check_storage_quota(size)
         self.db.metric_inc("file_manifests_received")
 
     async def handle_file_chunk(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
@@ -1990,19 +2076,31 @@ class QuantumNode:
             raise ValueError("File chunk checksum mismatch")
         total_chunks = int(meta.get("total_chunks", 1))
         chunk_index = int(meta.get("chunk_index", 0))
-        if chunk_index < 0 or chunk_index >= total_chunks:
+        declared_size = int(meta.get("size", -1))
+        expected_chunks = max(1, (declared_size + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES) if declared_size >= 0 else 0
+        if (declared_size < 0 or declared_size > MAX_FILE_BYTES
+                or total_chunks != expected_chunks
+                or int(meta.get("chunk_size", 0)) != MAX_CHUNK_BYTES
+                or chunk_index < 0 or chunk_index >= total_chunks):
             raise ValueError("Invalid file chunk index")
+        expected_size = (0 if declared_size == 0 else
+                         min(MAX_CHUNK_BYTES, declared_size - chunk_index * MAX_CHUNK_BYTES))
+        if len(chunk) != expected_size:
+            raise ValueError("File chunk size mismatch")
         self._check_storage_quota(len(chunk))
-        Path(FILES_DIR).mkdir(exist_ok=True)
-        chunk_dir = Path(FILES_DIR) / f"{file_id}.chunks"
-        chunk_dir.mkdir(exist_ok=True)
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        chunk_dir = self.files_dir / f"{file_id}.chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
         chunk_path = chunk_dir / str(chunk_index)
         # Chunks are encrypted at rest immediately, the same as a finished
         # file — they sit on disk mid-transfer and must not be recoverable
         # in plaintext from a stolen disk image while assembly is pending.
         stored_chunk, chunk_nonce = self.encrypt_chunk_for_disk(chunk, file_id, chunk_index)
-        chunk_path.write_bytes(stored_chunk)
         if self.db.save_file_chunk(file_id, chunk_index, total_chunks, str(chunk_path), chunk_nonce):
+            # Only the first accepted delivery writes the path. A duplicate
+            # chunk must not replace ciphertext while the DB still holds the
+            # original nonce, which would make final reassembly undecryptable.
+            chunk_path.write_bytes(stored_chunk)
             self._track_storage(len(stored_chunk))
         chunks = self.db.file_chunks(file_id)
         if len(chunks) == total_chunks:
@@ -2029,7 +2127,7 @@ class QuantumNode:
                 path.unlink()
             except OSError:
                 pass
-        chunk_dir = Path(FILES_DIR) / f"{file_id}.chunks"
+        chunk_dir = self.files_dir / f"{file_id}.chunks"
         try:
             chunk_dir.rmdir()
         except OSError:
@@ -2043,20 +2141,22 @@ class QuantumNode:
             raise ValueError("File exceeds configured limit")
         if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
             raise ValueError("File checksum mismatch")
-        Path(FILES_DIR).mkdir(exist_ok=True)
-        storage = str(Path(FILES_DIR) / file_id)
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        storage = str(self.files_dir / file_id)
         stored, file_nonce = self.encrypt_for_disk(raw, file_id)
         inserted = self.db.save_file(
             file_id, safe_filename(meta.get("filename") or "download.bin"),
             peer_pubkey, len(raw), meta["sha256"], storage,
             recipient=self.public_key, group_id=meta.get("group_id"),
-            file_nonce=file_nonce, replace=False
+            file_nonce=file_nonce, replace=False,
+            mime_type=safe_content_type(meta.get("mime_type"), str(meta.get("filename") or ""))
         )
         if inserted:
             Path(storage).write_bytes(stored)
             self._track_storage(len(stored))
+            saved_file = self.db.get_file(file_id)
             await self.broadcast_ui({
-                "type": "file", "file": {**meta, "file_id": file_id, "direction": "in", "url": f"/files/{file_id}"},
+                "type": "file", "file": self._public_file(saved_file) if saved_file else {},
                 "storage_bytes": self._storage_bytes_used(),
             })
 
@@ -2224,10 +2324,11 @@ class QuantumNode:
         elif typ == "send_file":
             filename = safe_filename(msg.get("filename"))
             data = str(msg.get("data", ""))
+            content_type = safe_content_type(msg.get("content_type"), filename)
             if msg.get("group_id"):
-                await self.send_group_file(str(msg["group_id"]), filename, data)
+                await self.send_group_file(str(msg["group_id"]), filename, data, content_type)
             else:
-                await self.send_file(msg["pubkey"], filename, data, msg.get("group_id"))
+                await self.send_file(msg["pubkey"], filename, data, msg.get("group_id"), content_type)
         elif typ == "create_group":
             group_id = str(uuid.uuid4())
             name = (validate_label(msg.get("name"), "Group name", MAX_GROUP_NAME_CHARS)
@@ -2580,29 +2681,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/files/"):
-            try:
-                file_id = validate_file_id(path.rsplit("/", 1)[-1])
-            except ValueError:
-                self.send_error(404, "File not found")
-                return
-            meta = self.node.db.get_file(file_id) if self.node else None
-            if not meta or not Path(meta["storage_path"]).exists():
-                self.send_error(404, "File not found")
-                return
-            ctype = mimetypes.guess_type(meta["filename"])[0] or "application/octet-stream"
-            stored = Path(meta["storage_path"]).read_bytes()
-            data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
-                    if self.node else stored)
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header(
-                "Content-Disposition",
-                f"attachment; filename*=UTF-8''{quote(meta['filename'])}"
-            )
-            self._security_headers(download=True)
-            self.end_headers()
-            self.wfile.write(data)
+            self._serve_file(parsed, head_only=False)
             return
 
         self.send_error(404)
@@ -2652,28 +2731,54 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self._security_headers()
             self.end_headers()
         elif path.startswith("/files/"):
-            # Compute the same metadata GET would, but only send headers.
-            try:
-                file_id = validate_file_id(path.rsplit("/", 1)[-1])
-            except ValueError:
-                self.send_error(404, "File not found")
-                return
-            meta = self.node.db.get_file(file_id) if self.node else None
-            if not meta or not Path(meta["storage_path"]).exists():
-                self.send_error(404, "File not found")
-                return
-            ctype = mimetypes.guess_type(meta["filename"])[0] or "application/octet-stream"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(meta["size"]))
-            self.send_header(
-                "Content-Disposition",
-                f"attachment; filename*=UTF-8''{quote(meta['filename'])}"
-            )
-            self._security_headers(download=True)
-            self.end_headers()
+            self._serve_file(parsed, head_only=True)
         else:
             self.send_error(404)
+
+    def _serve_file(self, parsed: Any, head_only: bool = False) -> None:
+        """Serve a decrypted local attachment with media-friendly ranges."""
+        try:
+            file_id = validate_file_id(parsed.path.rsplit("/", 1)[-1])
+        except ValueError:
+            self.send_error(404, "File not found")
+            return
+        meta = self.node.db.get_file(file_id) if self.node else None
+        if not meta or not Path(meta["storage_path"]).exists():
+            self.send_error(404, "File not found")
+            return
+
+        stored = Path(meta["storage_path"]).read_bytes()
+        data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
+                if self.node else stored)
+        try:
+            byte_range = parse_http_range(self.headers.get("Range", ""), len(data))
+        except ValueError:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{len(data)}")
+            self.send_header("Accept-Ranges", "bytes")
+            self._security_headers(download=True)
+            self.end_headers()
+            return
+
+        start, end = byte_range if byte_range else (0, max(0, len(data) - 1))
+        body = data[start:end + 1] if data else b""
+        inline = parse_qs(parsed.query).get("view", [""])[0] == "1"
+        ctype = safe_content_type(meta.get("mime_type"), meta["filename"])
+        self.send_response(206 if byte_range else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Accept-Ranges", "bytes")
+        if byte_range:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        disposition = "inline" if inline else "attachment"
+        self.send_header(
+            "Content-Disposition",
+            f"{disposition}; filename*=UTF-8''{quote(meta['filename'])}"
+        )
+        self._security_headers(download=not inline)
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
 
     def _security_headers(self, download: bool = False) -> None:
         connect_src = "connect-src 'self' ws://127.0.0.1:* ws://localhost:* ws://[::1]:* wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
@@ -2731,8 +2836,6 @@ HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>⚛ Quantum Chat</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-
 :root {
   --bg: #030508;
   --glass-bg: rgba(12, 18, 30, 0.65);
@@ -2763,8 +2866,8 @@ HTML = r"""<!doctype html>
   --in-bg: var(--s3);
   
   --rad: 16px;
-  --font: 'Outfit', system-ui, sans-serif;
-  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -3288,6 +3391,32 @@ body {
   transform: scale(1.02);
 }
 
+.attachment-card {
+  width: min(340px, 68vw);
+  color: var(--text1);
+}
+.attachment-preview-link { display: block; color: inherit; text-decoration: none; }
+.attachment-preview-link .msg-image { width: 100%; max-width: none; }
+.attachment-head {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding-top: 10px;
+}
+.attachment-head:first-child { padding-top: 0; }
+.attachment-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 13px; font-weight: 650;
+}
+.attachment-meta { color: var(--text3); font-size: 11px; font-family: var(--mono); }
+.attachment-download {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border: 1px solid rgba(255,255,255,.14);
+  border-radius: 8px; color: inherit; text-decoration: none; flex: 0 0 auto;
+}
+.attachment-download:hover { background: rgba(255,255,255,.1); }
+.attachment-audio { width: 100%; height: 38px; margin-top: 10px; display: block; }
+.attachment-video { width: 100%; max-height: 260px; display: block; border-radius: 8px; background: #000; }
+.msg-group.out .attachment-meta { color: rgba(255,255,255,.72); }
+
 /* Inline file-message chip (non-image files shown in the chat timeline) */
 .file-msg-chip {
   display: flex;
@@ -3547,6 +3676,16 @@ body {
   margin-top: 6px;
   font-family: var(--mono);
 }
+.transfer-status {
+  min-height: 20px; margin-top: 7px; display: flex; align-items: center; gap: 8px;
+  color: var(--text2); font-size: 11px;
+}
+.transfer-status:empty { min-height: 0; margin-top: 0; }
+.transfer-status .progress-track {
+  width: 96px; height: 4px; overflow: hidden; background: rgba(255,255,255,.1); border-radius: 2px;
+}
+.transfer-status .progress-fill { height: 100%; background: var(--accent); transition: width .15s linear; }
+.icon-btn.busy { opacity: .45; pointer-events: none; }
 
 /* ── Right panel ── */
 .panel-section {
@@ -3742,11 +3881,15 @@ body {
 .rec-indicator {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--danger); font-family: var(--mono);
-  padding: 0 4px;
+  padding: 0 24px 8px;
 }
 .rec-indicator .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--danger);
   box-shadow: 0 0 6px var(--danger); animation: pulse 1s infinite;
+}
+.rec-cancel {
+  margin-left: 8px; padding: 3px 8px; border: 1px solid rgba(255,51,102,.45);
+  border-radius: 6px; background: transparent; color: var(--danger); cursor: pointer;
 }
 
 /* ── Modal (identity backup / restore) ── */
@@ -3970,6 +4113,10 @@ body {
   .id-card { padding: 12px; }
   .id-card-head { justify-content: center; }
   .id-card-head > div:last-child { display: none; }
+  .composer { padding: 12px; }
+  .messages-wrap { padding-left: 12px; padding-right: 12px; }
+  .msg-bubble { max-width: 88%; }
+  .attachment-card { width: min(310px, 76vw); }
 }
 </style>
 </head>
@@ -4084,7 +4231,7 @@ body {
         <textarea id="text" rows="1" placeholder="Type an encrypted message…"
           oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
         <div class="composer-actions">
-          <label class="icon-btn" title="Attach file">
+          <label class="icon-btn" id="attachBtn" title="Attach file">
             📎
             <input id="fileInput" type="file" hidden onchange="sendFile()">
           </label>
@@ -4092,6 +4239,7 @@ body {
           <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send">➤</button>
         </div>
       </div>
+      <div class="transfer-status" id="transferStatus"></div>
       <div class="char-hint" id="charHint">0 / 65536</div>
     </div>
   </main>
@@ -4181,6 +4329,10 @@ let mediaRecorder = null;
 let recordedChunks = [];
 let recordStart = 0;
 let recordTimer = null;
+let recordingTarget = null;
+let discardRecording = false;
+let uploadInProgress = false;
+let pendingUploadName = '';
 let loadingMore = false;
 
 // ─── Utils ──────────────────────────────────────────────────────────────────
@@ -4232,7 +4384,38 @@ const fileIcon = name => {
   return map[ext] || '📎';
 };
 const isImage = name => /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(name||'');
-const isAudio = name => /\.(mp3|wav|ogg|flac|aac|webm|m4a)$/i.test(name||'');
+const isAudio = (name, type='') => String(type).startsWith('audio/') ||
+  /\.(mp3|wav|ogg|oga|flac|aac|m4a|opus)$/i.test(name||'') ||
+  (/^voice-message-/i.test(name||'') && /\.webm$/i.test(name||''));
+const isVideo = (name, type='') => String(type).startsWith('video/') ||
+  /\.(mp4|mov|m4v|avi|mkv|webm)$/i.test(name||'');
+const snapshotTarget = () => selectedTarget ? {...selectedTarget} : null;
+const fileViewUrl = fileId => `/files/${encodeURIComponent(fileId)}?view=1&token=${encodeURIComponent(UI_TOKEN)}`;
+const fileDownloadUrl = fileId => `/files/${encodeURIComponent(fileId)}?token=${encodeURIComponent(UI_TOKEN)}`;
+const normalizeFile = f => ({
+  ...f,
+  sender_pubkey: f.sender_pubkey || f.from || '',
+  recipient_pubkey: f.recipient_pubkey || f.to || null,
+  direction: f.direction || ((f.sender_pubkey || f.from) === state.public_key ? 'out' : 'in'),
+  uploaded_at: f.uploaded_at || f.sent_at || (Date.now()/1000|0),
+  mime_type: f.mime_type || '',
+});
+const fileMessage = raw => {
+  const f = normalizeFile(raw);
+  return {
+    msg_id: `file-${f.file_id}`,
+    sender_pubkey: f.sender_pubkey,
+    recipient_pubkey: f.recipient_pubkey,
+    group_id: f.group_id || null,
+    body: f.filename,
+    direction: f.direction,
+    timestamp: f.uploaded_at,
+    delivered: 1,
+    status: 'delivered',
+    reactions: [], read_at: 1,
+    _isFile: true, _file: f,
+  };
+};
 const avatarLetter = name => (name||'?').trim()[0].toUpperCase();
 const avatarColor = key => {
   let h = 0;
@@ -4258,14 +4441,19 @@ function setConn(connected) {
 }
 
 function send(obj) {
-  if(ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
-  else toast('UI socket not connected', 'warning');
+  if(ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify(obj)); return true; }
+    catch(_) { toast('Could not send to the local node', 'error'); return false; }
+  }
+  toast('UI socket not connected', 'warning');
+  return false;
 }
 
 // ─── Message handler ─────────────────────────────────────────────────────────
 function handle(d) {
   if(d.type === 'state') {
     state = d;
+    state.files = (state.files||[]).map(normalizeFile);
     render();
   } else if(d.type === 'friends') {
     state.friends = d.friends;
@@ -4284,6 +4472,7 @@ function handle(d) {
     toast('Backup generated — copy it somewhere safe', 'success');
   } else if(d.type === 'notice') {
     if(d.level === 'error' && loadingMore) { loadingMore = false; renderMessages(); }
+    if(d.level === 'error' && uploadInProgress) finishUpload();
     toast(d.text, d.level || 'info');
   } else if(d.type === 'message') {
     state.messages.push(d.message);
@@ -4304,50 +4493,23 @@ function handle(d) {
       send({type:'clear_unread', pubkey: d.message.sender_pubkey});
     }
   } else if(d.type === 'file') {
-    state.files.unshift(d.file);
+    const file = normalizeFile(d.file);
+    state.files = [file, ...state.files.filter(f => f.file_id !== file.file_id)];
     if(d.storage_bytes !== undefined) state.storage_bytes = d.storage_bytes;
     $('statFiles').textContent = state.files.length;
     renderFiles();
     renderStorageQuota();
-    // Also push a synthetic chat message so file transfers appear inline in
-    // the conversation, with an image preview when the browser can render one.
-    // The message is tagged with _fileUrl / _imgSrc / _fileName so renderMessages
-    // can render a clickable thumbnail or a download chip instead of plain text.
-    const fileUrl = `/files/${d.file.file_id}?token=${encodeURIComponent(UI_TOKEN)}`;
-    const isImg = isImage(d.file.filename);
-    const synth = {
-      msg_id: 'file-' + d.file.file_id,
-      sender_pubkey: d.file.sender_pubkey,
-      recipient_pubkey: d.file.recipient_pubkey || (d.file.direction === 'out' ? '' : state.public_key),
-      group_id: d.file.group_id || null,
-      body: d.file.filename,
-      direction: d.file.direction,
-      timestamp: d.file.sent_at || d.file.uploaded_at || (Date.now()/1000|0),
-      delivered: 1,
-      status: 'delivered',
-      reactions: [],
-      read_at: null,
-      _isFile: true,
-      _fileName: d.file.filename,
-      _fileSize: d.file.size,
-      _fileUrl: fileUrl,
-      _imgSrc: isImg ? fileUrl : null,
-    };
-    // Avoid duplicate synth messages if the relay delivers the same file twice.
-    if(!state.messages.find(m => m.msg_id === synth.msg_id)) {
-      state.messages.push(synth);
-      // If the file arrives for the currently-open conversation, mark read.
-      const isSelected = selectedTarget &&
-        (selectedTarget.type === 'group'
-          ? synth.group_id === selectedTarget.id
-          : !synth.group_id && (synth.sender_pubkey === selectedTarget.id || synth.recipient_pubkey === selectedTarget.id));
-      if(isSelected && synth.direction === 'in') {
-        send({type:'clear_unread', pubkey: synth.sender_pubkey});
-      }
-    }
+    if(file.direction === 'out' && (!pendingUploadName || pendingUploadName === file.filename)) finishUpload();
     renderMessages();
     if(selectedTarget) scrollBottom(false);
-    toast(`${d.file.direction === 'in' ? '📥' : '📤'} ${d.file.filename}`, 'success');
+    const isSelected = selectedTarget && matchTarget(fileMessage(file));
+    if(isSelected && file.direction === 'in') send({type:'clear_unread', pubkey:file.sender_pubkey});
+    if(!isSelected && file.direction === 'in') {
+      const friend = state.friends.find(f => f.pubkey === file.sender_pubkey);
+      notify(friend?.nickname || short(file.sender_pubkey), `Sent ${file.filename}`);
+      bumpUnread(file.sender_pubkey);
+    }
+    toast(`${file.direction === 'in' ? '📥 Received' : '📤 Sent'} ${file.filename}`, 'success');
   } else if(d.type === 'typing') {
     if(d.active) {
       typing[d.peer] = Date.now();
@@ -4475,11 +4637,52 @@ function renderSidebar() {
   }
 }
 
+function renderAttachment(m) {
+  const f = m._file;
+  const viewUrl = fileViewUrl(f.file_id);
+  const downloadUrl = fileDownloadUrl(f.file_id);
+  const head = `<div class="attachment-head">
+    <span class="file-msg-icon">${fileIcon(f.filename)}</span>
+    <span style="min-width:0;flex:1">
+      <span class="attachment-name" title="${esc(f.filename)}">${esc(f.filename)}</span>
+      <span class="attachment-meta">${fmt(f.size)}</span>
+    </span>
+    <a class="attachment-download" href="${downloadUrl}" download title="Download ${esc(f.filename)}" onclick="event.stopPropagation()">↓</a>
+  </div>`;
+  if(isImage(f.filename)) {
+    return `<div class="attachment-card">
+      <a class="attachment-preview-link" href="${viewUrl}" target="_blank" rel="noopener noreferrer">
+        <img class="msg-image" src="${viewUrl}" alt="${esc(f.filename)}" loading="lazy">
+      </a>${head}</div>`;
+  }
+  if(isAudio(f.filename, f.mime_type)) {
+    return `<div class="attachment-card">${head}
+      <audio class="attachment-audio" controls preload="metadata" src="${viewUrl}">Audio playback is not supported.</audio>
+    </div>`;
+  }
+  if(isVideo(f.filename, f.mime_type)) {
+    return `<div class="attachment-card">
+      <video class="attachment-video" controls preload="metadata" src="${viewUrl}"></video>${head}
+    </div>`;
+  }
+  return `<a class="file-msg-chip" href="${downloadUrl}" download title="Download ${esc(f.filename)}">
+    <span class="file-msg-icon">${fileIcon(f.filename)}</span>
+    <span class="file-msg-text">
+      <span class="file-msg-name">${esc(f.filename)}</span>
+      <span class="file-msg-size">${fmt(f.size)} · encrypted attachment</span>
+    </span>
+    <span class="file-msg-dl">↓</span>
+  </a>`;
+}
+
 function renderMessages() {
   const el = $('messages');
   if(!selectedTarget) return;
 
-  const msgs = (state.messages||[]).filter(m => matchTarget(m));
+  const msgs = [
+    ...(state.messages||[]),
+    ...(state.files||[]).map(fileMessage),
+  ].filter(m => matchTarget(m)).sort((a,b) => (a.timestamp-b.timestamp) || String(a.msg_id).localeCompare(String(b.msg_id)));
   const loadMoreHtml = state.has_more_messages
     ? `<div class="load-more-row"><button class="load-more-btn" onclick="loadMore()" ${loadingMore?'disabled':''}>${loadingMore?'Loading…':'Load older messages'}</button></div>`
     : '';
@@ -4517,31 +4720,10 @@ function renderMessages() {
       `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(m.recipient_pubkey||m.sender_pubkey)}','${emoji}')">${emoji} ${info.count}</span>`
     ).join('');
 
-    // Image body / file chip / text body
-    let bodyHtml;
-    if(m._imgSrc) {
-      // Inline image preview (sent or received). Clicking opens the file URL
-      // in a new tab so the user can save or zoom it.
-      bodyHtml = `<img class="msg-image" src="${esc(m._imgSrc)}" onclick="window.open(this.src)" loading="lazy">`;
-    } else if(m._isFile) {
-      // Non-image file transfer rendered as a clickable chip with icon,
-      // filename, size, and a download link.
-      const icon = fileIcon(m._fileName);
-      const sizeStr = m._fileSize !== undefined ? fmt(m._fileSize) : '';
-      bodyHtml = `<a class="file-msg-chip" href="${esc(m._fileUrl)}" download title="Download ${esc(m._fileName)}">
-        <span class="file-msg-icon">${icon}</span>
-        <span class="file-msg-text">
-          <span class="file-msg-name">${esc(m._fileName)}</span>
-          <span class="file-msg-size">${sizeStr} · click to download</span>
-        </span>
-        <span class="file-msg-dl">⬇</span>
-      </a>`;
-    } else {
-      bodyHtml = `<span>${linkify(esc(m.body))}</span>`;
-    }
+    const bodyHtml = m._isFile ? renderAttachment(m) : `<span>${linkify(esc(m.body))}</span>`;
 
     // Reaction bar
-    const reactionBar = `<div class="reaction-bar">
+    const reactionBar = m._isFile ? '' : `<div class="reaction-bar">
       ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(isOut?m.recipient_pubkey:m.sender_pubkey)}','${e}')">${e}</button>`).join('')}
     </div>`;
 
@@ -4556,10 +4738,10 @@ function renderMessages() {
           <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
           ${statusIcon}
           ${!isOut && !m.read_at ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}')">mark read</button>` : ''}
-          <div class="msg-actions">
+          ${m._isFile ? '' : `<div class="msg-actions">
             <button class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">⧉ Copy</button>
             <button class="msg-action-btn" title="Delete locally" onclick="deleteMessageLocally('${esc(m.msg_id)}')">🗑 Delete</button>
-          </div>
+          </div>`}
         </div>
       </div>
     `;
@@ -4625,18 +4807,20 @@ function renderFiles() {
     return;
   }
   el.innerHTML = state.files.slice(0,10).map(f => {
-    const url = `/files/${f.file_id}?token=${encodeURIComponent(UI_TOKEN)}`;
+    const viewUrl = fileViewUrl(f.file_id);
+    const downloadUrl = fileDownloadUrl(f.file_id);
+    const direction = f.direction === 'out' ? 'Sent' : 'Received';
     return `
     <div class="file-item" style="flex-direction:column;align-items:stretch">
       <div style="display:flex;align-items:center;gap:12px">
         <div class="file-icon">${fileIcon(f.filename)}</div>
         <div class="file-info">
           <div class="file-name" title="${esc(f.filename)}">${esc(f.filename)}</div>
-          <div class="file-meta">${fmt(f.size)} · ${relTime(f.uploaded_at)}</div>
+          <div class="file-meta">${direction} · ${fmt(f.size)} · ${relTime(f.uploaded_at)}</div>
         </div>
-        <a class="file-dl" href="${url}" download title="Download">⬇</a>
+        <a class="file-dl" href="${downloadUrl}" download title="Download">↓</a>
       </div>
-      ${isAudio(f.filename) ? `<audio class="file-audio" controls preload="none" src="${url}"></audio>` : ''}
+      ${isAudio(f.filename, f.mime_type) ? `<audio class="file-audio" controls preload="metadata" src="${viewUrl}"></audio>` : ''}
     </div>
   `;
   }).join('');
@@ -4896,21 +5080,56 @@ function sendMessage() {
 function sendFile() {
   const f = $('fileInput').files[0];
   if(!f) return;
-  sendFileBlob(f, f.name);
+  sendFileBlob(f, f.name, snapshotTarget());
   $('fileInput').value = '';
 }
 
-function sendFileBlob(blob, filename) {
-  if(!selectedTarget) { toast('Select a friend or group first', 'warning'); return; }
+function targetCanReceiveFiles(target) {
+  if(!target) { toast('Select a friend or group first', 'warning'); return false; }
+  if(target.type === 'friend' && !state.sessions?.[target.id]) {
+    toast('Connect this friend securely before sending a file', 'warning');
+    return false;
+  }
+  return true;
+}
+
+function setTransferStatus(text, percent=null) {
+  $('transferStatus').innerHTML = text ? `<span>${esc(text)}</span>${percent === null ? '' :
+    `<span class="progress-track"><span class="progress-fill" style="display:block;width:${Math.max(0,Math.min(100,percent))}%"></span></span>`}` : '';
+}
+
+function finishUpload() {
+  uploadInProgress = false;
+  pendingUploadName = '';
+  $('attachBtn').classList.remove('busy');
+  setTransferStatus('');
+}
+
+function sendFileBlob(blob, filename, target=snapshotTarget()) {
+  if(!targetCanReceiveFiles(target)) return;
+  if(uploadInProgress) { toast('Wait for the current attachment to finish', 'warning'); return; }
   if(blob.size > MAX_FILE_BYTES_UI) { toast('File exceeds 512 MB limit','error'); return; }
+  const available = state.max_storage_bytes > 0 ? state.max_storage_bytes - (state.storage_bytes||0) : Infinity;
+  if(blob.size > available) { toast('This file exceeds the remaining local storage quota', 'error'); return; }
+  uploadInProgress = true;
+  pendingUploadName = filename;
+  $('attachBtn').classList.add('busy');
+  setTransferStatus(`Preparing ${filename}`, 0);
   const r = new FileReader();
+  r.onprogress = e => {
+    if(e.lengthComputable) setTransferStatus(`Preparing ${filename}`, Math.round(e.loaded/e.total*100));
+  };
+  r.onerror = () => { finishUpload(); toast('Could not read that file', 'error'); };
   r.onload = () => {
     const data = r.result.split(',')[1];
-    if(selectedTarget.type === 'group') {
-      send({type:'send_file', group_id:selectedTarget.id, filename, data});
+    setTransferStatus(`Encrypting and sending ${filename}`);
+    let sent;
+    if(target.type === 'group') {
+      sent = send({type:'send_file', group_id:target.id, filename, content_type:blob.type, data});
     } else {
-      send({type:'send_file', pubkey:selectedTarget.id, filename, data});
+      sent = send({type:'send_file', pubkey:target.id, filename, content_type:blob.type, data});
     }
+    if(!sent) finishUpload();
   };
   r.readAsDataURL(blob);
 }
@@ -4918,36 +5137,66 @@ function sendFileBlob(blob, filename) {
 // ─── Voice messages ─────────────────────────────────────────────────────────
 async function toggleVoiceRecording() {
   if(mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
+    stopVoiceRecording(false);
     return;
   }
-  if(!selectedTarget) { toast('Select a friend or group first', 'warning'); return; }
-  if(!navigator.mediaDevices?.getUserMedia) { toast('Voice recording is not supported in this browser', 'error'); return; }
+  const target = snapshotTarget();
+  if(!targetCanReceiveFiles(target)) return;
+  if(uploadInProgress) { toast('Wait for the current attachment to finish', 'warning'); return; }
+  if(!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    toast('Voice recording is not supported in this browser', 'error'); return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
     recordedChunks = [];
-    mediaRecorder = new MediaRecorder(stream);
+    recordingTarget = target;
+    discardRecording = false;
+    const preferred = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    const mimeType = preferred.find(t => MediaRecorder.isTypeSupported?.(t));
+    mediaRecorder = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
     mediaRecorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onerror = () => {
+      discardRecording = true;
+      stream.getTracks().forEach(t => t.stop());
+      toast('Voice recording failed', 'error');
+    };
     mediaRecorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
       clearInterval(recordTimer);
       $('recIndicator').innerHTML = '';
       $('micBtn').classList.remove('recording');
       const blob = new Blob(recordedChunks, {type: mediaRecorder.mimeType || 'audio/webm'});
-      const ext = (mediaRecorder.mimeType || 'audio/webm').includes('ogg') ? 'ogg' : 'webm';
-      if(blob.size > 0) sendFileBlob(blob, `voice-message-${Date.now()}.${ext}`);
+      const kind = mediaRecorder.mimeType || 'audio/webm';
+      const ext = kind.includes('ogg') ? 'ogg' : kind.includes('mp4') ? 'm4a' : 'webm';
+      if(!discardRecording && blob.size > 0) {
+        sendFileBlob(blob, `voice-message-${Date.now()}.${ext}`, recordingTarget);
+      } else if(!discardRecording) {
+        toast('No audio was captured', 'warning');
+      }
       mediaRecorder = null;
+      recordingTarget = null;
     };
-    mediaRecorder.start();
+    mediaRecorder.start(1000);
     recordStart = Date.now();
     $('micBtn').classList.add('recording');
     recordTimer = setInterval(() => {
       const secs = Math.floor((Date.now()-recordStart)/1000);
-      $('recIndicator').innerHTML = `<div class="rec-indicator"><span class="dot"></span>Recording ${String(Math.floor(secs/60)).padStart(1,'0')}:${String(secs%60).padStart(2,'0')} — click 🎙️ to send</div>`;
+      $('recIndicator').innerHTML = `<div class="rec-indicator"><span class="dot"></span>Recording ${String(Math.floor(secs/60)).padStart(1,'0')}:${String(secs%60).padStart(2,'0')}
+        <button class="rec-cancel" onclick="stopVoiceRecording(true)">Cancel</button></div>`;
+      if(secs >= 300) {
+        toast('Five-minute recording limit reached', 'info');
+        stopVoiceRecording(false);
+      }
     }, 200);
   } catch(err) {
     toast('Microphone access denied or unavailable', 'error');
   }
+}
+
+function stopVoiceRecording(discard=false) {
+  if(!mediaRecorder || mediaRecorder.state !== 'recording') return;
+  discardRecording = discard;
+  mediaRecorder.stop();
 }
 
 // ─── Identity backup / restore ──────────────────────────────────────────────
@@ -5106,19 +5355,11 @@ mainEl.addEventListener('dragleave', e => {
 mainEl.addEventListener('drop', e => {
   e.preventDefault();
   $('dropOverlay').classList.remove('active');
-  if(!selectedTarget) { toast('Select a contact first', 'warning'); return; }
+  const target = snapshotTarget();
+  if(!target) { toast('Select a contact first', 'warning'); return; }
   const file = e.dataTransfer.files[0];
   if(!file) return;
-  if(file.size > MAX_FILE_BYTES_UI) { toast('File exceeds 512 MB limit', 'error'); return; }
-  const r = new FileReader();
-  r.onload = () => {
-    const data = r.result.split(',')[1];
-    if(selectedTarget.type === 'group')
-      send({type:'send_file', group_id:selectedTarget.id, filename:file.name, data});
-    else
-      send({type:'send_file', pubkey:selectedTarget.id, filename:file.name, data});
-  };
-  r.readAsDataURL(file);
+  sendFileBlob(file, file.name, target);
 });
 
 // Focus on window return — clear title unread

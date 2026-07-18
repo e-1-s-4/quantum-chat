@@ -13,11 +13,32 @@ from chat import (
     Database,
     PQModule,
     QuantumCrypto,
+    files_dir_for_db,
+    parse_http_range,
+    safe_content_type,
     safe_filename,
     validate_file_id,
     validate_label,
     validate_public_key,
 )
+
+
+def test_attachment_helpers_preserve_mime_ranges_and_node_isolation(tmp_path):
+    assert safe_content_type("audio/webm;codecs=opus", "voice.webm") == "audio/webm"
+    assert safe_content_type("not a mime", "photo.png") == "image/png"
+    assert parse_http_range("", 10) is None
+    assert parse_http_range("bytes=2-5", 10) == (2, 5)
+    assert parse_http_range("bytes=7-", 10) == (7, 9)
+    assert parse_http_range("bytes=-3", 10) == (7, 9)
+    with pytest.raises(ValueError):
+        parse_http_range("bytes=20-30", 10)
+    with pytest.raises(ValueError):
+        parse_http_range("bytes=0-1,4-5", 10)
+
+    alice_dir = files_dir_for_db(str(tmp_path / "alice.db"))
+    bob_dir = files_dir_for_db(str(tmp_path / "bob.db"))
+    assert alice_dir != bob_dir
+    assert str(alice_dir).endswith("alice.db.files")
 
 
 def test_validate_public_key_enforces_hex_and_expected_length():
@@ -102,6 +123,11 @@ def test_state_payload_is_json_serializable_with_encrypted_rows():
         json.dumps(payload)
         assert "body_nonce" not in payload["messages"][0]
         assert "file_nonce" not in payload["files"][0]
+        assert "storage_path" not in payload["files"][0]
+        assert payload["files"][0]["sender_pubkey"] == "aa"
+        assert payload["files"][0]["recipient_pubkey"] == "bb"
+        assert payload["files"][0]["direction"] == "out"
+        assert payload["files"][0]["mime_type"] == "text/plain"
         assert payload["has_more_messages"] is False
         db.close()
     finally:
@@ -634,6 +660,47 @@ def test_http_get_version_returns_lightweight_payload():
     payload = json.loads(written[0].decode())
     assert "version" in payload
     assert "app" in payload
+
+
+def test_http_file_view_supports_inline_byte_ranges(tmp_path):
+    file_id = str(uuid.uuid4())
+    path = tmp_path / file_id
+    path.write_bytes(b"0123456789")
+    meta = {
+        "file_id": file_id,
+        "filename": "voice-message.webm",
+        "mime_type": "audio/webm",
+        "size": 10,
+        "storage_path": str(path),
+        "file_nonce": None,
+    }
+    node = SimpleNamespace(
+        ui_token="token",
+        db=SimpleNamespace(get_file=lambda requested: meta if requested == file_id else None),
+        decrypt_from_disk=lambda data, _file_id, _nonce: data,
+    )
+    captured = {}
+    written = []
+    handler = object.__new__(ChatHTTPHandler)
+    handler.path = f"/files/{file_id}?view=1&token=token"
+    handler.require_http_auth = False
+    handler.node = node
+    handler.headers = {"Range": "bytes=3-6"}
+    handler.send_response = lambda code, _msg=None: captured.__setitem__("status", code)
+    handler.send_header = lambda key, value: captured.__setitem__(key, value)
+    handler.end_headers = lambda: None
+    handler.send_error = lambda code, msg="": captured.update(status=code, error=msg)
+    handler.wfile = SimpleNamespace(write=lambda data: written.append(data))
+
+    ChatHTTPHandler.do_GET(handler)
+
+    assert captured["status"] == 206
+    assert captured["Content-Type"] == "audio/webm"
+    assert captured["Content-Range"] == "bytes 3-6/10"
+    assert captured["Content-Length"] == "4"
+    assert captured["Accept-Ranges"] == "bytes"
+    assert captured["Content-Disposition"].startswith("inline;")
+    assert written == [b"3456"]
 
 
 def test_direct_rate_gc_drops_stale_buckets():
