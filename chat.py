@@ -2957,7 +2957,12 @@ body {
   margin-top: 12px;
   line-height: 1.6;
 }
-.id-key.visible { display: block; animation: fadeIn 0.3s; }
+.id-key.visible { 
+  display: block; 
+  max-height: 120px; 
+  overflow-y: auto; 
+  animation: fadeIn 0.3s; 
+}
 .id-actions { display: flex; gap: 8px; margin-top: 12px; }
 
 /* Search */
@@ -3378,7 +3383,10 @@ body {
 }
 
 .reaction-bar {
-  display: none;
+  display: flex;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(10px) scale(0.95);
   position: absolute;
   bottom: calc(100% + 8px);
   background: var(--s2);
@@ -3389,15 +3397,25 @@ body {
   gap: 4px;
   z-index: 10;
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-  animation: fadeInDown 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-@keyframes fadeInDown {
-  from { opacity: 0; transform: translateY(10px) scale(0.95); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  transition: opacity 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
+              transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
+              visibility 0.2s;
+  transition-delay: 1.5s;
 }
 .msg-group.out .reaction-bar { right: 0; }
 .msg-group.in .reaction-bar { left: 0; }
-.msg-bubble:hover .reaction-bar { display: flex; }
+.msg-bubble:hover .reaction-bar {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
+.reaction-bar:hover {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
 .reaction-btn {
   width: 36px; height: 36px;
   border-radius: 10px;
@@ -3982,7 +4000,7 @@ body {
           <div class="id-fp mono" id="myFp">loading…</div>
         </div>
       </div>
-      <div class="id-key" id="myKey">loading…</div>
+      <div class="id-key" id="myKey" onclick="event.stopPropagation()">loading…</div>
       <div class="id-actions" id="idActions" style="display:none">
         <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();copyKey()">Copy key</button>
         <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();openBackupModal()">Backup / restore</button>

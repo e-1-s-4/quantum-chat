@@ -14,8 +14,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-ROOT = Path("/home/z/my-project/quantum-chat")
-WORKDIR = Path("/home/z/my-project/scripts/e2e-run")
+ROOT = Path(__file__).parent.resolve()
+WORKDIR = ROOT / "scripts" / "e2e-run"
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 # Use private ports.
