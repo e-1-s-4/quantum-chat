@@ -99,6 +99,21 @@ def test_database_encrypts_identity_session_and_message_at_rest():
                 pass
 
 
+def test_delete_message_is_persistent_and_removes_local_metadata(tmp_path):
+    pytest.importorskip("cryptography")
+    db = Database(str(tmp_path / "delete.db"), master_key=b"k" * 32)
+    db.save_message("m1", "aa", "erase me", "in", recipient="bb")
+    db.add_reaction("m1", "bb", "👍")
+    db.save_read_receipt("m1", "bb")
+
+    assert db.delete_message("m1") is True
+    assert db.delete_message("m1") is False
+    assert db.recent_messages() == []
+    assert db.conn.execute("SELECT 1 FROM reactions WHERE msg_id='m1'").fetchone() is None
+    assert db.conn.execute("SELECT 1 FROM read_receipts WHERE msg_id='m1'").fetchone() is None
+    db.close()
+
+
 def test_state_payload_is_json_serializable_with_encrypted_rows():
     pytest.importorskip("cryptography")
     fd, path = tempfile.mkstemp()

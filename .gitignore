@@ -7,3 +7,4 @@ files/
 *.db
 *.db.key
 *.key.tmp
+scripts/*-run/

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v3.2.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v3.3.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v3.3.0:
+- Responsive conversation navigation and a compact, accessible action menu
+- Resilient UI WebSocket reconnects with bounded exponential backoff
+- Persistent local message deletion and duplicate-event protection
+- Improved keyboard, focus, reduced-motion, and narrow-screen behavior
 
 New in v3.2.0:
 - Multi-device sync: message history and read state sync between devices
@@ -57,7 +63,7 @@ from urllib.parse import quote, urlparse, parse_qs
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -1096,6 +1102,24 @@ class Database:
                 (int(read_at), msg_id)
             )
             self.conn.commit()
+
+    def delete_message(self, msg_id: str) -> bool:
+        """Permanently remove one message and its local-only metadata.
+
+        This is deliberately a local operation: it does not create or send a
+        remote deletion event, so it cannot imply that another participant has
+        erased their copy. Foreign keys are not used for the metadata tables in
+        older databases, therefore the dependent rows are removed explicitly.
+        """
+        msg_id = str(msg_id or "").strip()
+        if not msg_id:
+            raise ValueError("Message id is required")
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM messages WHERE msg_id=?", (msg_id,))
+            self.conn.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
+            self.conn.execute("DELETE FROM read_receipts WHERE msg_id=?", (msg_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def _hydrate_message_row(self, r: sqlite3.Row) -> Dict[str, Any]:
         d = dict(r)
@@ -2756,6 +2780,11 @@ class QuantumNode:
                 msg["pubkey"], str(msg["msg_id"]),
                 str(msg["emoji"]), str(msg.get("action", "add"))
             )
+        elif typ == "delete_message":
+            msg_id = str(msg.get("msg_id") or "")
+            if not self.db.delete_message(msg_id):
+                raise ValueError("Message is no longer available")
+            await self.broadcast_ui({"type": "message_deleted", "msg_id": msg_id})
         elif typ == "clear_unread":
             pubkey = self.validate_peer_key(msg["pubkey"])
             self.db.clear_unread(pubkey)
@@ -4648,6 +4677,103 @@ body {
   .msg-bubble { max-width: 88%; }
   .attachment-card { width: min(310px, 76vw); }
 }
+
+/* ── v3.3 workspace polish ────────────────────────────────────────────────
+   Keep the dense chat layout calm and legible on both a laptop and a phone.
+   These tokens intentionally use solid surfaces: message content stays the
+   visual focus and the UI remains readable when transparency is disabled. */
+:root {
+  --bg: #0b1016;
+  --glass-bg: #111922;
+  --s1: #111922;
+  --s2: #17232d;
+  --s3: #1c2a35;
+  --s4: #263844;
+  --border: #2a3b47;
+  --border2: #496271;
+  --accent: #52d3b5;
+  --accent-glow: rgba(82, 211, 181, .2);
+  --accent2: #5ba8ff;
+  --accent2-glow: rgba(91, 168, 255, .2);
+  --danger: #ff7185;
+  --warn: #f2c861;
+  --text1: #f4f7f8;
+  --text2: #afbec6;
+  --text3: #73838d;
+  --out-bg: #176d66;
+  --in-bg: #1c2a35;
+  --rad: 8px;
+}
+body { background: var(--bg); background-image: none; }
+#sidebar, #panel, .chat-header, .composer { background: var(--glass-bg); backdrop-filter: none; -webkit-backdrop-filter: none; }
+.app-logo .icon, .id-avatar, .call-modal-avatar, .call-overlay-avatar { background: var(--accent); -webkit-text-fill-color: currentColor; filter: none; box-shadow: none; }
+.btn-primary { background: var(--accent); color: #071412; box-shadow: none; }
+.btn-primary:hover { filter: brightness(1.08); box-shadow: none; }
+.btn-secondary { background: #1a2730; }
+.btn-danger { color: #ff9aaa; }
+.friend-item { border-radius: 8px; margin: 2px 10px; }
+.friend-item.active { background: #203642; box-shadow: none; }
+.friend-item.active::before { background: var(--accent); box-shadow: none; }
+.msg-bubble { border-radius: 12px; box-shadow: none; }
+.msg-group.out .msg-bubble { background: var(--out-bg); box-shadow: none; }
+.msg-group.in .msg-bubble { background: var(--in-bg); backdrop-filter: none; -webkit-backdrop-filter: none; }
+.composer-inner { border-radius: 10px; background: #0d151c; box-shadow: none; }
+.composer-inner:focus-within { box-shadow: 0 0 0 3px var(--accent-glow); }
+.send-btn { background: var(--accent); color: #071412; box-shadow: none; border-radius: 8px; }
+.send-btn:hover { transform: none; box-shadow: none; }
+.char-hint.danger { color: var(--danger); font-weight: 700; }
+.toast { border-radius: 8px; background: #17232d; backdrop-filter: none; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+.stat-box, .session-item, .file-item, .modal, .search-result-item { border-radius: 8px; }
+.stat-box b { background: none; -webkit-text-fill-color: currentColor; color: var(--accent); }
+button, input, textarea, select, summary { font: inherit; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chat-header-actions { min-width: 0; flex-wrap: nowrap; }
+.header-menu { position: relative; }
+.header-menu > summary { list-style: none; cursor: pointer; }
+.header-menu > summary::-webkit-details-marker { display: none; }
+.header-menu-items { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 190px; padding: 6px; border: 1px solid var(--border2); border-radius: 8px; background: #17232d; box-shadow: 0 14px 34px rgba(0,0,0,.4); }
+.header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 5px; padding: 9px 10px; }
+.mobile-back { display: none; }
+.connection-hint { display: none; }
+@media (max-width: 720px) {
+  body { overflow: hidden; }
+  #app { position: relative; }
+  #sidebar { width: 100%; min-width: 0; border-right: 0; }
+  #main { display: none; width: 100%; }
+  #app.mobile-chat-open #sidebar { display: none; }
+  #app.mobile-chat-open #main { display: flex; }
+  .sidebar-head { padding: 16px; }
+  .id-card { margin: 12px 16px; }
+  .list-section { padding-bottom: 24px; }
+  .friend-item { margin: 3px 8px; padding: 12px 12px; }
+  .friend-avatar { margin: 0; }
+  .friend-info { display: block; }
+  .friend-name, .search-wrap { display: block; }
+  .section-label span { display: inline; }
+  .section-label { justify-content: space-between; }
+  .mode-tabs { display: flex; }
+  .unread-badge { display: block; }
+  .app-logo h1, .app-logo .ver, .sidebar-head .conn-badge span { display: block; }
+  .id-card-head > div:last-child { display: block; }
+  .section-label { padding-left: 16px; padding-right: 16px; }
+  .chat-header { padding: 12px 14px; gap: 10px; min-height: 64px; }
+  .mobile-back { display: inline-flex; flex: 0 0 auto; }
+  .chat-header-actions .btn:not(.mobile-primary) { display: none; }
+  .header-menu { display: block; }
+  .chat-header-actions .header-menu > summary { display: inline-flex; }
+  .chat-header-actions .header-menu-items .btn { display: flex; }
+  .messages-wrap { padding: 16px 12px; }
+  .msg-bubble { max-width: 88%; }
+  .composer { padding: 10px 12px 12px; }
+  .composer-inner { padding: 8px 10px; }
+  #text { font-size: 16px; }
+  #panel { display: none; }
+  .drop-overlay { border-radius: 8px; }
+  #toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
+}
 </style>
 </head>
 <body>
@@ -4884,6 +5010,7 @@ body {
 const UI_WS_PORT = __UI_WS_PORT__;
 const UI_TOKEN = "__UI_TOKEN__";
 const MAX_FILE_BYTES_UI = 512*1024*1024;
+const MAX_TEXT_BYTES_UI = 64*1024;
 
 let state = {
   public_key: '', fingerprint: '', signaling_url: '',
@@ -4892,6 +5019,8 @@ let state = {
   storage_bytes: 0, max_storage_bytes: 0,
 };
 let ws = null;
+let wsRetryTimer = null;
+let wsRetryDelay = 1000;
 let mode = 'friends';          // 'friends' | 'groups'
 let selectedTarget = null;     // {type:'friend'|'group', id:string}
 let typing = {};               // peer_pubkey -> timestamp
@@ -5008,18 +5137,32 @@ const avatarColor = key => {
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 function wsConnect() {
+  if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  clearTimeout(wsRetryTimer);
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${scheme}://${location.hostname}:${UI_WS_PORT}/?token=${encodeURIComponent(UI_TOKEN)}`);
-  ws.onopen = () => setConn(true);
-  ws.onclose = () => { setConn(false); setTimeout(wsConnect, 1500); };
+  ws.onopen = () => {
+    wsRetryDelay = 1000;
+    setConn(true);
+  };
+  ws.onclose = () => {
+    ws = null;
+    setConn(false, Math.ceil(wsRetryDelay / 1000));
+    wsRetryTimer = setTimeout(wsConnect, wsRetryDelay);
+    wsRetryDelay = Math.min(30000, Math.round(wsRetryDelay * 1.8));
+  };
   ws.onerror = () => {};
-  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onmessage = e => {
+    try { handle(JSON.parse(e.data)); }
+    catch(err) { console.error('Ignored invalid UI socket frame', err); }
+  };
 }
 
-function setConn(connected) {
+function setConn(connected, retrySeconds=0) {
   const b = $('connBadge'), t = $('connText');
   b.className = 'conn-badge' + (connected ? ' connected' : '');
-  t.textContent = connected ? 'connected' : 'disconnected';
+  t.textContent = connected ? 'connected' : (retrySeconds ? `retrying in ${retrySeconds}s` : 'disconnected');
+  updateSendBtn();
 }
 
 function send(obj) {
@@ -5033,9 +5176,14 @@ function send(obj) {
 
 // ─── Message handler ─────────────────────────────────────────────────────────
 function handle(d) {
+  if(!d || typeof d !== 'object') return;
   if(d.type === 'state') {
     state = d;
+    state.friends = state.friends || [];
+    state.groups = state.groups || [];
+    state.messages = dedupeMessages(state.messages || []);
     state.files = (state.files||[]).map(normalizeFile);
+    reconcileSelection();
     render();
   } else if(d.type === 'friends') {
     state.friends = d.friends;
@@ -5044,7 +5192,7 @@ function handle(d) {
   } else if(d.type === 'history') {
     const el = $('messages');
     const prevHeight = el.scrollHeight, prevTop = el.scrollTop;
-    state.messages = [...d.messages, ...state.messages];
+    state.messages = dedupeMessages([...(d.messages||[]), ...state.messages]);
     state.has_more_messages = d.has_more_messages;
     loadingMore = false;
     renderMessages();
@@ -5057,6 +5205,8 @@ function handle(d) {
     if(d.level === 'error' && uploadInProgress) finishUpload();
     toast(d.text, d.level || 'info');
   } else if(d.type === 'message') {
+    if(!d.message || state.messages.some(m => m.msg_id === d.message.msg_id)) return;
+    const keepAtBottom = isNearBottom();
     state.messages.push(d.message);
     const isSelected = selectedTarget &&
       (selectedTarget.type === 'friend'
@@ -5070,7 +5220,7 @@ function handle(d) {
     }
     renderMessages();
     renderSidebar();
-    scrollBottom(false);
+    if(isSelected && keepAtBottom) scrollBottom(false);
     if(isSelected && d.message.direction === 'in') {
       send({type:'clear_unread', pubkey: d.message.sender_pubkey});
     }
@@ -5121,6 +5271,11 @@ function handle(d) {
       }
       renderMessages();
     }
+  } else if(d.type === 'message_deleted') {
+    state.messages = state.messages.filter(m => m.msg_id !== d.msg_id);
+    renderMessages();
+    renderSidebar();
+    toast('Message deleted from local history', 'success');
   } else if(d.type === 'search_results') {
     renderSearchResults(d.query, d.results || []);
   } else if(d.type === 'call_incoming') {
@@ -5143,11 +5298,29 @@ function render() {
   $('statSessions').textContent = Object.keys(state.sessions||{}).length;
   $('statFiles').textContent = (state.files||[]).length;
   renderSidebar();
+  renderChatHeader();
   renderMessages();
+  renderTyping();
   renderSessions();
   renderFiles();
   renderStorageQuota();
   updateSendBtn();
+}
+
+function dedupeMessages(messages) {
+  const seen = new Set();
+  return messages.filter(m => m && m.msg_id && !seen.has(m.msg_id) && seen.add(m.msg_id));
+}
+
+function reconcileSelection() {
+  if(!selectedTarget) return;
+  const exists = selectedTarget.type === 'friend'
+    ? state.friends.some(f => f.pubkey === selectedTarget.id)
+    : state.groups.some(g => g.group_id === selectedTarget.id);
+  if(!exists) {
+    selectedTarget = null;
+    setMobileChat(false);
+  }
 }
 
 function renderSidebar() {
@@ -5269,7 +5442,10 @@ function renderAttachment(m) {
 
 function renderMessages() {
   const el = $('messages');
-  if(!selectedTarget) return;
+  if(!selectedTarget) {
+    el.innerHTML = '<div class="empty-state"><div class="emo" aria-hidden="true">&#9883;</div><h3>Quantum Chat</h3><p>Select a conversation to view your encrypted history.</p></div>';
+    return;
+  }
 
   const msgs = [
     ...(state.messages||[]),
@@ -5448,6 +5624,7 @@ function renderChatHeader() {
     const secure = !!(state.sessions&&state.sessions[selectedTarget.id]);
     const bgColor = avatarColor(selectedTarget.id);
     el.innerHTML = `
+      <button class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">&#8592;</button>
       <div class="chat-header-avatar" style="background:${bgColor}">${esc(avatarLetter(f?.nickname||selectedTarget.id))}</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
@@ -5457,16 +5634,21 @@ function renderChatHeader() {
         </div>
       </div>
       <div class="chat-header-actions">
-        ${!secure?`<button class="btn btn-primary btn-sm" onclick="connectPeer()">Connect</button>`:''}
-        <button class="btn btn-secondary btn-sm" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">🔍</button>
-        ${secure?`<button class="btn btn-secondary btn-sm" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">📞</button>
-        <button class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">🎥</button>`:''}
-        <button class="btn btn-secondary btn-sm" onclick="renameFriend()" title="Edit nickname">✎ Rename</button>
-        ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Unverify</button>`:`<button class="btn btn-primary btn-sm" onclick="verifyFriend(true)">Verify safety</button>`}
-        ${f?.blocked
-          ? `<button class="btn btn-primary btn-sm" onclick="blockFriend(false)">Unblock</button>`
-          : `<button class="btn btn-danger btn-sm" onclick="blockFriend(true)" title="Block this friend and drop the active session">Block</button>`}
-        <button class="btn btn-secondary btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove</button>
+        ${!secure?`<button class="btn btn-primary btn-sm mobile-primary" onclick="connectPeer()">Connect</button>`:''}
+        <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">Search</button>
+        ${secure?`<button class="btn btn-secondary btn-sm mobile-primary" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">Call</button>
+        <button class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">Video</button>`:''}
+        <details class="header-menu">
+          <summary class="btn btn-secondary btn-sm" title="Conversation actions" aria-label="Conversation actions">&#8943;</summary>
+          <div class="header-menu-items">
+            <button class="btn btn-secondary btn-sm" onclick="renameFriend()">Rename</button>
+            ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Remove verification</button>`:`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(true)">Verify safety number</button>`}
+            ${f?.blocked
+              ? `<button class="btn btn-secondary btn-sm" onclick="blockFriend(false)">Unblock</button>`
+              : `<button class="btn btn-danger btn-sm" onclick="blockFriend(true)">Block</button>`}
+            <button class="btn btn-danger btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove friend</button>
+          </div>
+        </details>
       </div>
     `;
   } else {
@@ -5474,15 +5656,21 @@ function renderChatHeader() {
     const name = g?.name || 'Group';
     const isOwner = g && g.owner_pubkey === state.public_key;
     el.innerHTML = `
+      <button class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">&#8592;</button>
       <div class="chat-header-avatar">👥</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
         <div class="chat-header-sub">${(g?.members||[]).length} members · epoch ${g?.epoch??0} · ${esc(g?.fingerprint||'')}</div>
       </div>
       <div class="chat-header-actions">
-        <button class="btn btn-secondary btn-sm" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">🔍</button>
-        ${isOwner ? `<button class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
-        <button class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')" title="Generate a fresh group key and redistribute it to current members">Rotate key</button>` : ''}
+        <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation">Search</button>
+        ${isOwner ? `<details class="header-menu">
+          <summary class="btn btn-secondary btn-sm" title="Group actions" aria-label="Group actions">&#8943;</summary>
+          <div class="header-menu-items">
+            <button class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
+            <button class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate group key</button>
+          </div>
+        </details>` : ''}
       </div>
     `;
     if($('groupManagePanel').classList.contains('open')) renderGroupManage();
@@ -5533,8 +5721,9 @@ function selectFriend(pubkey) {
   scrollBottom(true);
   send({type:'clear_unread', pubkey});
   updateSendBtn();
+  setMobileChat(true);
   // Request browser notification permission lazily
-  if(Notification.permission === 'default') Notification.requestPermission();
+  if('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
 }
 
 function selectGroup(group_id) {
@@ -5544,6 +5733,16 @@ function selectGroup(group_id) {
   renderMessages();
   scrollBottom(true);
   updateSendBtn();
+  setMobileChat(true);
+}
+
+function setMobileChat(open) {
+  $('app').classList.toggle('mobile-chat-open', !!open);
+}
+
+function closeMobileChat() {
+  stopTyping();
+  setMobileChat(false);
 }
 
 function matchTarget(m) {
@@ -5558,6 +5757,7 @@ function setMode(m) {
   $('tabFriends').className = 'mode-tab' + (m==='friends'?' active':'');
   $('tabGroups').className  = 'mode-tab' + (m==='groups' ?' active':'');
   selectedTarget = null;
+  setMobileChat(false);
   renderSidebar();
   renderChatHeader();
   renderMessages();
@@ -5654,10 +5854,8 @@ function copyMessage(msgId) {
 }
 
 function deleteMessageLocally(msgId) {
-  if(!confirm('Delete this message locally? This only removes it from your view — the sender and any other devices still have it.')) return;
-  state.messages = state.messages.filter(m => m.msg_id !== msgId);
-  renderMessages();
-  toast('Message removed from this device', 'info');
+  if(!confirm('Delete this message from this device? The other participant and your other devices may still have their copies.')) return;
+  send({type:'delete_message', msg_id:msgId});
 }
 
 // ─── Message search ───────────────────────────────────────────────────────────
@@ -5933,11 +6131,17 @@ function stopRingtone() {
 function sendMessage() {
   const text = $('text').value.trim();
   if(!text || !selectedTarget) return;
-  if(selectedTarget.type === 'group') {
-    send({type:'send_message', group_id:selectedTarget.id, text});
-  } else {
-    send({type:'send_message', pubkey:selectedTarget.id, text});
+  if(new TextEncoder().encode(text).length > MAX_TEXT_BYTES_UI) {
+    toast('Message exceeds the 64 KB limit', 'error');
+    return;
   }
+  let sent;
+  if(selectedTarget.type === 'group') {
+    sent = send({type:'send_message', group_id:selectedTarget.id, text});
+  } else {
+    sent = send({type:'send_message', pubkey:selectedTarget.id, text});
+  }
+  if(!sent) return;
   $('text').value = '';
   onTextInput();
   stopTyping();
@@ -6153,6 +6357,7 @@ function onTextInput() {
   const v = $('text').value;
   const bytes = new TextEncoder().encode(v).length;
   $('charHint').textContent = `${bytes.toLocaleString()} / 65,536`;
+  $('charHint').classList.toggle('danger', bytes > MAX_TEXT_BYTES_UI);
   updateSendBtn();
   autoResize($('text'));
   if(v.trim()) startTyping(); else stopTyping();
@@ -6170,7 +6375,8 @@ function autoResize(ta) {
 function updateSendBtn() {
   const hasText = !!$('text').value.trim();
   const hasTarget = !!selectedTarget;
-  $('sendBtn').disabled = !(hasText && hasTarget);
+  const withinLimit = new TextEncoder().encode($('text').value).length <= MAX_TEXT_BYTES_UI;
+  $('sendBtn').disabled = !(hasText && hasTarget && withinLimit && ws?.readyState === WebSocket.OPEN);
 }
 
 // ─── Scroll ───────────────────────────────────────────────────────────────────
@@ -6178,6 +6384,11 @@ function scrollBottom(instant) {
   const el = $('messages');
   if(instant) el.scrollTop = el.scrollHeight;
   else setTimeout(() => el.scrollTop = el.scrollHeight, 50);
+}
+
+function isNearBottom() {
+  const el = $('messages');
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
 }
 
 // ─── Unread ───────────────────────────────────────────────────────────────────
@@ -6192,7 +6403,7 @@ function updateTitle() {
 
 // ─── Notifications ────────────────────────────────────────────────────────────
 function notify(title, body) {
-  if(Notification.permission === 'granted') {
+  if('Notification' in window && Notification.permission === 'granted') {
     try {
       new Notification(`⚛ ${title}`, {body: body.slice(0,120), icon: ''});
     } catch(_) {}
@@ -6232,6 +6443,23 @@ mainEl.addEventListener('drop', e => {
 window.addEventListener('focus', () => {
   unreadTitle = 0;
   updateTitle();
+});
+
+window.addEventListener('online', wsConnect);
+document.addEventListener('visibilitychange', () => {
+  if(!document.hidden && (!ws || ws.readyState === WebSocket.CLOSED)) wsConnect();
+});
+document.addEventListener('click', event => {
+  document.querySelectorAll('.header-menu[open]').forEach(menu => {
+    if(!menu.contains(event.target)) menu.removeAttribute('open');
+  });
+});
+document.addEventListener('keydown', event => {
+  if(event.key !== 'Escape') return;
+  if($('backupModal').classList.contains('open')) closeBackupModal();
+  else if($('searchModal').classList.contains('open')) closeSearchModal();
+  else if($('groupManagePanel').classList.contains('open')) toggleGroupManage();
+  else if(matchMedia('(max-width: 720px)').matches && selectedTarget) closeMobileChat();
 });
 
 wsConnect();

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Integration test for the v3.2.0 additions: multi-device sync, WebRTC call
-signaling, and message search. Same style/pattern as e2e_test.py."""
+"""Integration test for multi-device sync, WebRTC call signaling, search,
+and parallel file transfer. Same style/pattern as e2e_test.py."""
 
 from __future__ import annotations
 import asyncio
@@ -32,10 +32,14 @@ async def run_node(db_path, http_port, ui_port, direct_port, signaling_port):
         max_storage_bytes=1024 * 1024 * 1024,
     )
     node.allow_remote_ui = False
-    chat.start_http(node, "127.0.0.1", http_port, ui_port, require_http_auth=False)
-    asyncio.create_task(chat.start_ui_ws(node, "127.0.0.1", ui_port))
-    asyncio.create_task(chat.start_direct_peer(node, "127.0.0.1", direct_port))
-    asyncio.create_task(node.connect_signaling_loop())
+    node._test_httpd = chat.start_http(
+        node, "127.0.0.1", http_port, ui_port, require_http_auth=False
+    )
+    node._test_tasks = [
+        asyncio.create_task(chat.start_ui_ws(node, "127.0.0.1", ui_port)),
+        asyncio.create_task(chat.start_direct_peer(node, "127.0.0.1", direct_port)),
+        asyncio.create_task(node.connect_signaling_loop()),
+    ]
     return node
 
 
@@ -188,8 +192,16 @@ async def main():
     print("Shutting down…")
     for n in (alice1, alice2, bob):
         n._shutting_down = True
+        n._test_httpd.shutdown()
+        n._test_httpd.server_close()
+        for task in n._test_tasks:
+            task.cancel()
     signaling_task.cancel()
-    await asyncio.sleep(0.5)
+    await asyncio.gather(
+        signaling_task,
+        *(task for n in (alice1, alice2, bob) for task in n._test_tasks),
+        return_exceptions=True,
+    )
     alice1.db.close()
     alice2.db.close()
     bob.db.close()

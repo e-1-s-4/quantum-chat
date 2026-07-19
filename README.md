@@ -1,6 +1,6 @@
 # Quantum Chat
 
-**v3.2.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
+**v3.3.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
 
 Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
 
@@ -10,6 +10,7 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 
 ## Table of contents
 
+- [What's new in v3.3.0](#whats-new-in-v330)
 - [What's new in v3.2.0](#whats-new-in-v320)
 - [What's new in v3.1.0](#whats-new-in-v310)
 - [Features](#features)
@@ -30,6 +31,20 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 - [Packaging and development](#packaging-and-development)
 - [Historical changelog](#historical-changelog)
 - [License](#license)
+
+---
+
+## What's new in v3.3.0
+
+v3.3.0 focuses on making the browser client dependable and comfortable as a daily chat workspace while preserving the existing wire protocol and cryptographic design.
+
+- **Real mobile navigation.** Phones now show a full-width conversation list and transition into a full-width chat view with a clear back action. Contact names, search, status, and unread context remain available instead of collapsing into an icon-only rail.
+- **Compact conversation actions.** Search and calling stay immediately available while lower-frequency verification, rename, block, removal, member management, and key rotation actions live in a compact menu that does not overflow the header.
+- **Resilient local connection.** The UI WebSocket reconnects with bounded exponential backoff, reconnects promptly when the page becomes active or the browser returns online, ignores malformed frames safely, and keeps unsent composer text when the local node is unavailable.
+- **Persistent local deletion.** Deleting a message removes its encrypted database row plus local reaction/read metadata and updates every open browser UI. This remains a local-only operation: it does not claim to erase the peer's copy or copies on other devices.
+- **Safer live updates.** State/history/message events are deduplicated, refreshes reconcile stale selections and headers, and incoming messages no longer force the timeline to the bottom while you are reading older history.
+- **Accessibility and visual polish.** Solid high-contrast surfaces replace decorative glow-heavy styling, focus states are consistently visible, reduced-motion preferences are honored, modals close with Escape, and the composer enforces the server's UTF-8 byte limit before sending.
+- **Tests and metadata.** The unit suite now contains **43 passing tests**, including persistent message-deletion coverage, and package/runtime versions are aligned at `3.3.0`.
 
 ---
 
@@ -127,7 +142,7 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 - Full-text message search (🔍 in the chat header), scoped to the open 1:1 or group conversation, with click-to-jump navigation to the matched message.
 - Typing indicators (ephemeral relay messages), delivery/read status ticks, a manual **mark read** action, and touch- and keyboard-accessible emoji reaction controls.
 - Per-friend unread counts persist in SQLite and clear when a conversation is read. Browser notifications and title unread-count updates fire when messages arrive while the page is unfocused.
-- Copy-message-to-clipboard and delete-message-locally hover actions on every message.
+- Copy-message-to-clipboard and persistent local delete actions on every message. Deletion affects only this device's database, not the peer or other devices.
 - URL auto-linking with `rel="noopener noreferrer"`.
 
 **Files**
@@ -245,7 +260,7 @@ Each peer then:
 
 The local browser interface includes:
 
-- A redesigned dark three-column layout with responsive mobile behavior.
+- A focused dark workspace with a three-column desktop layout and full-width list/chat navigation on mobile.
 - A dashboard for friend, online peer, secure session, and file counts.
 - Friend cards with online badges, secure-session badges, unread counters, and last-message previews.
 - Target-scoped message history with a quick text filter and a "Load older messages" control.
@@ -426,7 +441,7 @@ Important remaining limits:
 pytest test_validation_and_database.py
 ```
 
-42 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
+43 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
 
 ### Live HTTP smoke test
 

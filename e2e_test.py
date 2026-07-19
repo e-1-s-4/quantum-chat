@@ -85,7 +85,7 @@ async def wait_for_session(node: chat.QuantumNode, peer_pubkey: str,
 
 
 async def main():
-    print("=== Quantum Chat v3.1.0 end-to-end test ===")
+    print(f"=== Quantum Chat v{chat.VERSION} end-to-end test ===")
     # Clear any old DBs.
     for f in WORKDIR.glob("*"):
         if f.is_file():
@@ -151,7 +151,7 @@ async def main():
         failures.append("session-establishment")
     else:
         # Alice sends Bob a message.
-        test_msg = f"Hello Bob, this is a v3.1.0 end-to-end test message at {time.time()}"
+        test_msg = f"Hello Bob, this is an end-to-end test message at {time.time()}"
         await alice.send_chat(bob.public_key, test_msg)
         # Wait for Bob to receive it.
         received = None
