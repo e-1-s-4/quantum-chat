@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v2.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v3.2.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v3.2.0:
+- Multi-device sync: message history and read state sync between devices
+  that share one identity, over a relay that now supports multiple live
+  connections per identity
+- Voice/video calls: WebRTC signaling (offer/answer/ICE) carried over the
+  same PQ-authenticated relay/direct channel as everything else
+- Full-text message search across 1:1 and group history
+- Chat message padding to reduce ciphertext-length metadata leakage to the
+  relay/network observers
+- Per-identity relay rate limiting; ephemeral (non-persisted) relay envelopes
+  for typing/ICE/device-sync traffic
+- Parallelized group message fan-out and file-chunk transfer
+
+New in v3.1.0:
+- Critical signature verification fix
+- Delivery-ack ordering and read-receipt timestamp fixes
 
 New in v2.0:
 - Typing indicators (ephemeral relay)
@@ -40,7 +57,7 @@ from urllib.parse import quote, urlparse, parse_qs
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -70,6 +87,8 @@ MAX_REACTION_EMOJI_BYTES = 8
 ALLOWED_REACTIONS = {"👍", "❤️", "😂", "😮", "😢", "🔥"}
 SCHEMA_VERSION = 5
 REPLAY_WINDOW = 2048              # accepted out-of-order span for message counters
+FILE_CHUNK_CONCURRENCY = 8        # chunks sent in flight at once per file transfer;
+                                   # well under REPLAY_WINDOW so out-of-order arrival is safe
 DEFAULT_MAX_STORAGE_MB = 4096      # default disk quota for received/sent file bytes
 MESSAGE_PAGE_SIZE = 200            # messages sent on initial state sync / per page
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1    # passphrase KDF work factor
@@ -173,6 +192,32 @@ def b64e(data: bytes) -> str:
 
 def b64d(data: str) -> bytes:
     return base64.b64decode(data.encode("ascii"), validate=True)
+
+
+PAD_BUCKET_BYTES = 256
+
+
+def pad_plaintext(data: bytes, bucket: int = PAD_BUCKET_BYTES) -> bytes:
+    """Right-pad plaintext with zero bytes up to the next multiple of
+    `bucket`, prefixed with a 4-byte big-endian original length. Chat
+    ciphertext length is visible to the relay and any passive network
+    observer even though the content is not; without padding, that length
+    leaks a strong signal about message content (e.g. "ok" vs a paragraph).
+    Padding to fixed-size buckets reduces that leak to "which size bucket",
+    at the cost of a few bytes of overhead per message."""
+    prefix = len(data).to_bytes(4, "big")
+    body = prefix + data
+    pad_len = (-len(body)) % bucket
+    return body + b"\x00" * pad_len
+
+
+def unpad_plaintext(data: bytes) -> bytes:
+    if len(data) < 4:
+        raise ValueError("Padded plaintext too short")
+    n = int.from_bytes(data[:4], "big")
+    if n < 0 or n > len(data) - 4:
+        raise ValueError("Invalid padding length")
+    return data[4:4 + n]
 
 
 def canonical_json(value: Dict[str, Any]) -> bytes:
@@ -327,6 +372,17 @@ class QuantumCrypto:
         hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt,
                          info=b"quantum-chat-v1-message-key")
         return hkdf.derive(session_key)
+
+    def derive_device_sync_key(self, secret_key: bytes) -> bytes:
+        """Derive a symmetric key for syncing local state (sent/received
+        messages, read status) between devices that share this identity's
+        secret key — see 'Multi-device support'. Deterministic from the
+        secret key alone so any device holding the same identity backup can
+        compute it independently, with no extra handshake. The relay only
+        ever sees the resulting ciphertext, never this key or the plaintext."""
+        hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32,
+                         salt=b"quantum-chat-device-sync-v1", info=b"device-sync")
+        return hkdf.derive(secret_key)
 
     def encrypt(self, key: bytes, plaintext: bytes, aad: bytes = b"") -> Dict[str, str]:
         nonce = secrets.token_bytes(12)
@@ -1073,6 +1129,50 @@ class Database:
                 "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (before_id,)
             ).fetchone() is not None
 
+    def search_messages(self, query: str, target: Optional[str] = None,
+                        limit: int = 100, scan_limit: int = 20000) -> List[Dict[str, Any]]:
+        """Case-insensitive substring search across message history.
+
+        Message bodies are encrypted at rest (see encrypt_blob), so this
+        can't be pushed into SQL as a LIKE/FTS query without either storing
+        a plaintext search index (defeating the point of at-rest encryption)
+        or a deterministic-but-leaky token index — neither is worth it for a
+        local single-user database. Instead this decrypts rows newest-first
+        up to `scan_limit` and filters in Python, stopping early once
+        `limit` matches are found. `target` optionally restricts the scan to
+        one friend pubkey or one group_id, which keeps most real searches
+        fast since they're scoped to an open conversation."""
+        query = (query or "").strip().lower()
+        if not query:
+            return []
+        with self.lock:
+            if target and UUID_RE.match(target):
+                rows = self.conn.execute(
+                    "SELECT * FROM messages WHERE group_id=? ORDER BY timestamp DESC, id DESC LIMIT ?",
+                    (target, scan_limit)
+                ).fetchall()
+            elif target:
+                rows = self.conn.execute(
+                    "SELECT * FROM messages WHERE sender_pubkey=? OR recipient_pubkey=? "
+                    "ORDER BY timestamp DESC, id DESC LIMIT ?",
+                    (target, target, scan_limit)
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (scan_limit,)
+                ).fetchall()
+        results = []
+        for r in rows:
+            try:
+                d = self._hydrate_message_row(r)
+            except Exception:
+                continue  # skip rows that fail to decrypt rather than aborting the whole search
+            if query in d["body"].lower():
+                results.append(d)
+                if len(results) >= limit:
+                    break
+        return results
+
     # ── Reactions ─────────────────────────────────────────────────────────────
 
     def add_reaction(self, msg_id: str, peer_pubkey: str, emoji: str,
@@ -1305,7 +1405,36 @@ class QuantumNode:
         self._typing_timers: Dict[str, asyncio.TimerHandle] = {}
         self.max_storage_bytes = max_storage_bytes
         self._direct_rate: Dict[str, List[int]] = {}
+        # peer_pubkey -> {"call_id", "role" ("caller"/"callee"), "media"
+        # ("audio"/"video"), "state" ("ringing"/"active")}. Call *signaling*
+        # (offer/answer/ICE candidates) rides the same PQ-authenticated
+        # relay/direct channel as everything else in this file. The actual
+        # audio/video media stream itself is standard WebRTC (DTLS-SRTP),
+        # negotiated directly browser-to-browser after signaling completes —
+        # that leg is not post-quantum, since no mainstream browser offers a
+        # PQ WebRTC media path yet. See README for the full caveat.
+        self.active_calls: Dict[str, Dict[str, Any]] = {}
+        self.ice_servers = self._load_ice_servers()
         self._load_state()
+
+    @staticmethod
+    def _load_ice_servers() -> List[Dict[str, Any]]:
+        raw = os.environ.get("QUANTUM_CHAT_ICE_SERVERS")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                LOG.warning("Ignoring malformed QUANTUM_CHAT_ICE_SERVERS")
+        # A public STUN-only default is enough for NAT traversal between two
+        # peers that aren't both behind symmetric NATs. Production
+        # deployments that need to guarantee connectivity should set
+        # QUANTUM_CHAT_ICE_SERVERS to a JSON list including a TURN server
+        # with credentials, e.g.:
+        #   [{"urls":"stun:stun.l.google.com:19302"},
+        #    {"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]
+        return [{"urls": "stun:stun.l.google.com:19302"}]
 
     def _load_state(self) -> None:
         for friend in self.db.get_friends():
@@ -1375,11 +1504,18 @@ class QuantumNode:
             "storage_bytes": self._storage_bytes_used(),
             "max_storage_bytes": self.max_storage_bytes,
             "version": VERSION,
+            "ice_servers": self.ice_servers,
         }
 
     async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any],
-                         queue_on_failure: bool = False) -> None:
-        envelope = {"type": "relay", "to": peer_pubkey, "payload": payload}
+                         queue_on_failure: bool = False, ephemeral: bool = False) -> None:
+        envelope: Dict[str, Any] = {"type": "relay", "to": peer_pubkey, "payload": payload}
+        if ephemeral:
+            # Tell the relay this is best-effort, ephemeral traffic (typing
+            # indicators, ICE candidates, device-sync pings) that should be
+            # dropped rather than persisted to its offline queue if the
+            # target isn't currently connected — see SignalingServer.handle.
+            envelope["ephemeral"] = True
         if self.enable_direct and peer_pubkey in self.peer_direct:
             try:
                 await self.send_direct(peer_pubkey, payload)
@@ -1679,7 +1815,7 @@ class QuantumNode:
         msg_key = self.crypto.derive_message_key(
             session_key, self.public_key, peer_pubkey, counter, "chat"
         )
-        packet = self.crypto.encrypt(msg_key, text.encode(), canonical_json(payload))
+        packet = self.crypto.encrypt(msg_key, pad_plaintext(text.encode()), canonical_json(payload))
         # Save the outgoing message BEFORE send_relay so the row exists by
         # the time a synchronous delivery_ack comes back over the direct
         # transport. With direct delivery, send_relay blocks until the peer
@@ -1716,6 +1852,11 @@ class QuantumNode:
                 "status": "sent_to_relay", "reactions": [], "read_at": None,
             }
         })
+        await self.sync_to_devices("chat_out", {
+            "msg_id": msg_id, "sender_pubkey": self.public_key,
+            "recipient_pubkey": peer_pubkey, "group_id": group_id,
+            "body": text, "delivered": False, "status": "sent_to_relay",
+        })
 
     async def handle_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
@@ -1726,9 +1867,9 @@ class QuantumNode:
         msg_key = self.crypto.derive_message_key(
             session_key, peer_pubkey, self.public_key, counter, "chat"
         )
-        text = self.crypto.decrypt(
+        text = unpad_plaintext(self.crypto.decrypt(
             msg_key, data["packet"], canonical_json(payload)
-        ).decode("utf-8")
+        )).decode("utf-8")
         self.db.mark_recv_counter(peer_pubkey, counter)
         inserted = self.db.save_message(
             payload["msg_id"], peer_pubkey, text, "in",
@@ -1753,6 +1894,11 @@ class QuantumNode:
                     "status": "delivered", "reactions": [], "read_at": None,
                 }
             })
+            await self.sync_to_devices("chat_in", {
+                "msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey,
+                "recipient_pubkey": self.public_key, "group_id": payload.get("group_id"),
+                "body": text, "delivered": True, "status": "delivered",
+            })
 
     # ── Typing Indicators ─────────────────────────────────────────────────────
 
@@ -1766,7 +1912,7 @@ class QuantumNode:
                 "from": self.public_key,
                 "to": peer_pubkey,
                 "active": active,
-            })
+            }, ephemeral=True)
         except Exception:
             pass  # typing indicators are ephemeral — failures are acceptable
 
@@ -1876,6 +2022,188 @@ class QuantumNode:
             "emoji": emoji, "action": action,
         })
 
+    # ── Multi-device sync ────────────────────────────────────────────────────
+
+    async def sync_to_devices(self, event: str, data: Dict[str, Any]) -> None:
+        """Best-effort fan-out of a local event (a message we just sent or
+        received, or a read/unread change) to any other device that shares
+        this identity's secret key. Addressed to our own public key so the
+        relay's per-identity socket fan-out (see SignalingServer.handle)
+        delivers it to every *other* device currently online under this
+        identity, and encrypted with a key derived from the secret key
+        itself so the relay never sees plaintext. This is a convenience
+        sync, not a source of truth — each device's own local database
+        remains authoritative for its own state — so failures are swallowed
+        rather than raised."""
+        try:
+            key = self.crypto.derive_device_sync_key(self.secret_key)
+            body = canonical_json({"event": event, "data": data})
+            packet = self.crypto.encrypt(key, body)
+            envelope = self.signed_payload("device_sync", {"packet": packet})
+            await self.send_relay(self.public_key, envelope, ephemeral=True)
+        except Exception as exc:
+            LOG.debug("Device sync fan-out skipped: %s", exc)
+
+    async def _handle_device_sync(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
+        if peer_pubkey != self.public_key or not self.verify_signed(self.public_key, payload):
+            raise ValueError("Invalid device sync frame")
+        key = self.crypto.derive_device_sync_key(self.secret_key)
+        inner = payload.get("payload", {})
+        body = json.loads(self.crypto.decrypt(key, inner["packet"]))
+        event = body.get("event")
+        data = body.get("data", {}) or {}
+        if event in ("chat_out", "chat_in"):
+            direction = "out" if event == "chat_out" else "in"
+            inserted = self.db.save_message(
+                str(data.get("msg_id", "")), str(data.get("sender_pubkey", "")),
+                str(data.get("body", "")), direction,
+                recipient=data.get("recipient_pubkey"), group_id=data.get("group_id"),
+                delivered=bool(data.get("delivered", True)), status=str(data.get("status", "delivered")),
+            )
+            if inserted:
+                if direction == "in":
+                    self.db.increment_unread(str(data.get("sender_pubkey", "")))
+                await self.broadcast_ui({"type": "message", "message": {
+                    "msg_id": data.get("msg_id"), "sender_pubkey": data.get("sender_pubkey"),
+                    "recipient_pubkey": data.get("recipient_pubkey"), "group_id": data.get("group_id"),
+                    "body": data.get("body"), "direction": direction, "timestamp": utc_ts(),
+                    "delivered": int(bool(data.get("delivered", True))),
+                    "status": data.get("status", "delivered"), "reactions": [], "read_at": None,
+                }})
+        elif event == "read_local":
+            peer = str(data.get("peer_pubkey", ""))
+            if peer:
+                self.db.clear_unread(peer)
+                await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+
+    # ── Voice/video calls (WebRTC signaling over the authenticated relay) ───
+
+    async def send_call_offer(self, peer_pubkey: str, sdp: Dict[str, Any], media: str = "video") -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        if not self.db.is_friend(peer_pubkey):
+            raise ValueError("Add this public key as a friend before calling")
+        if media not in ("audio", "video"):
+            raise ValueError("Call media must be 'audio' or 'video'")
+        if peer_pubkey in self.active_calls:
+            raise ValueError("A call with this friend is already in progress")
+        await self.require_fresh_session(peer_pubkey, outgoing=True)
+        call_id = str(uuid.uuid4())
+        self.active_calls[peer_pubkey] = {"call_id": call_id, "role": "caller", "media": media, "state": "ringing"}
+        await self.send_relay(peer_pubkey, self.signed_payload("call_offer", {
+            "from": self.public_key, "to": peer_pubkey, "call_id": call_id,
+            "media": media, "sdp": sdp, "sent_at": utc_ts(),
+        }))
+        await self.broadcast_ui({
+            "type": "call_state", "peer": peer_pubkey, "call_id": call_id,
+            "state": "ringing", "role": "caller", "media": media,
+        })
+
+    async def handle_call_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.db.is_friend(peer_pubkey):
+            return  # silently ignore call attempts from non-friends
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid call offer signature")
+        payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Call offer routing mismatch")
+        media = payload.get("media") if payload.get("media") in ("audio", "video") else "video"
+        if peer_pubkey in self.active_calls:
+            # Already ringing/active with this peer (or with someone else,
+            # scoped per-peer here) — tell the caller we're busy instead of
+            # silently dropping their offer.
+            try:
+                await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
+                    "from": self.public_key, "to": peer_pubkey,
+                    "call_id": payload.get("call_id"), "reason": "busy",
+                }))
+            except Exception:
+                pass
+            return
+        self.active_calls[peer_pubkey] = {
+            "call_id": payload.get("call_id"), "role": "callee", "media": media, "state": "ringing",
+        }
+        await self.broadcast_ui({
+            "type": "call_incoming", "peer": peer_pubkey, "call_id": payload.get("call_id"),
+            "media": media, "sdp": payload.get("sdp"),
+        })
+
+    async def send_call_answer(self, peer_pubkey: str, sdp: Dict[str, Any]) -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        call = self.active_calls.get(peer_pubkey)
+        if not call or call["role"] != "callee":
+            raise ValueError("No incoming call from this friend to answer")
+        await self.send_relay(peer_pubkey, self.signed_payload("call_answer", {
+            "from": self.public_key, "to": peer_pubkey, "call_id": call["call_id"],
+            "sdp": sdp, "sent_at": utc_ts(),
+        }))
+        call["state"] = "active"
+        await self.broadcast_ui({
+            "type": "call_state", "peer": peer_pubkey, "call_id": call["call_id"],
+            "state": "active", "role": "callee", "media": call["media"],
+        })
+
+    async def handle_call_answer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid call answer signature")
+        payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Call answer routing mismatch")
+        call = self.active_calls.get(peer_pubkey)
+        if not call or call["call_id"] != payload.get("call_id") or call["role"] != "caller":
+            raise ValueError("Call answer does not match an active outgoing call")
+        call["state"] = "active"
+        await self.broadcast_ui({
+            "type": "call_answered", "peer": peer_pubkey,
+            "call_id": call["call_id"], "sdp": payload.get("sdp"),
+        })
+
+    async def send_call_ice(self, peer_pubkey: str, candidate: Dict[str, Any]) -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        call = self.active_calls.get(peer_pubkey)
+        if not call:
+            return  # call already ended locally; drop stray trickle-ICE candidates
+        await self.send_relay(peer_pubkey, self.signed_payload("call_ice", {
+            "from": self.public_key, "to": peer_pubkey,
+            "call_id": call["call_id"], "candidate": candidate,
+        }), ephemeral=True)
+
+    async def handle_call_ice(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            return
+        payload = data["payload"]
+        call = self.active_calls.get(peer_pubkey)
+        if not call or call["call_id"] != payload.get("call_id"):
+            return
+        await self.broadcast_ui({
+            "type": "call_ice", "peer": peer_pubkey, "candidate": payload.get("candidate"),
+        })
+
+    async def send_call_end(self, peer_pubkey: str, reason: str = "hangup") -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        call = self.active_calls.pop(peer_pubkey, None)
+        if not call:
+            return
+        try:
+            await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
+                "from": self.public_key, "to": peer_pubkey,
+                "call_id": call["call_id"], "reason": reason,
+            }))
+        except Exception:
+            pass  # best-effort — the local call state is already cleared either way
+        await self.broadcast_ui({
+            "type": "call_state", "peer": peer_pubkey,
+            "call_id": call["call_id"], "state": "ended", "reason": reason,
+        })
+
+    async def handle_call_end(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        payload = data.get("payload", {}) if isinstance(data, dict) else {}
+        call = self.active_calls.pop(peer_pubkey, None)
+        await self.broadcast_ui({
+            "type": "call_state", "peer": peer_pubkey,
+            "call_id": (call or {}).get("call_id") or payload.get("call_id"),
+            "state": "ended", "reason": payload.get("reason", "hangup"),
+        })
+
     async def send_group_invite(self, peer_pubkey: str, invite: Dict[str, Any], group_key: bytes) -> None:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         counter = self.db.next_send_counter(peer_pubkey)
@@ -1902,9 +2230,8 @@ class QuantumNode:
         new_epoch = int(group["epoch"]) + 1
         new_key = secrets.token_bytes(32)
         self.db.save_group_key(group_id, new_epoch, new_key, self.public_key)
-        for member in members:
-            if member == self.public_key:
-                continue
+
+        async def deliver_key(member: str) -> None:
             if member in self.sessions and self.session_fresh(member):
                 invite = {
                     "group_id": group_id, "name": group["name"], "members": members,
@@ -1914,6 +2241,8 @@ class QuantumNode:
                     await self.send_group_invite(member, invite, new_key)
                 except Exception as exc:
                     LOG.warning("Failed to deliver rotated group key to %s: %s", short_key(member), exc)
+
+        await asyncio.gather(*(deliver_key(m) for m in members if m != self.public_key))
         await self.broadcast_ui({
             "type": "notice", "level": "success",
             "text": f"Group key rotated (epoch {new_epoch})"
@@ -1947,7 +2276,7 @@ class QuantumNode:
         msg_id = str(uuid.uuid4())
         meta = {"msg_id": msg_id, "from": self.public_key, "group_id": group_id,
                 "epoch": epoch, "sent_at": utc_ts()}
-        packet = self.crypto.encrypt(group_key["key"], text.encode(), canonical_json(meta))
+        packet = self.crypto.encrypt(group_key["key"], pad_plaintext(text.encode()), canonical_json(meta))
         envelope = self.signed_payload("group_chat", {"meta": meta, "packet": packet})
         # Save the outgoing group message BEFORE fan-out so the row exists by
         # the time any synchronous ack/reaction comes back over the direct
@@ -1958,14 +2287,21 @@ class QuantumNode:
                 delivered += 1  # optimistically count intended recipients
         self.db.save_message(msg_id, self.public_key, text, "out", group_id=group_id,
                              delivered=delivered > 0, status="sent_to_group")
-        actually_sent = 0
-        for peer in members - {self.public_key}:
-            if self.db.is_friend(peer):
-                try:
-                    await self.send_relay(peer, envelope, queue_on_failure=True)
-                    actually_sent += 1
-                except Exception as exc:
-                    LOG.warning("Group fan-out to %s failed: %s", short_key(peer), exc)
+
+        async def deliver(peer: str) -> bool:
+            try:
+                await self.send_relay(peer, envelope, queue_on_failure=True)
+                return True
+            except Exception as exc:
+                LOG.warning("Group fan-out to %s failed: %s", short_key(peer), exc)
+                return False
+
+        # Fan out to all recipients concurrently instead of one at a time —
+        # in a large group, sequential awaits mean the Nth member waits on
+        # N-1 round trips to the relay before their copy even goes out.
+        recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
+        results = await asyncio.gather(*(deliver(peer) for peer in recipients)) if recipients else []
+        actually_sent = sum(1 for ok in results if ok)
         await self.broadcast_ui({"type": "message", "message": {
             "msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": None,
             "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
@@ -2015,14 +2351,32 @@ class QuantumNode:
                     "mime_type": mime_type,
                     "total_chunks": total_chunks, "chunk_size": MAX_CHUNK_BYTES, "sent_at": utc_ts()}
         await self.send_relay(peer_pubkey, self.signed_payload("file_manifest", manifest), queue_on_failure=True)
-        for idx in range(total_chunks):
-            chunk = raw[idx * MAX_CHUNK_BYTES:(idx + 1) * MAX_CHUNK_BYTES]
-            counter = self.db.next_send_counter(peer_pubkey)
-            meta = {**manifest, "chunk_index": idx, "counter": counter,
-                    "chunk_sha256": hashlib.sha256(chunk).hexdigest()}
-            msg_key = self.crypto.derive_message_key(session_key, self.public_key, peer_pubkey, counter, "file-chunk")
-            packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
-            await self.send_relay(peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet}, queue_on_failure=True)
+        # Chunk counters must be allocated in strict order up front (the
+        # underlying counter is a simple per-peer increment), but the
+        # encrypt+send work for each chunk is independent, so it's safe and
+        # meaningfully faster — especially over a non-local relay — to fan
+        # those out with bounded concurrency rather than one at a time. The
+        # receive-side replay window (REPLAY_WINDOW) comfortably tolerates
+        # the resulting out-of-order arrival.
+        counters = [self.db.next_send_counter(peer_pubkey) for _ in range(total_chunks)]
+        chunk_semaphore = asyncio.Semaphore(FILE_CHUNK_CONCURRENCY)
+
+        async def send_chunk(idx: int, counter: int) -> None:
+            async with chunk_semaphore:
+                chunk = raw[idx * MAX_CHUNK_BYTES:(idx + 1) * MAX_CHUNK_BYTES]
+                meta = {**manifest, "chunk_index": idx, "counter": counter,
+                        "chunk_sha256": hashlib.sha256(chunk).hexdigest()}
+                msg_key = self.crypto.derive_message_key(session_key, self.public_key, peer_pubkey, counter, "file-chunk")
+                packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
+                await self.send_relay(peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet}, queue_on_failure=True)
+
+        results = await asyncio.gather(
+            *(send_chunk(idx, counters[idx]) for idx in range(total_chunks)),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                raise r
         saved_file = self.db.get_file(file_id)
         await self.broadcast_ui({
             "type": "file",
@@ -2173,7 +2527,7 @@ class QuantumNode:
         group_key = self.db.get_group_key(group_id, int(meta.get("epoch", 0)))
         if not group_key:
             raise ValueError("Missing group epoch key")
-        text = self.crypto.decrypt(group_key["key"], payload["packet"], canonical_json(meta)).decode("utf-8")
+        text = unpad_plaintext(self.crypto.decrypt(group_key["key"], payload["packet"], canonical_json(meta))).decode("utf-8")
         inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
                                         delivered=True, status="delivered")
         if inserted:
@@ -2212,6 +2566,16 @@ class QuantumNode:
             await self.handle_read_receipt(peer_pubkey, payload)
         elif kind == "reaction":
             await self.handle_reaction(peer_pubkey, payload)
+        elif kind == "device_sync":
+            await self._handle_device_sync(peer_pubkey, payload)
+        elif kind == "call_offer":
+            await self.handle_call_offer(peer_pubkey, payload)
+        elif kind == "call_answer":
+            await self.handle_call_answer(peer_pubkey, payload)
+        elif kind == "call_ice":
+            await self.handle_call_ice(peer_pubkey, payload)
+        elif kind == "call_end":
+            await self.handle_call_end(peer_pubkey, payload)
         elif kind == "delivery_ack":
             if not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid delivery acknowledgement")
@@ -2312,7 +2676,7 @@ class QuantumNode:
             await self.broadcast_ui(self.state_payload())
         elif typ == "rename_friend":
             pubkey = self.validate_peer_key(msg["pubkey"])
-            nickname = self.db.rename_friend(pubkey, str(msg.get("nickname") or ""))
+            self.db.rename_friend(pubkey, str(msg.get("nickname") or ""))
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
         elif typ == "connect":
             await self.connect_peer(msg["pubkey"])
@@ -2386,14 +2750,17 @@ class QuantumNode:
             await self.send_read_receipt(msg["pubkey"], str(msg["msg_id"]))
             self.db.clear_unread(msg["pubkey"])
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"]})
         elif typ == "reaction":
             await self.send_reaction(
                 msg["pubkey"], str(msg["msg_id"]),
                 str(msg["emoji"]), str(msg.get("action", "add"))
             )
         elif typ == "clear_unread":
-            self.db.clear_unread(self.validate_peer_key(msg["pubkey"]))
+            pubkey = self.validate_peer_key(msg["pubkey"])
+            self.db.clear_unread(pubkey)
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.sync_to_devices("read_local", {"peer_pubkey": pubkey})
         elif typ == "refresh":
             await self.broadcast_ui(self.state_payload())
         elif typ == "load_more_messages":
@@ -2403,6 +2770,23 @@ class QuantumNode:
             await ws.send(json.dumps({
                 "type": "history", "messages": older, "has_more_messages": has_more
             }))
+        elif typ == "search_messages":
+            query = str(msg.get("query") or "")
+            target = msg.get("pubkey") or msg.get("group_id")
+            results = self._with_message_metadata(
+                self.db.search_messages(query, target=str(target) if target else None)
+            )
+            await ws.send(json.dumps({
+                "type": "search_results", "query": query, "results": results
+            }))
+        elif typ == "call_offer":
+            await self.send_call_offer(msg["pubkey"], msg["sdp"], str(msg.get("media", "video")))
+        elif typ == "call_answer":
+            await self.send_call_answer(msg["pubkey"], msg["sdp"])
+        elif typ == "call_ice":
+            await self.send_call_ice(msg["pubkey"], msg["candidate"])
+        elif typ == "call_end":
+            await self.send_call_end(msg["pubkey"], str(msg.get("reason", "hangup")))
         else:
             raise ValueError(f"Unknown command: {typ}")
 
@@ -2507,7 +2891,11 @@ class QuantumNode:
 
 class SignalingServer:
     def __init__(self) -> None:
-        self.clients: Dict[str, Any] = {}
+        # Dict[pubkey] -> set of live sockets. A set (not a single socket)
+        # is what makes multi-device support possible: two devices holding
+        # the same identity can both stay registered and connected at once,
+        # and relay/self-sync traffic fans out to every socket in the set.
+        self.clients: Dict[str, Set[Any]] = {}
         self.aliases: Dict[str, str] = {}
         self.peer_meta: Dict[str, Dict[str, Any]] = {}
         self.offline: Dict[str, List[Dict[str, Any]]] = {}
@@ -2516,6 +2904,12 @@ class SignalingServer:
         self.relay_db.commit()
         self.crypto = QuantumCrypto()
         self.rate: Dict[Any, List[int]] = {}
+        # Per-socket rate limiting (self.rate) is no longer sufficient on its
+        # own once one identity can hold several simultaneous connections —
+        # an attacker who registers many device sockets under one signed
+        # identity could otherwise multiply their effective send rate. This
+        # tracks an aggregate ceiling per pubkey across all of its sockets.
+        self.pubkey_rate: Dict[str, List[int]] = {}
 
     def _rate_ok(self, ws: Any, limit: int = 120, window: int = 60) -> bool:
         now = utc_ts()
@@ -2524,13 +2918,21 @@ class SignalingServer:
         self.rate[ws] = events
         return len(events) <= limit
 
+    def _pubkey_rate_ok(self, pubkey: str, limit: int = 300, window: int = 60) -> bool:
+        now = utc_ts()
+        events = [t for t in self.pubkey_rate.get(pubkey, []) if now - t < window]
+        events.append(now)
+        self.pubkey_rate[pubkey] = events
+        return len(events) <= limit
+
     async def broadcast_peers(self) -> None:
         payload = json.dumps({"type": "peers", "peers": self.peer_meta})
-        for ws in list(self.clients.values()):
-            try:
-                await ws.send(payload)
-            except Exception:
-                pass
+        for sockets in list(self.clients.values()):
+            for ws in list(sockets):
+                try:
+                    await ws.send(payload)
+                except Exception:
+                    pass
 
     async def handle(self, ws: Any) -> None:
         pubkey = None
@@ -2563,7 +2965,7 @@ class SignalingServer:
                                     "type": "error", "text": "Invalid registration signature"
                                 }))
                                 continue
-                        elif candidate in self.clients:
+                        elif self.clients.get(candidate):
                             await ws.send(json.dumps({
                                 "type": "error",
                                 "text": "Duplicate unsigned registration rejected"
@@ -2574,10 +2976,14 @@ class SignalingServer:
                         if not HEX_RE.match(relay_alias) or len(relay_alias) > 128:
                             raise ValueError("Invalid relay alias")
                         direct_url = msg.get("direct_url") if isinstance(msg.get("direct_url"), str) else None
-                        old = self.clients.get(pubkey)
-                        if old and old is not ws:
-                            await old.close(code=1008, reason="Replaced by signed registration")
-                        self.clients[pubkey] = ws
+                        # Signed registrations are added alongside any existing
+                        # connection for this identity rather than replacing it,
+                        # so a second device holding the same identity backup
+                        # can stay online at the same time as the first (see
+                        # 'Multi-device support'). Unsigned registrations can't
+                        # prove they hold the identity, so those are still
+                        # rejected outright when the identity is already live.
+                        self.clients.setdefault(pubkey, set()).add(ws)
                         self.aliases[relay_alias] = pubkey
                         self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
                         for queued in self.offline.pop(pubkey, []):
@@ -2594,6 +3000,9 @@ class SignalingServer:
                                 "type": "error", "text": "Register before relaying"
                             }))
                             continue
+                        if not self._pubkey_rate_ok(pubkey):
+                            await ws.send(json.dumps({"type": "error", "text": "Rate limit exceeded"}))
+                            continue
                         raw_target = str(msg.get("to", ""))
                         try:
                             target = validate_public_key(raw_target, self.crypto.sign_public_key_bytes)
@@ -2608,10 +3017,29 @@ class SignalingServer:
                                 "type": "error", "text": "Invalid relay payload"
                             }))
                             continue
-                        if target in self.clients:
-                            await self.clients[target].send(json.dumps({
-                                "type": "relay", "from": pubkey, "payload": payload
-                            }))
+                        # Fan out to every device socket registered for the
+                        # target identity, excluding the sender's own socket
+                        # (relevant for self-addressed device-sync traffic,
+                        # where "target" is the sender's own identity and we
+                        # only want *other* devices to receive it).
+                        target_sockets = [t for t in self.clients.get(target, ()) if t is not ws]
+                        ephemeral = bool(msg.get("ephemeral"))
+                        if target_sockets:
+                            envelope = json.dumps({"type": "relay", "from": pubkey, "payload": payload})
+                            for target_ws in target_sockets:
+                                try:
+                                    await target_ws.send(envelope)
+                                except Exception:
+                                    LOG.debug("Dropped relay fan-out to a stale device socket for %s", short_key(target))
+                        elif ephemeral:
+                            # Ephemeral traffic (typing indicators, ICE
+                            # candidates, device-sync pings) is a best-effort
+                            # convenience signal, not durable state — persisting
+                            # it to the offline queue would let it pile up
+                            # forever for identities that never bring a second
+                            # device online, or spam a relay/direct message the
+                            # instant a peer reconnects long after it's stale.
+                            await ws.send(json.dumps({"type": "queued", "to": target, "ephemeral": True}))
                         else:
                             queue = self.offline.setdefault(target, [])
                             if len(queue) >= 500:
@@ -2630,13 +3058,20 @@ class SignalingServer:
                     await ws.send(json.dumps({"type": "error", "text": str(exc)}))
         finally:
             self.rate.pop(ws, None)
-            if pubkey and self.clients.get(pubkey) is ws:
-                del self.clients[pubkey]
-                self.peer_meta.pop(pubkey, None)
-                for alias, owner in list(self.aliases.items()):
-                    if owner == pubkey:
-                        self.aliases.pop(alias, None)
-                await self.broadcast_peers()
+            if pubkey and pubkey in self.clients:
+                sockets = self.clients[pubkey]
+                sockets.discard(ws)
+                if not sockets:
+                    del self.clients[pubkey]
+                    self.pubkey_rate.pop(pubkey, None)
+                    self.peer_meta.pop(pubkey, None)
+                    for alias, owner in list(self.aliases.items()):
+                        if owner == pubkey:
+                            self.aliases.pop(alias, None)
+                    await self.broadcast_peers()
+                # If other device sockets are still registered for this
+                # identity, leave peer_meta/aliases/online-peers state alone
+                # — the identity as a whole is still online.
 
 
 # ─── HTTP Server ──────────────────────────────────────────────────────────────
@@ -2781,13 +3216,18 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _security_headers(self, download: bool = False) -> None:
-        connect_src = "connect-src 'self' ws://127.0.0.1:* ws://localhost:* ws://[::1]:* wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
+        # stun:/turn: schemes are added so the browser's RTCPeerConnection can
+        # reach ICE servers for voice/video calls — CSP3-compliant browsers
+        # apply connect-src to WebRTC connections, not just fetch/WebSocket.
+        connect_src = ("connect-src 'self' stun: turn: stuns: turns: "
+                       "ws://127.0.0.1:* ws://localhost:* ws://[::1]:* "
+                       "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;")
         if self.require_http_auth:
             host = (self.headers.get("Host", "") or "").strip()
             if host:
                 host = host.split("/", 1)[0]
                 connect_src = (
-                    f"connect-src 'self' ws://{host} wss://{host} "
+                    f"connect-src 'self' stun: turn: stuns: turns: ws://{host} wss://{host} "
                     "ws://127.0.0.1:* ws://localhost:* ws://[::1]:* "
                     "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
                 )
@@ -2804,6 +3244,11 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         # from rendering at all rather than sanitizing in-place.
         self.send_header("X-XSS-Protection", "1; mode=block")
         self.send_header("X-Permitted-Cross-Domain-Policies", "none")
+        # Calls need getUserMedia, which browsers gate behind Permissions-Policy
+        # in addition to the user's own camera/mic prompt. frame-ancestors
+        # 'none' above means this page is never embedded, so explicitly
+        # allowing 'self' here only ever affects this same-origin UI itself.
+        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), display-capture=()")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -3327,6 +3772,11 @@ body {
 
 /* Messages */
 .msg-group { display: flex; flex-direction: column; margin: 4px 0; }
+.msg-group.flash .msg-bubble { animation: msg-flash 1.6s ease-out; }
+@keyframes msg-flash {
+  0% { box-shadow: 0 0 0 3px var(--accent2); }
+  100% { box-shadow: none; }
+}
 .msg-group.out { align-items: flex-end; }
 .msg-group.in { align-items: flex-start; }
 
@@ -3469,13 +3919,21 @@ body {
 }
 .msg-group.in .msg-actions { margin-left: 0; margin-right: 6px; }
 .msg-bubble:hover ~ .msg-meta .msg-actions,
-.msg-meta:hover .msg-actions { opacity: 1; }
+.msg-meta:hover .msg-actions,
+.msg-meta:focus-within .msg-actions { opacity: 1; }
+/* Touch devices have no hover state at all, so hover-gated actions would
+   otherwise be permanently invisible and unreachable there — always show
+   them below the ~tablet breakpoint and on any device that reports no
+   hover capability. */
+@media (hover: none), (max-width: 768px) {
+  .msg-actions { opacity: 1; }
+}
 .msg-action-btn {
   background: none; border: none; cursor: pointer;
   color: var(--text3); font-size: 11px; padding: 2px 6px;
   border-radius: 4px; transition: all 0.15s;
 }
-.msg-action-btn:hover { background: rgba(255,255,255,0.08); color: var(--text1); }
+.msg-action-btn:hover, .msg-action-btn:focus-visible { background: rgba(255,255,255,0.08); color: var(--text1); }
 
 /* Reactions */
 .reactions {
@@ -3539,11 +3997,21 @@ body {
   transform: translateY(0) scale(1);
   transition-delay: 0s;
 }
-.reaction-bar:hover {
+.reaction-bar:hover,
+.reaction-bar:focus-within {
   opacity: 1;
   visibility: visible;
   transform: translateY(0) scale(1);
   transition-delay: 0s;
+}
+/* Same touch-accessibility rationale as .msg-actions above: without a real
+   hover state, this bar would never appear on a touchscreen. It's shown
+   inline instead of as a hover flyout below the tablet breakpoint. */
+@media (hover: none), (max-width: 768px) {
+  .reaction-bar {
+    opacity: 1; visibility: visible; transform: none;
+    position: static; margin-top: 6px; box-shadow: none;
+  }
 }
 .reaction-btn {
   width: 36px; height: 36px;
@@ -3555,7 +4023,7 @@ body {
   display: flex; align-items: center; justify-content: center;
   transition: all 0.2s;
 }
-.reaction-btn:hover { background: rgba(255,255,255,0.1); transform: scale(1.1); }
+.reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255,255,255,0.1); transform: scale(1.1); }
 
 /* Typing indicator */
 #typing-indicator {
@@ -3916,6 +4384,68 @@ body {
 .modal-tabs button.active { color: #fff; border-color: var(--accent2); background: rgba(58,134,255,0.15); }
 .modal-actions { display: flex; gap: 8px; margin-top: 14px; }
 
+/* ── Message search ── */
+.search-results { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.search-result-item {
+  text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--s3); color: var(--text);
+  cursor: pointer; font-size: 13px; line-height: 1.4;
+}
+.search-result-item:hover, .search-result-item:focus-visible { border-color: var(--accent2); background: rgba(58,134,255,0.1); }
+.search-result-meta { font-size: 11px; color: var(--text3); margin-bottom: 4px; }
+.search-empty { font-size: 12px; color: var(--text3); text-align: center; padding: 18px 0; }
+
+/* ── Calls ── */
+.call-modal { text-align: center; }
+.call-modal-avatar {
+  width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 14px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 30px; background: linear-gradient(135deg, var(--accent2), var(--accent));
+  animation: call-pulse 1.4s ease-in-out infinite;
+}
+@keyframes call-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  50% { box-shadow: 0 0 0 14px rgba(58,134,255,0); }
+}
+.call-overlay {
+  position: fixed; inset: 0; z-index: 200; background: #050608;
+  display: flex; align-items: center; justify-content: center;
+}
+.call-overlay[hidden] { display: none; }
+.call-overlay-inner { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+#remoteVideo {
+  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #0a0b0d;
+}
+#localVideo {
+  position: absolute; bottom: 96px; right: 20px; width: 140px; height: 100px;
+  object-fit: cover; border-radius: 12px; border: 2px solid var(--border2);
+  box-shadow: var(--glass-shadow); background: #111; z-index: 2;
+}
+.call-overlay-info {
+  position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center;
+  gap: 8px; color: #fff; text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+}
+.call-overlay-avatar {
+  width: 88px; height: 88px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 34px; background: linear-gradient(135deg, var(--accent2), var(--accent));
+}
+.call-overlay-name { font-size: 20px; font-weight: 700; }
+.call-overlay-status { font-size: 13px; opacity: 0.85; }
+.call-overlay-controls {
+  position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 16px; z-index: 3;
+}
+.call-btn {
+  width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(255,255,255,0.14); color: #fff; font-size: 22px;
+  display: flex; align-items: center; justify-content: center; transition: all 0.15s;
+}
+.call-btn:hover { background: rgba(255,255,255,0.24); }
+.call-btn:active { transform: scale(0.94); }
+.call-btn.call-btn-muted { background: rgba(255,255,255,0.35); }
+.call-btn-end { background: var(--danger, #e5484d); }
+.call-btn-end:hover { filter: brightness(1.1); }
+
 /* ── Add friend / group panels ── */
 .slide-panel {
   background: rgba(0,0,0,0.15);
@@ -4229,14 +4759,14 @@ body {
     <div class="composer">
       <div class="composer-inner">
         <textarea id="text" rows="1" placeholder="Type an encrypted message…"
-          oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
+          aria-label="Message text" oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
         <div class="composer-actions">
-          <label class="icon-btn" id="attachBtn" title="Attach file">
+          <label class="icon-btn" id="attachBtn" title="Attach file" aria-label="Attach file" role="button" tabindex="0">
             📎
-            <input id="fileInput" type="file" hidden onchange="sendFile()">
+            <input id="fileInput" type="file" hidden onchange="sendFile()" aria-label="Choose a file to send">
           </label>
-          <button class="icon-btn" id="micBtn" title="Record voice message" onclick="toggleVoiceRecording()">🎙️</button>
-          <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send">➤</button>
+          <button class="icon-btn" id="micBtn" title="Record voice message" aria-label="Record voice message" onclick="toggleVoiceRecording()">🎙️</button>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send" aria-label="Send message">➤</button>
         </div>
       </div>
       <div class="transfer-status" id="transferStatus"></div>
@@ -4271,9 +4801,9 @@ body {
 </div>
 
 <!-- Backup / restore identity modal -->
-<div class="modal-overlay" id="backupModal">
+<div class="modal-overlay" id="backupModal" role="dialog" aria-modal="true" aria-labelledby="backupModalTitle">
   <div class="modal">
-    <h2>Identity backup &amp; restore</h2>
+    <h2 id="backupModalTitle">Identity backup &amp; restore</h2>
     <p class="hint">
       Carry your identity (public key / fingerprint) to a second device. This does
       <b>not</b> copy friends, sessions, or message history — only your signing keypair,
@@ -4296,6 +4826,52 @@ body {
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" style="flex:1" onclick="closeBackupModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Message search -->
+<div class="modal-overlay" id="searchModal" role="dialog" aria-modal="true" aria-labelledby="searchModalTitle">
+  <div class="modal">
+    <h2 id="searchModalTitle">Search messages</h2>
+    <p class="hint" id="searchScopeHint">Searching this conversation.</p>
+    <input class="field" id="searchInput" type="text" placeholder="Search…"
+           aria-label="Search message text" oninput="debounceSearch()"
+           onkeydown="if(event.key==='Enter') runSearch()">
+    <div id="searchResults" class="search-results" aria-live="polite"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" style="flex:1" onclick="closeSearchModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Incoming call -->
+<div class="modal-overlay" id="incomingCallModal" role="dialog" aria-modal="true" aria-labelledby="incomingCallTitle">
+  <div class="modal call-modal">
+    <div class="call-modal-avatar" id="incomingCallAvatar">📞</div>
+    <h2 id="incomingCallTitle">Incoming call</h2>
+    <p class="hint" id="incomingCallSub">someone is calling…</p>
+    <div class="modal-actions">
+      <button class="btn btn-danger" style="flex:1" onclick="declineCall()" aria-label="Decline call">Decline</button>
+      <button class="btn btn-primary" style="flex:1" onclick="acceptCall()" aria-label="Accept call">Accept</button>
+    </div>
+  </div>
+</div>
+
+<!-- Active/outgoing call overlay -->
+<div class="call-overlay" id="callOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="callOverlayName">
+  <div class="call-overlay-inner">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <div class="call-overlay-info">
+      <div class="call-overlay-avatar" id="callOverlayAvatar">📞</div>
+      <div class="call-overlay-name" id="callOverlayName">—</div>
+      <div class="call-overlay-status" id="callOverlayStatus" aria-live="polite">Calling…</div>
+    </div>
+    <div class="call-overlay-controls">
+      <button class="call-btn" id="callMuteBtn" onclick="toggleCallMute()" aria-label="Mute microphone" title="Mute microphone">🎙️</button>
+      <button class="call-btn" id="callCameraBtn" onclick="toggleCallCamera()" aria-label="Turn camera off" title="Turn camera off">🎥</button>
+      <button class="call-btn call-btn-end" onclick="hangupCall()" aria-label="End call" title="End call">📵</button>
     </div>
   </div>
 </div>
@@ -4334,6 +4910,12 @@ let discardRecording = false;
 let uploadInProgress = false;
 let pendingUploadName = '';
 let loadingMore = false;
+let searchDebounceTimer = null;
+// Call state: at most one call in flight at a time in this UI.
+let pc = null;                 // RTCPeerConnection
+let localStream = null;
+let currentCall = null;        // {peer, call_id, role, media, state}
+let pendingIceQueue = [];      // candidates that arrived before setRemoteDescription
 
 // ─── Utils ──────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -4539,6 +5121,16 @@ function handle(d) {
       }
       renderMessages();
     }
+  } else if(d.type === 'search_results') {
+    renderSearchResults(d.query, d.results || []);
+  } else if(d.type === 'call_incoming') {
+    handleCallIncoming(d);
+  } else if(d.type === 'call_answered') {
+    handleCallAnswered(d);
+  } else if(d.type === 'call_ice') {
+    handleCallIceCandidate(d);
+  } else if(d.type === 'call_state') {
+    handleCallStateEvent(d);
   }
 }
 
@@ -4567,7 +5159,7 @@ function renderSidebar() {
     const friends = state.friends.filter(f =>
       !q || (f.nickname||'').toLowerCase().includes(q) || f.pubkey.toLowerCase().includes(q)
     );
-    const addBtn = `<button onclick="toggleAdd()" title="Add friend">＋</button>`;
+    const addBtn = `<button onclick="toggleAdd()" title="Add friend" aria-label="Add friend">＋</button>`;
     const label = document.createElement('div');
     label.className = 'section-label';
     label.innerHTML = `<span>Friends (${friends.length})</span>${addBtn}`;
@@ -4609,7 +5201,7 @@ function renderSidebar() {
     const groups = state.groups.filter(g =>
       !q || (g.name||'').toLowerCase().includes(q)
     );
-    const addBtn = `<button onclick="toggleGroup()" title="Create group">＋</button>`;
+    const addBtn = `<button onclick="toggleGroup()" title="Create group" aria-label="Create group">＋</button>`;
     const label = document.createElement('div');
     label.className = 'section-label';
     label.innerHTML = `<span>Groups (${groups.length})</span>${addBtn}`;
@@ -4728,7 +5320,7 @@ function renderMessages() {
     </div>`;
 
     html += `
-      <div class="msg-group ${isOut?'out':'in'}">
+      <div class="msg-group ${isOut?'out':'in'}" data-msg-id="${esc(m.msg_id)}">
         <div class="msg-bubble" style="${sameGroup?'margin-top:1px':''}">
           ${reactionBar}
           ${bodyHtml}
@@ -4866,6 +5458,9 @@ function renderChatHeader() {
       </div>
       <div class="chat-header-actions">
         ${!secure?`<button class="btn btn-primary btn-sm" onclick="connectPeer()">Connect</button>`:''}
+        <button class="btn btn-secondary btn-sm" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">🔍</button>
+        ${secure?`<button class="btn btn-secondary btn-sm" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">📞</button>
+        <button class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">🎥</button>`:''}
         <button class="btn btn-secondary btn-sm" onclick="renameFriend()" title="Edit nickname">✎ Rename</button>
         ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Unverify</button>`:`<button class="btn btn-primary btn-sm" onclick="verifyFriend(true)">Verify safety</button>`}
         ${f?.blocked
@@ -4884,10 +5479,11 @@ function renderChatHeader() {
         <div class="chat-header-name">${esc(name)}</div>
         <div class="chat-header-sub">${(g?.members||[]).length} members · epoch ${g?.epoch??0} · ${esc(g?.fingerprint||'')}</div>
       </div>
-      ${isOwner ? `<div class="chat-header-actions">
-        <button class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
-        <button class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')" title="Generate a fresh group key and redistribute it to current members">Rotate key</button>
-      </div>` : ''}
+      <div class="chat-header-actions">
+        <button class="btn btn-secondary btn-sm" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">🔍</button>
+        ${isOwner ? `<button class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
+        <button class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')" title="Generate a fresh group key and redistribute it to current members">Rotate key</button>` : ''}
+      </div>
     `;
     if($('groupManagePanel').classList.contains('open')) renderGroupManage();
   }
@@ -4911,7 +5507,7 @@ function renderGroupManage() {
     return `<div class="member-row">
       <span class="role-tag">${role}</span>
       <span class="mono" title="${esc(pubkey)}">${esc(label)}</span>
-      ${canRemove ? `<button class="rm-btn" title="Remove from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">✕</button>` : ''}
+      ${canRemove ? `<button class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">✕</button>` : ''}
     </div>`;
   }).join('') || '<span class="muted" style="font-size:12px">No members</span>';
 }
@@ -5062,6 +5658,276 @@ function deleteMessageLocally(msgId) {
   state.messages = state.messages.filter(m => m.msg_id !== msgId);
   renderMessages();
   toast('Message removed from this device', 'info');
+}
+
+// ─── Message search ───────────────────────────────────────────────────────────
+function openSearchModal() {
+  if(!selectedTarget) { toast('Select a friend or group first', 'warning'); return; }
+  const label = selectedTarget.type === 'friend'
+    ? (state.friends.find(f=>f.pubkey===selectedTarget.id)?.nickname || short(selectedTarget.id))
+    : (state.groups.find(g=>g.group_id===selectedTarget.id)?.name || 'this group');
+  $('searchScopeHint').textContent = `Searching your conversation with ${label}.`;
+  $('searchResults').innerHTML = '';
+  $('searchInput').value = '';
+  $('searchModal').classList.add('open');
+  setTimeout(() => $('searchInput').focus(), 50);
+}
+function closeSearchModal() {
+  $('searchModal').classList.remove('open');
+}
+function debounceSearch() {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(runSearch, 300);
+}
+function runSearch() {
+  const query = $('searchInput').value.trim();
+  if(!query || !selectedTarget) { $('searchResults').innerHTML = ''; return; }
+  const payload = {type:'search_messages', query};
+  if(selectedTarget.type === 'group') payload.group_id = selectedTarget.id;
+  else payload.pubkey = selectedTarget.id;
+  send(payload);
+}
+function renderSearchResults(query, results) {
+  const el = $('searchResults');
+  if(!results.length) {
+    el.innerHTML = `<div class="search-empty">No messages match "${esc(query)}"</div>`;
+    return;
+  }
+  el.innerHTML = results.map(m => {
+    const snippet = m.body.length > 160 ? m.body.slice(0, 160) + '…' : m.body;
+    const who = m.direction === 'out' ? 'You' : short(m.sender_pubkey);
+    return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}')">
+      <div class="search-result-meta">${esc(who)} · ${relTime(m.timestamp)}</div>
+      ${esc(snippet)}
+    </button>`;
+  }).join('');
+}
+function jumpToMessage(msgId) {
+  closeSearchModal();
+  const node = document.querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
+  if(!node) {
+    toast("That message isn't loaded yet — try 'Load older messages' first", 'info');
+    return;
+  }
+  node.scrollIntoView({behavior:'smooth', block:'center'});
+  node.classList.add('flash');
+  setTimeout(() => node.classList.remove('flash'), 1600);
+}
+
+// ─── Voice/video calls ─────────────────────────────────────────────────────────
+// Call *signaling* (offer/answer/ICE) is relayed over the same PQ-authenticated
+// channel as everything else in this app. The media stream itself is standard
+// WebRTC (DTLS-SRTP), negotiated directly browser-to-browser — that leg is not
+// post-quantum, since no mainstream browser offers one yet.
+function friendName(pubkey) {
+  return state.friends.find(f=>f.pubkey===pubkey)?.nickname || short(pubkey);
+}
+
+async function startCall(media) {
+  if(!selectedTarget || selectedTarget.type !== 'friend') return;
+  if(currentCall) { toast('Already in a call', 'warning'); return; }
+  if(!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
+    toast('Calls are not supported in this browser', 'error');
+    return;
+  }
+  const peer = selectedTarget.id;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({audio:true, video: media==='video'});
+  } catch(err) {
+    toast(`Couldn't access ${media==='video'?'camera/microphone':'microphone'}: ${err.message}`, 'error');
+    return;
+  }
+  currentCall = {peer, call_id:null, role:'caller', media, state:'ringing'};
+  setupPeerConnection(peer, media);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({type:'call_offer', pubkey: peer, sdp: pc.localDescription, media});
+    showCallOverlay(peer, media, 'Calling…');
+  } catch(err) {
+    toast(`Couldn't start the call: ${err.message}`, 'error');
+    cleanupCall();
+  }
+}
+
+function setupPeerConnection(peer, media) {
+  pc = new RTCPeerConnection({iceServers: state.ice_servers || [{urls:'stun:stun.l.google.com:19302'}]});
+  pc.onicecandidate = e => {
+    if(e.candidate && currentCall) send({type:'call_ice', pubkey: peer, candidate: e.candidate.toJSON()});
+  };
+  pc.ontrack = e => {
+    const remote = $('remoteVideo');
+    if(remote.srcObject !== e.streams[0]) remote.srcObject = e.streams[0];
+  };
+  pc.onconnectionstatechange = () => {
+    if(pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) {
+      toast('Call connection lost', 'warning');
+    }
+  };
+  $('localVideo').srcObject = localStream;
+  $('localVideo').style.display = media === 'video' ? '' : 'none';
+  $('remoteVideo').style.display = media === 'video' ? '' : 'none';
+}
+
+function showCallOverlay(peer, media, status) {
+  $('callOverlayName').textContent = friendName(peer);
+  $('callOverlayStatus').textContent = status;
+  $('callOverlayAvatar').textContent = media === 'video' ? '🎥' : '📞';
+  $('callOverlay').hidden = false;
+  $('callMuteBtn').classList.remove('call-btn-muted');
+  $('callCameraBtn').textContent = '🎥';
+}
+
+function handleCallIncoming(d) {
+  if(currentCall) {
+    // Already busy — mirror the server-side busy handling for defense in depth.
+    send({type:'call_end', pubkey: d.peer, reason:'busy'});
+    return;
+  }
+  currentCall = {peer:d.peer, call_id:d.call_id, role:'callee', media:d.media, state:'ringing', offerSdp:d.sdp};
+  $('incomingCallAvatar').textContent = d.media === 'video' ? '🎥' : '📞';
+  $('incomingCallSub').textContent = `${friendName(d.peer)} is ${d.media === 'video' ? 'video ' : ''}calling…`;
+  $('incomingCallModal').classList.add('open');
+  playRingtone();
+}
+
+async function acceptCall() {
+  $('incomingCallModal').classList.remove('open');
+  if(!currentCall || currentCall.role !== 'callee') return;
+  if(!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
+    toast('Calls are not supported in this browser', 'error');
+    send({type:'call_end', pubkey: currentCall.peer, reason:'no-media'});
+    currentCall = null;
+    return;
+  }
+  const {peer, media, offerSdp} = currentCall;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({audio:true, video: media==='video'});
+  } catch(err) {
+    toast(`Couldn't access ${media==='video'?'camera/microphone':'microphone'}: ${err.message}`, 'error');
+    send({type:'call_end', pubkey: peer, reason:'no-media'});
+    currentCall = null;
+    return;
+  }
+  setupPeerConnection(peer, media);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  try {
+    await pc.setRemoteDescription(offerSdp);
+    await flushIceQueue();
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({type:'call_answer', pubkey: peer, sdp: pc.localDescription});
+    currentCall.state = 'active';
+    showCallOverlay(peer, media, 'Connected');
+  } catch(err) {
+    toast(`Couldn't answer the call: ${err.message}`, 'error');
+    cleanupCall();
+  }
+}
+
+function declineCall() {
+  $('incomingCallModal').classList.remove('open');
+  if(currentCall) send({type:'call_end', pubkey: currentCall.peer, reason:'declined'});
+  currentCall = null;
+}
+
+async function handleCallAnswered(d) {
+  if(!currentCall || currentCall.peer !== d.peer || !pc) return;
+  try {
+    await pc.setRemoteDescription(d.sdp);
+    await flushIceQueue();
+    currentCall.state = 'active';
+    $('callOverlayStatus').textContent = 'Connected';
+  } catch(err) {
+    toast(`Call setup failed: ${err.message}`, 'error');
+    cleanupCall();
+  }
+}
+
+async function handleCallIceCandidate(d) {
+  if(!currentCall || currentCall.peer !== d.peer || !d.candidate) return;
+  if(pc && pc.remoteDescription) {
+    try { await pc.addIceCandidate(d.candidate); } catch(_) {}
+  } else {
+    pendingIceQueue.push(d.candidate);
+  }
+}
+
+async function flushIceQueue() {
+  while(pendingIceQueue.length && pc) {
+    const c = pendingIceQueue.shift();
+    try { await pc.addIceCandidate(c); } catch(_) {}
+  }
+}
+
+function handleCallStateEvent(d) {
+  if(!currentCall || currentCall.peer !== d.peer) return;
+  if(d.state === 'ringing' && currentCall.role === 'caller') {
+    $('callOverlayStatus').textContent = 'Ringing…';
+  } else if(d.state === 'active') {
+    currentCall.state = 'active';
+    $('callOverlayStatus').textContent = 'Connected';
+  } else if(d.state === 'ended') {
+    const reasonText = {busy:'They were on another call', declined:'Call declined', hangup:'Call ended', 'no-media':'They could not join'}[d.reason] || 'Call ended';
+    toast(reasonText, 'info');
+    cleanupCall();
+  }
+}
+
+function hangupCall() {
+  if(currentCall) send({type:'call_end', pubkey: currentCall.peer, reason:'hangup'});
+  cleanupCall();
+}
+
+function cleanupCall() {
+  if(pc) { try { pc.close(); } catch(_) {} pc = null; }
+  if(localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  currentCall = null;
+  pendingIceQueue = [];
+  $('callOverlay').hidden = true;
+  $('incomingCallModal').classList.remove('open');
+  const rv = $('remoteVideo'), lv = $('localVideo');
+  if(rv) rv.srcObject = null;
+  if(lv) lv.srcObject = null;
+  stopRingtone();
+}
+
+function toggleCallMute() {
+  if(!localStream) return;
+  const track = localStream.getAudioTracks()[0];
+  if(!track) return;
+  track.enabled = !track.enabled;
+  $('callMuteBtn').classList.toggle('call-btn-muted', !track.enabled);
+  $('callMuteBtn').setAttribute('aria-label', track.enabled ? 'Mute microphone' : 'Unmute microphone');
+}
+
+function toggleCallCamera() {
+  if(!localStream) return;
+  const track = localStream.getVideoTracks()[0];
+  if(!track) return;
+  track.enabled = !track.enabled;
+  $('callCameraBtn').classList.toggle('call-btn-muted', !track.enabled);
+  $('callCameraBtn').textContent = track.enabled ? '🎥' : '🚫';
+  $('callCameraBtn').setAttribute('aria-label', track.enabled ? 'Turn camera off' : 'Turn camera on');
+}
+
+let ringtoneOsc = null;
+function playRingtone() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 440;
+    gain.gain.value = 0.05;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    ringtoneOsc = {ctx, osc};
+    setTimeout(stopRingtone, 20000);  // stop on its own if never answered/declined
+  } catch(_) {}
+}
+function stopRingtone() {
+  if(ringtoneOsc) { try { ringtoneOsc.osc.stop(); ringtoneOsc.ctx.close(); } catch(_) {} ringtoneOsc = null; }
 }
 
 function sendMessage() {
@@ -5429,6 +6295,12 @@ async def _cleanup_runtime_tasks(tasks: List[Any]) -> None:
 async def run_node(args: argparse.Namespace) -> None:
     if (not _is_local_host(args.http_host) or not _is_local_host(args.ui_ws_host)) and not args.allow_remote_ui:
         raise SystemExit("Refusing to expose the UI on a non-local interface without --allow-remote-ui")
+    if args.ice_servers:
+        try:
+            json.loads(args.ice_servers)  # validate before handing it to the node
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--ice-servers is not valid JSON: {exc}")
+        os.environ["QUANTUM_CHAT_ICE_SERVERS"] = args.ice_servers
     direct_url = None
     if args.enable_direct:
         advertised_host = args.direct_advertise_host or args.direct_host
@@ -5559,6 +6431,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-storage-mb", type=int, default=DEFAULT_MAX_STORAGE_MB,
         help=f"disk quota in MB for received/sent file bytes, 0 disables enforcement (default: {DEFAULT_MAX_STORAGE_MB})"
+    )
+    parser.add_argument(
+        "--ice-servers", default=None,
+        help="JSON list of WebRTC ICE servers for voice/video calls, e.g. "
+             '\'[{"urls":"stun:stun.l.google.com:19302"},'
+             '{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]\'. '
+             "Defaults to a public STUN-only server, or $QUANTUM_CHAT_ICE_SERVERS if set. "
+             "STUN alone won't traverse every NAT; add a TURN server for reliable connectivity."
     )
     parser.add_argument(
         "--log-level",

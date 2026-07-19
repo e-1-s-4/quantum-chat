@@ -14,9 +14,13 @@ from chat import (
     PQModule,
     QuantumCrypto,
     files_dir_for_db,
+    pad_plaintext,
+    parse_args,
     parse_http_range,
+    run_node,
     safe_content_type,
     safe_filename,
+    unpad_plaintext,
     validate_file_id,
     validate_label,
     validate_public_key,
@@ -116,6 +120,7 @@ def test_state_payload_is_json_serializable_with_encrypted_rows():
             direct_url=None,
             db=db,
             max_storage_bytes=0,
+            ice_servers=[{"urls": "stun:stun.l.google.com:19302"}],
         )
         node._with_message_metadata = chat_module.QuantumNode._with_message_metadata.__get__(node)
         node._storage_bytes_used = chat_module.QuantumNode._storage_bytes_used.__get__(node)
@@ -503,6 +508,7 @@ def test_remote_mode_ui_url_prints_token(monkeypatch):
         signaling_port=8766,
         ui_ws_host="0.0.0.0",
         max_storage_mb=4096,
+        ice_servers=None,
     )
     # New behavior: graceful shutdown catches CancelledError and exits cleanly.
     import chat
@@ -826,3 +832,108 @@ def test_send_chat_saves_message_before_send_relay():
                 os.remove(path + suffix)
             except FileNotFoundError:
                 pass
+
+
+# ── v3.2.0 additions ─────────────────────────────────────────────────────────
+
+def test_pad_plaintext_round_trips_and_buckets_length():
+    for msg in (b"", b"hi", b"x" * 255, b"x" * 256, b"x" * 257, "👍 unicode test".encode()):
+        padded = pad_plaintext(msg)
+        assert len(padded) % 256 == 0
+        assert unpad_plaintext(padded) == msg
+
+
+def test_pad_plaintext_different_messages_can_share_a_bucket_length():
+    # The whole point: two different short messages should be indistinguishable
+    # by ciphertext length once padded to the same bucket.
+    assert len(pad_plaintext(b"ok")) == len(pad_plaintext(b"sure, sounds good"))
+
+
+def test_unpad_plaintext_rejects_corrupt_length_prefix():
+    with pytest.raises(ValueError):
+        unpad_plaintext(b"\xff\xff\xff\xff" + b"\x00" * 16)
+    with pytest.raises(ValueError):
+        unpad_plaintext(b"\x00\x00")
+
+
+def test_derive_device_sync_key_is_deterministic_and_identity_specific():
+    crypto = QuantumCrypto()
+    sk_a = b"a" * 64
+    sk_b = b"b" * 64
+    key_a1 = crypto.derive_device_sync_key(sk_a)
+    key_a2 = crypto.derive_device_sync_key(sk_a)
+    key_b = crypto.derive_device_sync_key(sk_b)
+    assert key_a1 == key_a2, "same secret key must derive the same sync key every time"
+    assert key_a1 != key_b, "different identities must not share a sync key"
+    assert len(key_a1) == 32
+
+
+def test_search_messages_finds_substring_case_insensitively(tmp_path):
+    db = Database(str(tmp_path / "search.db"), master_key=b"k" * 32)
+    try:
+        db.save_message("m1", "alice", "The quick brown fox", "out", recipient="bob")
+        db.save_message("m2", "bob", "jumps over the lazy dog", "in", recipient="alice")
+        db.save_message("m3", "alice", "totally unrelated", "out", recipient="bob")
+        results = db.search_messages("QUICK BROWN")
+        assert len(results) == 1
+        assert results[0]["msg_id"] == "m1"
+        results2 = db.search_messages("the")
+        assert {r["msg_id"] for r in results2} == {"m1", "m2"}
+        assert db.search_messages("") == []
+        assert db.search_messages("nonexistent phrase") == []
+    finally:
+        db.close()
+
+
+def test_search_messages_can_be_scoped_to_one_target(tmp_path):
+    db = Database(str(tmp_path / "search2.db"), master_key=b"k" * 32)
+    try:
+        db.save_message("m1", "alice", "hello carol", "out", recipient="carol")
+        db.save_message("m2", "alice", "hello dave", "out", recipient="dave")
+        results = db.search_messages("hello", target="carol")
+        assert [r["msg_id"] for r in results] == ["m1"]
+    finally:
+        db.close()
+
+
+def test_signaling_server_supports_multiple_sockets_per_identity():
+    import chat as chat_module
+    server = chat_module.SignalingServer()
+    ws1, ws2 = object(), object()
+    server.clients.setdefault("pk1", set()).add(ws1)
+    server.clients.setdefault("pk1", set()).add(ws2)
+    assert server.clients["pk1"] == {ws1, ws2}
+    # Fan-out target set excludes the sending socket, which is exactly the
+    # logic the relay branch in handle() uses for self-addressed device sync.
+    targets = [t for t in server.clients.get("pk1", ()) if t is not ws1]
+    assert targets == [ws2]
+
+
+def test_pubkey_rate_limit_is_aggregate_across_devices():
+    import chat as chat_module
+    server = chat_module.SignalingServer()
+    for _ in range(300):
+        assert server._pubkey_rate_ok("pk1", limit=300, window=60)
+    # The 301st call within the window should be rejected even though no
+    # single socket individually hit a per-socket limit.
+    assert server._pubkey_rate_ok("pk1", limit=300, window=60) is False
+
+
+def test_ice_servers_default_is_stun_only_and_env_override_is_respected(monkeypatch):
+    import chat as chat_module
+    monkeypatch.delenv("QUANTUM_CHAT_ICE_SERVERS", raising=False)
+    default = chat_module.QuantumNode._load_ice_servers()
+    assert default == [{"urls": "stun:stun.l.google.com:19302"}]
+
+    custom = json.dumps([{"urls": "turn:turn.example.com:3478", "username": "u", "credential": "p"}])
+    monkeypatch.setenv("QUANTUM_CHAT_ICE_SERVERS", custom)
+    assert chat_module.QuantumNode._load_ice_servers() == json.loads(custom)
+
+    monkeypatch.setenv("QUANTUM_CHAT_ICE_SERVERS", "{not valid json")
+    assert chat_module.QuantumNode._load_ice_servers() == [{"urls": "stun:stun.l.google.com:19302"}]
+
+
+def test_run_node_rejects_malformed_ice_servers_cli_flag():
+    args = parse_args(["--ice-servers", "{not json", "--no-browser"])
+    with pytest.raises(SystemExit):
+        asyncio.run(run_node(args))

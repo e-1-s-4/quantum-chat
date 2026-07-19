@@ -82,7 +82,7 @@ if __name__ == "__main__":
             with urllib.request.urlopen(f"{base}/version") as r:
                 data = json.loads(r.read().decode())
             check("version-payload-has-version-and-app",
-                  data.get("version") == "3.1.0" and data.get("app") == "Quantum Chat",
+                  data.get("version") == "3.2.0" and data.get("app") == "Quantum Chat",
                   str(data))
         except Exception as e:
             check("version-payload-has-version-and-app", False, str(e))

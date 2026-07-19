@@ -1,8 +1,8 @@
 # Quantum Chat
 
-**v3.1.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
+**v3.2.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
 
-Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, typing indicators, read receipts, emoji reactions, unread counts, voice messages, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
+Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
 
 > **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has **not** been independently audited. Treat it as hardened experimental application code, not a certified secure messenger. Remote production deployments still need an external security review, TLS termination, operational monitoring, and a clear key-backup plan.
 
@@ -10,6 +10,7 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 
 ## Table of contents
 
+- [What's new in v3.2.0](#whats-new-in-v320)
 - [What's new in v3.1.0](#whats-new-in-v310)
 - [Features](#features)
 - [Requirements](#requirements)
@@ -29,6 +30,32 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 - [Packaging and development](#packaging-and-development)
 - [Historical changelog](#historical-changelog)
 - [License](#license)
+
+---
+
+## What's new in v3.2.0
+
+v3.2.0 is a feature and hardening release. It adds multi-device sync, voice/video calls, and message search, and hardens the relay/session layer to support them safely. The test suite grew to **42 unit tests + 13 live HTTP smoke tests + 15 end-to-end protocol tests + 14 new-feature integration tests (multi-device sync, calls, search, parallel file transfer)**, all passing.
+
+### New features
+
+- **Multi-device sync.** The signaling relay now supports multiple simultaneous connections per identity, so a second device holding the same identity backup can be online at the same time as the first. When you send or receive a message (or clear unread state), a best-effort, end-to-end-encrypted sync event fans out to your other connected devices — encrypted with a key derived from your identity's own secret key via HKDF, so the relay never sees plaintext and no extra handshake is needed. This does not require the second device to hold a live pairwise session with your friend; it just needs to hold your identity. See [Multi-device support](#multi-device-support) for the full design and its limits.
+- **Voice/video calls.** WebRTC call signaling (offer/answer/ICE candidates/hangup/busy) is carried over the same PQ-authenticated relay/direct channel as everything else, with a full call UI: an incoming-call modal, an in-call overlay with local/remote video, mute/camera-off/hang-up controls, and busy detection. **Caveat:** call *signaling* is post-quantum, but the resulting audio/video media stream is standard WebRTC (DTLS-SRTP) negotiated directly between browsers — that leg is not post-quantum, since no mainstream browser offers a PQ WebRTC media path today. Configure ICE servers with `--ice-servers` or `QUANTUM_CHAT_ICE_SERVERS`; the default is a public STUN-only server, which won't traverse every NAT — add a TURN server for reliable connectivity outside a LAN.
+- **Message search.** Full-text (substring, case-insensitive) search across 1:1 and group message history, scoped to the open conversation, via a 🔍 button in the chat header. Since message bodies are encrypted at rest, this decrypts recent history and filters in Python rather than maintaining a plaintext search index — see the `Database.search_messages` docstring for the reasoning.
+
+### Hardening
+
+- **Chat message padding.** Chat and group-chat plaintext is padded to 256-byte buckets before encryption, so ciphertext length leaks only a size bucket to the relay/network observers rather than the exact message length.
+- **Per-identity relay rate limiting.** Multi-device support means one identity can now hold several simultaneous relay connections; a new aggregate per-pubkey rate limit (in addition to the existing per-socket limit) prevents that from being used to multiply an attacker's effective send rate.
+- **Ephemeral relay envelopes.** Typing indicators, ICE candidates, and device-sync pings are now marked ephemeral: if the target isn't currently reachable, the relay drops them instead of persisting them to its offline queue, which previously let best-effort traffic pile up indefinitely for identities that never bring a second device online.
+- **CSP/Permissions-Policy updates for calls.** `connect-src` now allows `stun:`/`turn:` schemes (CSP3-compliant browsers apply `connect-src` to WebRTC connections, not just fetch/WebSocket), and a `Permissions-Policy: camera=(self), microphone=(self)` header explicitly scopes call media access to the app's own origin.
+- **Touch-accessible message actions.** The copy/delete/react controls on each message were gated entirely behind `:hover`, which made them permanently unreachable on touchscreens (no hover state at all). They're now always visible below the tablet breakpoint and on any device that reports no hover capability, and reachable via keyboard focus everywhere.
+- **Accessibility labeling pass.** Icon-only buttons (attach, send, record, add friend, create group, remove group member, search, call, mute, camera) now carry `aria-label`s; new modals use `role="dialog"`/`aria-modal`; message groups carry a stable `data-msg-id` for search-result navigation.
+
+### Performance
+
+- **Parallel group message fan-out.** Sending to a group now dispatches to all recipients concurrently instead of one relay round trip at a time, so the Nth member of a large group no longer waits on N-1 sequential deliveries ahead of them. The same change applies to rotated group key redistribution.
+- **Parallel file-chunk transfer.** File chunks are now sent with bounded concurrency (8 in flight at a time) instead of strictly one at a time, cutting large-file transfer latency over a non-local relay. Chunk counters are still allocated in strict order up front; the existing replay window (2048) comfortably tolerates the resulting out-of-order arrival, and reassembly correctness under concurrent, out-of-order chunks is covered by a live test.
 
 ---
 
@@ -85,17 +112,20 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 - Peers authenticate handshakes with **ML-DSA/Dilithium** signatures and establish shared secrets with **Kyber-512** (ML-KEM-512).
 - Pairwise sessions track a 24-hour lifetime; the UI warns when session keys are close to expiry.
 - Every chat message and file payload is encrypted with **AES-256-GCM** using HKDF-derived per-message keys, bound to sender, recipient, counter, and purpose. Binding both sender and recipient (rather than a single ambiguous "peer" value) keeps the two directions of a session on distinct keys.
+- Chat plaintext is padded to fixed-size buckets before encryption, so ciphertext length leaks only a size bucket to the relay/network observers rather than the exact message length.
 - Replay hardening: inbound chat/file payloads include counters, a replay window accepts valid out-of-order delivery, and duplicate counters/IDs are rejected.
 
 **Networking**
 - Direct peer WebSocket transport with relay fallback: nodes advertise an optional direct listener and try direct encrypted delivery before falling back to the signaling relay.
+- The relay supports multiple simultaneous connections per identity, enabling multi-device sync (see below) — a second device holding the same identity backup can stay online alongside the first.
 - Exponential backoff with up to 30% jitter when reconnecting to the relay.
-- Outbox queues eligible outbound payloads locally when offline; the relay persists offline envelopes in a small SQLite queue.
-- Per-socket rate limiting on both the relay and the direct peer listener; stale rate-limit buckets are GC'd on each new connection.
+- Outbox queues eligible outbound payloads locally when offline; the relay persists offline envelopes in a small SQLite queue. Ephemeral traffic (typing indicators, ICE candidates, device-sync pings) is exempt from offline persistence — it's dropped rather than queued if the target isn't reachable.
+- Per-socket *and* per-identity (aggregate, across all of an identity's device connections) rate limiting on the relay, plus per-IP rate limiting on the direct peer listener; stale rate-limit buckets are GC'd on each new connection.
 
 **Messaging**
 - 1:1 and group chat, with target-scoped message history, quick text filter, and a "Load older messages" pager.
-- Typing indicators (ephemeral relay messages), delivery/read status ticks, a manual **mark read** action, and hover emoji reaction controls.
+- Full-text message search (🔍 in the chat header), scoped to the open 1:1 or group conversation, with click-to-jump navigation to the matched message.
+- Typing indicators (ephemeral relay messages), delivery/read status ticks, a manual **mark read** action, and touch- and keyboard-accessible emoji reaction controls.
 - Per-friend unread counts persist in SQLite and clear when a conversation is read. Browser notifications and title unread-count updates fire when messages arrive while the page is unfocused.
 - Copy-message-to-clipboard and delete-message-locally hover actions on every message.
 - URL auto-linking with `rel="noopener noreferrer"`.
@@ -106,6 +136,12 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 - Voice messages: record a short voice note in the browser (🎙️ button) and send it through the existing encrypted file pipeline; audio files render with an inline player.
 - Drag-and-drop upload support.
 - Configurable storage quota (`--max-storage-mb`) caps total on-disk file bytes; oversized incoming or outgoing files are rejected up front. Usage is tracked incrementally and shown as a bar in the UI.
+
+**Calls**
+- 1:1 voice and video calls, signaled over the same PQ-authenticated relay/direct channel used for everything else (offer/answer/ICE/hangup, all signed and routed like any other message).
+- Busy detection: an offer to an identity already in (or ringing for) a call is answered with a signed `call_end{reason:"busy"}` instead of silently dropped or double-ringing.
+- Incoming-call modal with accept/decline, in-call overlay with local/remote video tiles, and mute/camera-off/hang-up controls.
+- Configurable ICE servers (`--ice-servers` / `QUANTUM_CHAT_ICE_SERVERS`); defaults to public STUN only. The media stream itself is standard WebRTC (DTLS-SRTP), not post-quantum — see [What's new in v3.2.0](#whats-new-in-v320).
 
 **Groups**
 - Create groups from selected friends or comma-separated public keys; group file fan-out.
@@ -120,7 +156,7 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 
 **HTTP & UI security**
 - Browser UI WebSocket requires a random startup token and rejects non-local origins; remote UI binds require `--allow-remote-ui`.
-- HTTP security headers on every response: `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`, `Cache-Control: no-store`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `X-Permitted-Cross-Domain-Policies: none`.
+- HTTP security headers on every response: `Content-Security-Policy` (including `stun:`/`turn:` in `connect-src` for calls), `Permissions-Policy: camera=(self), microphone=(self)`, `X-Content-Type-Options`, `Referrer-Policy`, `Cache-Control: no-store`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`, `X-Permitted-Cross-Domain-Policies: none`.
 - Non-root HTTP routes require the startup token when `--allow-remote-ui` is set.
 
 **Health & observability**
@@ -282,9 +318,12 @@ v3.0 wraps the local key file's passphrase-derived wrapping key with Scrypt inst
 
 ## Multi-device support
 
-Quantum Chat's identity, friends, sessions, and history all live in one local SQLite database, so there's no built-in protocol for keeping multiple devices in sync — that's a substantially larger undertaking (similar in spirit to how other E2E messengers implement multi-device support) than this project takes on.
+Quantum Chat's identity, friends, sessions, and history all live in one local SQLite database per install. As of v3.2.0, two (or more) installs sharing the same identity can be online at once and stay in sync for the things that matter most day to day:
 
-What v3.0 adds is a practical way to *carry your identity* to a second device: from the identity card, choose **Backup / restore** to export your signing keypair as a passphrase-protected string. Importing it on a brand-new install lets that install operate as you (same public key and fingerprint). This does **not** copy your friends list, sessions, or message history — those stay local to each device — and the UI refuses to import over an identity that already has friends or history, to avoid silently orphaning local state. Treat the exported string like a password: anyone with it and the passphrase can act as your identity.
+- **What syncs:** messages you send or receive, and clearing a conversation's unread state. Each device fans these out to your other connected devices as a best-effort event, encrypted with a key derived from your identity's own secret key (HKDF over the secret key — no extra handshake or pairing step needed, since any device holding the same identity backup can derive the same key independently). The relay only ever sees that ciphertext.
+- **What doesn't sync (yet):** friends list changes, group membership changes, verification state, and read receipts sent *to* your peers (as opposed to your own local unread state) are still per-device. Each device manages its own friends/groups DB independently. A message sent from device A syncs to device B even though device B never held a live pairwise session with the recipient — that's the point of syncing the plaintext event rather than trying to multiplex one session across devices, which is a substantially larger undertaking (similar in spirit to Signal's Sesame algorithm) than this project takes on.
+- **Best-effort, not authoritative:** each device's own local database remains the source of truth for its own state. If a sync event fails to deliver (e.g. the other device is offline), it is *not* queued server-side — it's simply not delivered, to avoid the relay's offline queue growing unboundedly for identities that never bring a second device online. A device that was offline when you sent a message from elsewhere will show that message once it reconnects and you send/receive something else on that conversation from either side, but there's no explicit backfill/catch-up sync yet.
+- **Getting a second device set up:** from the identity card, choose **Backup / restore** to export your signing keypair as a passphrase-protected string. Importing it on a brand-new install lets that install operate as you (same public key and fingerprint, and it will now start receiving sync events from your other online devices). The UI refuses to import over an identity that already has friends or history, to avoid silently orphaning local state. Treat the exported string like a password: anyone with it and the passphrase can act as your identity — including receiving your synced messages.
 
 For scripted setups, a brand-new (never-started) database can also be seeded directly at startup by setting `QUANTUM_CHAT_IMPORT_IDENTITY` (the backup string) and `QUANTUM_CHAT_IMPORT_PASSPHRASE` before the first run.
 
@@ -318,6 +357,7 @@ Useful node options:
 | `--direct-port` | `8768` | Port for the direct peer listener. |
 | `--direct-advertise-host` | direct host | Host/IP advertised to friends for direct delivery. |
 | `--max-storage-mb` | `4096` | Disk quota in MB for received/sent file bytes. `0` disables enforcement. |
+| `--ice-servers` | STUN-only default | JSON list of WebRTC ICE servers for voice/video calls, e.g. `'[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]'`. Also settable via `QUANTUM_CHAT_ICE_SERVERS`. STUN alone won't traverse every NAT; add a TURN server for reliable connectivity. |
 | `--log-level` | `WARNING` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
 Run only the signaling server:
@@ -337,6 +377,7 @@ python chat.py signal --host 0.0.0.0 --port 8766
 | `QUANTUM_CHAT_IMPORT_IDENTITY` | A `QCID1:...` backup string to seed a brand-new database with on first run. |
 | `QUANTUM_CHAT_IMPORT_PASSPHRASE` | The passphrase for `QUANTUM_CHAT_IMPORT_IDENTITY`. |
 | `QUANTUM_CHAT_RELAY_DB` | Path for the relay's offline-queue SQLite DB (default: `quantum_chat_relay.db`). |
+| `QUANTUM_CHAT_ICE_SERVERS` | JSON list of WebRTC ICE servers for voice/video calls; overridden by `--ice-servers` if both are set. Defaults to a public STUN-only server. |
 
 ---
 
@@ -348,9 +389,10 @@ requirements.txt                       # Runtime dependencies
 pyproject.toml                         # Package metadata and console entry point
 README.md                              # This document
 LICENSE                                # MIT
-test_validation_and_database.py        # Unit tests (30 cases)
+test_validation_and_database.py        # Unit tests (42 cases)
 scripts/smoke_test.py                  # Live HTTP smoke test (13 checks)
 scripts/e2e_test.py                    # End-to-end protocol test (15 checks)
+scripts/new_features_test.py           # Multi-device sync, calls, search, parallel file transfer (14 checks)
 quantum_chat.db                        # Created at runtime
 quantum_chat.db.key                    # Created at runtime; local at-rest encryption key
 files/                                 # Created at runtime for encrypted transferred files
@@ -365,9 +407,10 @@ Quantum Chat aims to protect message and file contents from the signaling relay 
 Important remaining limits:
 
 - Direct peer WebSocket delivery is attempted when peers advertise reachable direct listeners; the relay remains the fallback for NAT or firewall-restricted peers.
-- Relay-visible metadata is reduced through short-lived aliases and opaque encrypted payloads where possible, but a relay still sees connection timing and enough routing metadata to deliver envelopes.
+- Relay-visible metadata is reduced through short-lived aliases, opaque encrypted payloads, and message-length padding on chat plaintext where possible, but a relay still sees connection timing and enough routing metadata to deliver envelopes.
 - Group messages use stored group epoch keys and signed key distribution; this is stronger than per-message pairwise encryption, though it is not a certified MLS implementation.
-- Delivery acknowledgements, read receipts, reactions, typing indicators, local retries, and relay-persistent offline queues improve UX. There is no multi-device message/history sync — see [Multi-device support](#multi-device-support).
+- Delivery acknowledgements, read receipts, reactions, typing indicators, local retries, and relay-persistent offline queues improve UX. Multi-device sync (v3.2.0) covers message history and unread state between devices sharing one identity, but not friends/group membership changes or peer-facing read receipts — see [Multi-device support](#multi-device-support) for exactly what does and doesn't sync.
+- Voice/video call *signaling* is post-quantum-authenticated, but the negotiated media stream itself is standard WebRTC (DTLS-SRTP/classical crypto) — no mainstream browser offers a PQ WebRTC media path today.
 - File transfer uses encrypted chunks and a signed manifest, encrypted at rest for the duration of the transfer; browsers may still impose practical upload memory limits.
 - Local at-rest encryption can use raw key-file compatibility or passphrase-wrapped key files via `QUANTUM_CHAT_PASSPHRASE` (Scrypt-derived as of v3.0). Protect and back up the active key material.
 - Remote UI exposure is blocked unless `--allow-remote-ui` is provided; production deployments should still put the UI behind TLS and additional access controls.
@@ -383,7 +426,7 @@ Important remaining limits:
 pytest test_validation_and_database.py
 ```
 
-30 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, and `mark_remote_read`.
+42 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
 
 ### Live HTTP smoke test
 
@@ -400,6 +443,14 @@ python scripts/e2e_test.py
 ```
 
 Starts a real signaling server + two real nodes (Alice and Bob), establishes a Kyber session, exchanges an encrypted chat, verifies delivery acks, read receipts, and reactions all propagate end-to-end, and exercises nickname rename + block/unblock. 15 checks. This is the test that caught all three v3.1.0 critical bugs.
+
+### New-feature integration test
+
+```bash
+python scripts/new_features_test.py
+```
+
+Starts a real signaling server + three real nodes: Bob, and Alice running on two devices that share one identity. Verifies both of Alice's devices can be online simultaneously and see each other's identity; that a message Alice sends from device 1 syncs to device 2; that a reply from Bob syncs to device 2 even though device 2 never held a session with Bob; message search (positive and negative); a full call handshake (offer → incoming → answer → active → ICE → busy-on-second-offer → end); and that a multi-chunk file sent with the new bounded-concurrency transfer still reassembles byte-for-byte correctly despite out-of-order parallel chunk arrival. 14 checks.
 
 ### Manual database exercise
 
