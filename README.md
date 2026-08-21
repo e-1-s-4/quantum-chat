@@ -1,6 +1,6 @@
 # Quantum Chat
 
-**v3.3.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
+**v3.4.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
 
 Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
 
@@ -10,6 +10,7 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 
 ## Table of contents
 
+- [What's new in v3.4.0](#whats-new-in-v340)
 - [What's new in v3.3.0](#whats-new-in-v330)
 - [What's new in v3.2.0](#whats-new-in-v320)
 - [What's new in v3.1.0](#whats-new-in-v310)
@@ -33,6 +34,47 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 - [License](#license)
 
 ---
+
+## What's new in v3.4.0
+
+v3.4.0 is a security, correctness, and performance release found by auditing the whole codebase against its own test suite (two tests had drifted out of sync with the hardened relay behavior and now pass again). Wire-compatible with v3.3 peers.
+
+### Security
+
+- **Fixed: stored XSS via inline attachments.** `?view=1` served sender-controlled files inline using the sender-declared MIME type, and `text/html` / `image/svg+xml` were permitted — attacker script could render on the app's own origin, read the UI token out of `/`, and drive the local WebSocket API (up to and including exporting your identity). Inline rendering is now restricted to an inert-type allowlist (images excluding SVG, audio, video, `text/plain`, PDF); everything else downloads as an attachment, and allowed inline views additionally carry a `Content-Security-Policy: sandbox` header.
+- **Fixed: unauthenticated `call_end` frames.** Ending someone's call was the only state-mutating payload kind accepted without a signature; a hostile relay or on-path injector could tear down any active call. It is now verified like every sibling handler, stale `call_id`s are ignored, and blocked peers can no longer influence calls at all (`call_ice`/`call_end` check the blocklist, blocking drops any live call).
+- **Typing indicators are signed.** They were the last unsigned frame kind, letting a hostile relay fabricate presence activity for any identity; invalid signatures are dropped and logged.
+- **Direct-peer replay bound.** Direct transport frames carry a signed timestamp that was never checked; frames older/newer than two minutes are now rejected, shortening the window for replaying captured counterless kinds (receipts, reactions).
+- **Hardened CSP Host interpolation.** In remote mode the raw `Host` header was interpolated into `connect-src`; a semicolon-bearing value could inject arbitrary directives (first occurrence wins). Only syntactically valid `host[:port]` values are used now.
+- **Friendship oracle closed.** Session offers verify the signature before consulting the address book, so friendship state is no longer observable from unauthenticated probes.
+- **Group invite member cap.** The inbound invite path enforces `MAX_GROUP_MEMBERS` like the local create-group path.
+
+### Reliability
+
+- **Group keys reach members whose session was down.** Invites/rotated keys previously skipped anyone without a live pairwise session — permanently and silently: the member then dropped every future group message ("Missing group epoch key") with no way to request the key. Creating a group or rotating its key now starts a handshake toward sessionless members, and whenever a session establishes, owners re-deliver the current epoch key for shared groups (idempotent for peers that already hold it).
+- **Outbox no longer delivers undecryptable garbage after a rekey.** Queued chat/file/group-invite envelopes are sealed under the session key at queue time, but the 24h session TTL guarantees a rekey eventually invalidates them — flushed items then failed on the peer while staying "sent" locally forever. Session-bound queued items now record their sealing session id and are retired visibly (with a UI notice) if the session rekeyed before delivery.
+- **Clean relay closes queue to the outbox.** When the relay closed the connection without an error (restart/deploy), `signaling_ws` kept referencing the dead socket during the backoff window so sends raised instead of queueing; the reference is now cleared when the connection loop exits cleanly.
+- **`broadcast_ui` set-mutation race fixed** (snapshot before iterating), **failed initial UI handshakes no longer leak clients**, and **malformed session accepts no longer burn the pending offer** (validation completes before consumption).
+- **Forward compatibility restored.** Unknown relay payload kinds are logged and ignored instead of raising — a newer peer's extension frames can't tear down an older node's signaling connection. (Two tests had encoded contradictory expectations; both now pass against this documented behavior.)
+- **Shutdown hygiene:** the relay's offline-queue database is actually closed on shutdown (the old cleanup branch read an attribute that never existed), the HTTP server socket is closed, late background-task exceptions are surfaced instead of leaking "task exception was never retrieved", and per-server HTTP state means running two nodes in one process can't cross-wire their routes.
+- **Browser fixes:** per-peer typing-clear timers (a resumed typist's indicator was cleared early by the previous timer), voice-recording stop race (the old global-read `onstop` mislabeled blobs when recordings overlapped), null-safe search-result rendering, and correct per-group unread badges (group messages no longer light up the sender's 1:1 badge, and reading a group no longer clears it).
+
+### Performance
+
+- **Keep-alive direct-peer connections.** Direct delivery used to dial a fresh WebSocket per payload — every file chunk paid a full TCP+WS handshake. Connections are now pooled per peer URL with a single-redial-on-stale retry, and the receiver loops over frames per connection with per-frame rate limiting and auth.
+- **Bulk send-counter reservation.** A max-size file reserved 1,024 chunk counters in 1,024 committed transactions; they're now reserved in one statement.
+- **Session freshness without decryption.** TTL checks read `established_at` directly instead of AES-GCM-decrypting the full session key on every message/reaction/receipt.
+- **HEAD requests don't decrypt files.** `HEAD /files/<id>` serves metadata from the DB instead of reading and decrypting the whole attachment.
+- **PQ keygen cache.** `PQModule` generated and discarded a full ML-DSA keypair on every construction just to measure the public-key length; the measurement is cached per backend module.
+- **Relay offline queue index**, stale replay-counter pruning across rekeys, and rate-limit buckets that stop growing once a source is over its limit.
+
+### Testing
+
+- Unit suite grew to **150 passing tests**, including a new `test_enhancements.py` covering every fix above (inline-serving allowlist, call/typing authentication, group-key redelivery, outbox staleness, direct-frame freshness, per-server HTTP isolation, counter reservation, and more).
+- Live suites all green: 13 smoke checks + 15 end-to-end protocol checks + 14 feature-integration checks, with orderly task teardown in the e2e harness (its background tasks are now cancelled explicitly instead of being left for garbage collection).
+
+---
+
 
 ## What's new in v3.3.0
 
@@ -405,10 +447,12 @@ pyproject.toml                         # Package metadata and console entry poin
 README.md                              # This document
 LICENSE                                # MIT
 test_validation_and_database.py        # Unit tests (44 cases)
+test_node_relay_and_signaling.py       # Node/relay protocol unit tests (61 cases)
 test_error_propagation.py              # Error-surfacing tests (6 cases)
-scripts/smoke_test.py                  # Live HTTP smoke test (13 checks)
-scripts/e2e_test.py                    # End-to-end protocol test (15 checks)
-scripts/new_features_test.py           # Multi-device sync, calls, search, parallel file transfer (14 checks)
+test_enhancements.py                   # v3.4.0 security/reliability regression tests (39 cases)
+smoke_test.py                          # Live HTTP smoke test (13 checks)
+e2e_test.py                            # End-to-end protocol test (15 checks)
+new_features_test.py                   # Multi-device sync, calls, search, parallel file transfer (14 checks)
 quantum_chat.db                        # Created at runtime
 quantum_chat.db.key                    # Created at runtime; local at-rest encryption key
 files/                                 # Created at runtime for encrypted transferred files
@@ -439,9 +483,10 @@ Important remaining limits:
 ### Unit tests
 
 ```bash
-pytest                                       # both unit suites (105 cases)
+pytest                                       # all unit suites (150 cases)
 pytest test_validation_and_database.py       # validation, storage, HTTP
 pytest test_node_relay_and_signaling.py      # node/relay protocol behavior
+pytest test_enhancements.py                  # v3.4.0 security/reliability fixes
 ```
 
 `test_validation_and_database.py` — 44 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
@@ -463,7 +508,7 @@ SQLite persistence are exercised without a network or subprocesses.
 pytest test_error_propagation.py
 ```
 
-6 cases pinning the failure paths that must not be silent: an unrecognized relay payload kind is rejected instead of acked, `search_messages` logs the rows it could not decrypt, a failed `chmod` on the local key file warns, chunk cleanup only credits the quota with bytes it actually freed, an undecryptable attachment returns HTTP 500 rather than dropping the connection, and an unexpected error in a UI command is logged with its traceback.
+6 cases pinning the failure paths that must not be silent: an unrecognized relay payload kind is logged and ignored (forward compatibility) rather than tearing down the connection, `search_messages` logs the rows it could not decrypt, a failed `chmod` on the local key file warns, chunk cleanup only credits the quota with bytes it actually freed, an undecryptable attachment returns HTTP 500 rather than dropping the connection, and an unexpected error in a UI command is logged with its traceback.
 
 ### Live HTTP smoke test
 

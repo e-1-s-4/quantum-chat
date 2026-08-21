@@ -1,6 +1,6 @@
 [project]
 name = "quantum-chat"
-version = "3.3.0"
+version = "3.4.0"
 description = "Single-file post-quantum end-to-end encrypted peer-to-peer chat with a browser UI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,25 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5"]
 [tool.ruff]
 line-length = 160
 target-version = "py310"
+
+[tool.ruff.lint]
+# Explicit selection keeps linting deterministic across ruff versions.
+# BLE001 (broad except) is deliberately not selected: the network layers
+# intentionally catch broad exceptions around best-effort delivery and log
+# them — see the per-site comments.
+select = [
+  "E4",   # pycodestyle errors
+  "E7",   # pycodestyle errors
+  "E9",   # pycodestyle errors
+  "F",    # pyflakes
+  "I",    # import sorting
+  "UP",   # pyupgrade (modern typing)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Standalone scripts adjust sys.path before importing chat.
+"e2e_test.py" = ["E402"]
+"new_features_test.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

@@ -728,8 +728,9 @@ def test_direct_rate_gc_drops_stale_buckets():
     """_direct_rate_gc must drop buckets whose entries have all aged out so
     the dict can't grow unboundedly as peers cycle through source IPs."""
     pytest.importorskip("cryptography")
+    from types import SimpleNamespace  # noqa: I001 — deliberately local to this test
+
     import chat as chat_module
-    from types import SimpleNamespace
     node = SimpleNamespace(_direct_rate={"1.2.3.4": [0], "5.6.7.8": [int(__import__("time").time())]})
     chat_module.QuantumNode._direct_rate_gc(node)
     assert "1.2.3.4" not in node._direct_rate  # aged out, dropped
@@ -795,10 +796,10 @@ def test_send_chat_saves_message_before_send_relay():
     pytest.importorskip("cryptography")
     pytest.importorskip("pqcrypto")
     import chat as chat_module
-    from types import SimpleNamespace
-    import tempfile, os
 
-    fd, path = tempfile.mkstemp(); os.close(fd); os.remove(path)
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    os.remove(path)
     try:
         # Use a real node so we exercise the real save_message path.
         node = chat_module.QuantumNode(
@@ -958,7 +959,6 @@ def test_add_group_member_command(tmp_path):
     pytest.importorskip("cryptography")
     pytest.importorskip("pqcrypto")
     import chat as chat_module
-    import tempfile, os, uuid
 
     db_path = str(tmp_path / "group_add.db")
     node = chat_module.QuantumNode(db_path, "ws://127.0.0.1:65535", direct_url=None, enable_direct=False)

@@ -14,9 +14,12 @@ import pytest
 from chat import ChatHTTPHandler, Database, LocalKeyStore
 
 
-def test_unknown_relay_payload_kind_is_rejected():
+def test_unknown_relay_payload_kind_is_logged_and_ignored(caplog):
     """An unrecognized payload kind used to fall off the end of the dispatch
-    chain, so a sender received an ack for a frame that was never handled."""
+    chain without a trace. Raising on it would tear down the whole signaling
+    connection whenever a newer peer sends an extension frame, so unknown
+    kinds are now ignored for forward compatibility — but visibly: a warning
+    reaches the log instead of the frame vanishing silently."""
     pytest.importorskip("cryptography")
     pytest.importorskip("pqcrypto")
     import chat as chat_module
@@ -24,8 +27,10 @@ def test_unknown_relay_payload_kind_is_rejected():
     node = chat_module.QuantumNode(":memory:", "ws://127.0.0.1:65535", direct_url=None, enable_direct=False)
     try:
         peer, _ = node.crypto.new_identity()
-        with pytest.raises(ValueError, match="Unsupported relay payload kind"):
+        with caplog.at_level(logging.WARNING, logger="quantum_chat"):
             asyncio.run(node.handle_relay_payload(peer.hex(), {"kind": "not_a_real_kind"}))
+        assert any("not_a_real_kind" in r.getMessage() and "unsupported relay payload kind" in r.getMessage().lower()
+                   for r in caplog.records)
     finally:
         node.db.close()
 

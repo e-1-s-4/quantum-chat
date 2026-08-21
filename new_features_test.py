@@ -3,6 +3,7 @@
 and parallel file transfer. Same style/pattern as e2e_test.py."""
 
 from __future__ import annotations
+
 import asyncio
 import sys
 import time
@@ -20,8 +21,10 @@ PORTS = {
 }
 
 sys.path.insert(0, str(ROOT))
-import chat
 import logging
+
+import chat
+
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
 

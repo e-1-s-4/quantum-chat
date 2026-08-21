@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v3.3.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v3.4.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v3.4.0:
+- Security: sender-controlled attachments can no longer render inline as
+  HTML/SVG/XML (stored-XSS fix); inline views are allowlisted and sandboxed
+- Security: call_end and typing frames are now signed and routing-checked;
+  blocked peers lose all call signaling; direct-peer frames carry a freshness
+  bound against replay
+- Reliability: group keys reach members whose session was down (handshake is
+  started and the current epoch key re-delivered on session establishment)
+- Reliability: outbox items sealed under a since-rekeyed session are retired
+  visibly instead of being delivered as undecryptable garbage
+- Reliability: the UI WebSocket broadcast no longer races client set mutation,
+  a clean relay close now queues messages to the outbox, and session accepts
+  that fail validation no longer burn the pending offer
+- Performance: keep-alive pooled direct-peer connections (one handshake per
+  peer instead of per chunk), bulk send-counter reservation, keyless session
+  freshness checks, HEAD requests no longer decrypt whole files
+- Hygiene: per-instance HTTP server state (multi-node safe), relay offline
+  DB actually closed on shutdown, forward-compatible handling of unknown
+  payload kinds, per-group unread badges in the browser UI
 
 New in v3.3.0:
 - Responsive conversation navigation and a compact, accessible action menu
@@ -56,14 +76,14 @@ import time
 import uuid
 import webbrowser
 from dataclasses import dataclass
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import quote, urlparse, parse_qs
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar
+from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -79,6 +99,7 @@ MAX_CHUNK_BYTES = 512 * 1024
 DIRECT_PEER_HOST = "127.0.0.1"
 DIRECT_PEER_PORT = 8768
 PENDING_OFFER_TTL = 5 * 60
+DIRECT_FRAME_MAX_AGE = 2 * 60     # reject direct-peer frames older/newer than this
 SESSION_TTL = 24 * 3600           # 24-hour session key lifetime
 SESSION_WARN_SECS = 3600          # warn when < 1 hour left
 TYPING_INACTIVITY_TTL = 6         # clear typing indicator after N seconds silence
@@ -89,10 +110,26 @@ MAX_NICKNAME_CHARS = 80
 MAX_GROUP_NAME_CHARS = 120
 MAX_FILENAME_CHARS = 180
 MAX_GROUP_MEMBERS = 128
-MAX_REACTION_EMOJI_BYTES = 8
 ALLOWED_REACTIONS = {"👍", "❤️", "😂", "😮", "😢", "🔥"}
+# Sender-controlled content types that may render inline via "?view=1".
+# Deliberately excludes text/html, image/svg+xml, and the XML family: those
+# execute script when rendered on the app's own origin, where attacker JS
+# could read the UI token out of "/" and drive the local WebSocket API.
+INLINE_CONTENT_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+    "image/avif", "image/x-icon",
+    "video/mp4", "video/webm", "video/ogg",
+    "audio/mpeg", "audio/ogg", "audio/wav", "audio/webm", "audio/flac",
+    "audio/aac",
+    "text/plain",
+    "application/pdf",
+}
 SCHEMA_VERSION = 5
 REPLAY_WINDOW = 2048              # accepted out-of-order span for message counters
+# Relay payload kinds whose ciphertext is sealed under a pairwise session key.
+# Queued outbox items of these kinds are retired rather than sent if the
+# session rekeyed while the peer was unreachable — see Database.queue_outbox.
+SESSION_BOUND_KINDS = {"chat", "file", "file_manifest", "file_chunk", "group_invite"}
 FILE_CHUNK_CONCURRENCY = 8        # chunks sent in flight at once per file transfer;
                                    # well under REPLAY_WINDOW so out-of-order arrival is safe
 DEFAULT_MAX_STORAGE_MB = 4096      # default disk quota for received/sent file bytes
@@ -103,7 +140,7 @@ LOG = logging.getLogger("quantum_chat")
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
-def validate_public_key(pubkey: str, expected_bytes: Optional[int] = None) -> str:
+def validate_public_key(pubkey: str, expected_bytes: int | None = None) -> str:
     value = (pubkey or "").strip().lower()
     if not value or len(value) % 2 or not HEX_RE.fullmatch(value):
         raise ValueError("Public key must be a non-empty hexadecimal string")
@@ -135,7 +172,7 @@ def validate_emoji(emoji: str) -> str:
     return emoji
 
 
-def validate_direct_url(value: Any) -> Optional[str]:
+def validate_direct_url(value: Any) -> str | None:
     """Return a peer-advertised direct WebSocket URL, or None if unusable.
 
     The relay hands out this value, so it is attacker-controlled: without a
@@ -179,7 +216,7 @@ def files_dir_for_db(db_path: str) -> Path:
     return Path(FILES_DIR) if db_path == DB_FILE else Path(f"{Path(db_path)}.files")
 
 
-def parse_http_range(value: str, size: int) -> Optional[Tuple[int, int]]:
+def parse_http_range(value: str, size: int) -> tuple[int, int] | None:
     """Parse one RFC 7233 byte range and return inclusive offsets.
 
     Multiple ranges are intentionally unsupported because media elements only
@@ -251,7 +288,7 @@ def unpad_plaintext(data: bytes) -> bytes:
     return data[4:4 + n]
 
 
-def canonical_json(value: Dict[str, Any]) -> bytes:
+def canonical_json(value: dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -275,9 +312,9 @@ def require_websockets():
 
 def require_cryptography():
     try:
+        from cryptography.hazmat.primitives import hashes  # type: ignore
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF  # type: ignore
-        from cryptography.hazmat.primitives import hashes  # type: ignore
         return AESGCM, HKDF, hashes
     except ModuleNotFoundError as exc:
         raise SystemExit("Missing dependency: cryptography. Run `pip install -r requirements.txt`.") from exc
@@ -287,6 +324,11 @@ def require_cryptography():
 
 class PQModule:
     """Compatibility wrapper for pqcrypto import/API variance."""
+
+    # Per-backend cache of the signing public-key length (a constant for a
+    # given algorithm). Keyed by id() of the imported module, which is stable
+    # for the process lifetime because modules persist in sys.modules.
+    _SIGN_PK_LEN_CACHE: ClassVar[dict[int, int]] = {}
 
     def __init__(self) -> None:
         try:
@@ -311,10 +353,18 @@ class PQModule:
                     raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         self.sign_mod = sign_mod
         self.kem_mod = kem_mod
-        pk, _ = self.sign_keypair()
-        self.sign_public_key_bytes = len(pk)
+        # The public-key length is a per-algorithm constant. Measuring it used
+        # to generate and discard a full ML-DSA keypair on every construction
+        # (once per node *and* once per relay), which is pure wasted keygen —
+        # cache the measurement per backend module instead.
+        cached = PQModule._SIGN_PK_LEN_CACHE.get(id(sign_mod))
+        if cached is None:
+            pk, _ = self.sign_keypair()
+            cached = len(pk)
+            PQModule._SIGN_PK_LEN_CACHE[id(sign_mod)] = cached
+        self.sign_public_key_bytes = cached
 
-    def sign_keypair(self) -> Tuple[bytes, bytes]:
+    def sign_keypair(self) -> tuple[bytes, bytes]:
         if hasattr(self.sign_mod, "generate_keypair"):
             return self.sign_mod.generate_keypair()
         elif hasattr(self.sign_mod, "keygen"):
@@ -322,7 +372,7 @@ class PQModule:
         else:
             return self.sign_mod.keypair()
 
-    def kem_keypair(self) -> Tuple[bytes, bytes]:
+    def kem_keypair(self) -> tuple[bytes, bytes]:
         if hasattr(self.kem_mod, "generate_keypair"):
             return self.kem_mod.generate_keypair()
         elif hasattr(self.kem_mod, "keygen"):
@@ -360,7 +410,7 @@ class PQModule:
         LOG.debug("Signature verification returned a falsy result: %r", result)
         return False
 
-    def encapsulate(self, public_key: bytes) -> Tuple[bytes, bytes]:
+    def encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
         if hasattr(self.kem_mod, "encaps"):
             return self.kem_mod.encaps(public_key)
         elif hasattr(self.kem_mod, "encrypt"):
@@ -392,10 +442,10 @@ class QuantumCrypto:
         self.AESGCM, self.HKDF, self.hashes = require_cryptography()
         self.sign_public_key_bytes = self.pq.sign_public_key_bytes
 
-    def new_identity(self) -> Tuple[bytes, bytes]:
+    def new_identity(self) -> tuple[bytes, bytes]:
         return self.pq.sign_keypair()
 
-    def new_kem_keypair(self) -> Tuple[bytes, bytes]:
+    def new_kem_keypair(self) -> tuple[bytes, bytes]:
         return self.pq.kem_keypair()
 
     def sign(self, secret_key: bytes, message: bytes) -> bytes:
@@ -404,14 +454,14 @@ class QuantumCrypto:
     def verify(self, public_key: bytes, message: bytes, signature: bytes) -> bool:
         return self.pq.verify(public_key, message, signature)
 
-    def kem_encapsulate(self, public_key: bytes) -> Tuple[bytes, bytes]:
+    def kem_encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
         return self.pq.encapsulate(public_key)
 
     def kem_decapsulate(self, secret_key: bytes, ciphertext: bytes) -> bytes:
         return self.pq.decapsulate(secret_key, ciphertext)
 
     def derive_session_key(self, shared_secret: bytes, a_pub: str, b_pub: str,
-                           session_id: str, transcript: Optional[Dict[str, Any]] = None) -> bytes:
+                           session_id: str, transcript: dict[str, Any] | None = None) -> bytes:
         transcript_hash = hashlib.sha256(canonical_json(transcript or {})).hexdigest()
         salt = hashlib.sha256("|".join(sorted([a_pub, b_pub]) + [session_id, transcript_hash]).encode()).digest()
         hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt,
@@ -444,12 +494,12 @@ class QuantumCrypto:
                          salt=b"quantum-chat-device-sync-v1", info=b"device-sync")
         return hkdf.derive(secret_key)
 
-    def encrypt(self, key: bytes, plaintext: bytes, aad: bytes = b"") -> Dict[str, str]:
+    def encrypt(self, key: bytes, plaintext: bytes, aad: bytes = b"") -> dict[str, str]:
         nonce = secrets.token_bytes(12)
         ciphertext = self.AESGCM(key).encrypt(nonce, plaintext, aad)
         return {"nonce": b64e(nonce), "ciphertext": b64e(ciphertext)}
 
-    def decrypt(self, key: bytes, packet: Dict[str, str], aad: bytes = b"") -> bytes:
+    def decrypt(self, key: bytes, packet: dict[str, str], aad: bytes = b"") -> bytes:
         return self.AESGCM(key).decrypt(b64d(packet["nonce"]), b64d(packet["ciphertext"]), aad)
 
 
@@ -486,7 +536,7 @@ def pack_identity_backup(public_key: str, secret_key: bytes, passphrase: str) ->
     return f"{IDENTITY_BACKUP_TAG}:{b64e(salt)}:{b64e(nonce)}:{b64e(ciphertext)}"
 
 
-def unpack_identity_backup(blob: str, passphrase: str) -> Tuple[str, bytes]:
+def unpack_identity_backup(blob: str, passphrase: str) -> tuple[str, bytes]:
     parts = (blob or "").strip().split(":")
     if len(parts) != 4 or parts[0] != IDENTITY_BACKUP_TAG:
         raise ValueError("Unrecognized identity backup format")
@@ -497,8 +547,13 @@ def unpack_identity_backup(blob: str, passphrase: str) -> Tuple[str, bytes]:
         payload = AESGCM(key).decrypt(b64d(nonce_b64), b64d(ct_b64), IDENTITY_BACKUP_AAD)
     except Exception as exc:
         raise ValueError("Wrong passphrase or corrupted identity backup") from exc
-    data = json.loads(payload.decode("utf-8"))
-    return validate_public_key(data["pk"]), b64d(data["sk"])
+    try:
+        data = json.loads(payload.decode("utf-8"))
+        return validate_public_key(data["pk"]), b64d(data["sk"])
+    except Exception as exc:
+        # A payload that decrypts but doesn't parse is a corrupted backup, not
+        # a caller bug — keep the same ValueError contract as the paths above.
+        raise ValueError("Corrupted identity backup payload") from exc
 
 
 # ─── Local Key Store ──────────────────────────────────────────────────────────
@@ -513,7 +568,7 @@ class LocalKeyStore:
     """
 
     def __init__(self, db_path: str) -> None:
-        self.path = Path(f"{db_path}.key")
+        self.path = None if db_path == ":memory:" else Path(f"{db_path}.key")
         self.mode = os.environ.get("QUANTUM_CHAT_KEY_MODE", "passphrase" if os.environ.get("QUANTUM_CHAT_PASSPHRASE") else "file")
         self.passphrase = os.environ.get("QUANTUM_CHAT_PASSPHRASE")
 
@@ -529,21 +584,34 @@ class LocalKeyStore:
         return AESGCM(wrapping).decrypt(blob[:12], blob[12:], b"quantum-chat-local-key")
 
     def load_or_create(self) -> bytes:
+        if self.path is None:
+            # An in-memory database has nothing to persist across runs, so an
+            # ephemeral key is correct — and it avoids writing a literal
+            # ":memory:.key" file into the working directory that every
+            # in-memory node would silently share.
+            return secrets.token_bytes(32)
         if self.path.exists():
             raw = self.path.read_bytes().strip()
             try:
                 text = raw.decode("ascii")
-                if text.startswith("QCWRAP1:"):
-                    raise RuntimeError(
-                        "This key file uses the legacy v2.0 HKDF-wrapped format, which used no "
-                        "brute-force work factor for passphrase-derived keys. Set "
-                        "QUANTUM_CHAT_PASSPHRASE and re-run the v2.0 release once to unwrap it, "
-                        "then delete the .key file and start this version fresh so it can be "
-                        "re-wrapped with the stronger Scrypt-based format (QCWRAP2)."
-                    )
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(f"Invalid local key file: {self.path}") from exc
+            # These two remediation errors are raised deliberately: wrapping
+            # them in the generic "invalid key file" handler used to tell a
+            # user who merely forgot QUANTUM_CHAT_PASSPHRASE that their key
+            # file was corrupt.
+            if text.startswith("QCWRAP1:"):
+                raise RuntimeError(
+                    "This key file uses the legacy v2.0 HKDF-wrapped format, which used no "
+                    "brute-force work factor for passphrase-derived keys. Set "
+                    "QUANTUM_CHAT_PASSPHRASE and re-run the v2.0 release once to unwrap it, "
+                    "then delete the .key file and start this version fresh so it can be "
+                    "re-wrapped with the stronger Scrypt-based format (QCWRAP2)."
+                )
+            if text.startswith("QCWRAP2:") and not self.passphrase:
+                raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required for this wrapped key file")
+            try:
                 if text.startswith("QCWRAP2:"):
-                    if not self.passphrase:
-                        raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required for this wrapped key file")
                     _, salt_b64, blob_b64 = text.split(":", 2)
                     key = self._unwrap_key(b64d(blob_b64), b64d(salt_b64))
                 else:
@@ -595,7 +663,7 @@ class LocalKeyStore:
 # ─── Database ─────────────────────────────────────────────────────────────────
 
 class Database:
-    def __init__(self, db_path: str = DB_FILE, master_key: Optional[bytes] = None) -> None:
+    def __init__(self, db_path: str = DB_FILE, master_key: bytes | None = None) -> None:
         self.path = db_path
         self.master_key = master_key
         self.lock = threading.RLock()
@@ -693,7 +761,8 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'queued',
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    session_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS reactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -753,11 +822,11 @@ class Database:
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
 
-    def _columns(self, table: str) -> Set[str]:
+    def _columns(self, table: str) -> set[str]:
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def _ensure_columns(self) -> None:
-        additions: Dict[str, List[Tuple[str, str]]] = {
+        additions: dict[str, list[tuple[str, str]]] = {
             "identity": [("secret_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
             "sessions": [("key_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0"),
                          ("send_counter", "INTEGER NOT NULL DEFAULT 0"),
@@ -773,6 +842,7 @@ class Database:
                         ("verified", "INTEGER NOT NULL DEFAULT 0"),
                         ("blocked", "INTEGER NOT NULL DEFAULT 0"),
                         ("relay_alias", "TEXT"), ("direct_url", "TEXT")],
+            "outbox": [("session_id", "TEXT")],
         }
         for table, cols in additions.items():
             existing = self._columns(table)
@@ -788,14 +858,14 @@ class Database:
         AESGCM, _, _ = require_cryptography()
         return AESGCM(self.master_key)
 
-    def encrypt_blob(self, plaintext: bytes, aad: bytes = b"") -> Tuple[bytes, Optional[bytes], int]:
+    def encrypt_blob(self, plaintext: bytes, aad: bytes = b"") -> tuple[bytes, bytes | None, int]:
         aead = self._aead()
         if not aead:
             return plaintext, None, 0
         nonce = secrets.token_bytes(12)
         return aead.encrypt(nonce, plaintext, aad), nonce, 1
 
-    def decrypt_blob(self, ciphertext: bytes, nonce: Optional[bytes], aad: bytes = b"") -> bytes:
+    def decrypt_blob(self, ciphertext: bytes, nonce: bytes | None, aad: bytes = b"") -> bytes:
         if not nonce:
             return ciphertext
         aead = self._aead()
@@ -805,7 +875,7 @@ class Database:
 
     # ── Identity ──────────────────────────────────────────────────────────────
 
-    def load_identity(self) -> Optional[Tuple[str, bytes]]:
+    def load_identity(self) -> tuple[str, bytes] | None:
         with self.lock:
             row = self.conn.execute(
                 "SELECT public_key, secret_key, secret_nonce FROM identity WHERE id=1"
@@ -829,7 +899,7 @@ class Database:
 
     # ── Friends ───────────────────────────────────────────────────────────────
 
-    def add_friend(self, pubkey: str, nickname: Optional[str] = None) -> None:
+    def add_friend(self, pubkey: str, nickname: str | None = None) -> None:
         nickname = validate_label(nickname, "Nickname", MAX_NICKNAME_CHARS) or None
         with self.lock:
             self.conn.execute(
@@ -846,7 +916,7 @@ class Database:
             self.conn.execute("DELETE FROM sessions WHERE peer_pubkey=?", (pubkey,))
             self.conn.commit()
 
-    def get_friends(self) -> List[Dict[str, Any]]:
+    def get_friends(self) -> list[dict[str, Any]]:
         with self.lock:
             friends = []
             for r in self.conn.execute(
@@ -882,8 +952,8 @@ class Database:
             )
             self.conn.commit()
 
-    def set_friend_transport(self, pubkey: str, relay_alias: Optional[str] = None,
-                             direct_url: Optional[str] = None) -> None:
+    def set_friend_transport(self, pubkey: str, relay_alias: str | None = None,
+                             direct_url: str | None = None) -> None:
         with self.lock:
             self.conn.execute(
                 "UPDATE friends SET relay_alias=COALESCE(?, relay_alias), direct_url=COALESCE(?, direct_url) WHERE pubkey=?",
@@ -896,7 +966,7 @@ class Database:
             self.conn.execute("UPDATE friends SET verified=? WHERE pubkey=?", (int(verified), pubkey))
             self.conn.commit()
 
-    def rename_friend(self, pubkey: str, nickname: Optional[str]) -> str:
+    def rename_friend(self, pubkey: str, nickname: str | None) -> str:
         """Update the nickname of an existing friend. Returns the stored
         nickname (None if cleared). Validates the label so a too-long or
         illegal nickname never reaches the DB."""
@@ -936,7 +1006,7 @@ class Database:
 
     # ── Sessions ──────────────────────────────────────────────────────────────
 
-    def session_summary(self) -> Dict[str, Dict[str, Any]]:
+    def session_summary(self) -> dict[str, dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT peer_pubkey, session_id, established_at, initiator, "
@@ -970,7 +1040,7 @@ class Database:
             )
             self.conn.commit()
 
-    def get_session(self, peer_pubkey: str) -> Optional[Dict[str, Any]]:
+    def get_session(self, peer_pubkey: str) -> dict[str, Any] | None:
         with self.lock:
             row = self.conn.execute(
                 "SELECT * FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
@@ -984,17 +1054,38 @@ class Database:
             )
             return data
 
+    def session_established_at(self, peer_pubkey: str) -> int | None:
+        """Timestamp of the current session with this peer, without paying an
+        AES-GCM decryption of the whole key blob just to read a column."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT established_at FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
+            ).fetchone()
+            return int(row["established_at"]) if row else None
+
     def next_send_counter(self, peer_pubkey: str) -> int:
+        return self.reserve_send_counters(peer_pubkey, 1)[0]
+
+    def reserve_send_counters(self, peer_pubkey: str, count: int) -> list[int]:
+        """Atomically reserve `count` send counters and return them in order.
+
+        Reserving a whole file's chunk counters in one statement replaces a
+        transaction-per-chunk loop (1,024 commits for a max-size file) with a
+        single one, while keeping the strict counter ordering the receiver's
+        replay window expects."""
+        if count < 1:
+            return []
         with self.lock:
             row = self.conn.execute(
                 "SELECT send_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
             ).fetchone()
-            counter = int(row["send_counter"] if row else 0) + 1
+            start = int(row["send_counter"] if row else 0) + 1
+            end = start + count - 1
             self.conn.execute(
-                "UPDATE sessions SET send_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey)
+                "UPDATE sessions SET send_counter=? WHERE peer_pubkey=?", (end, peer_pubkey)
             )
             self.conn.commit()
-            return counter
+            return list(range(start, end + 1))
 
     def mark_recv_counter(self, peer_pubkey: str, counter: int) -> None:
         """Record a received counter with a replay window.
@@ -1025,6 +1116,13 @@ class Database:
             self.conn.execute(
                 "DELETE FROM recv_counters WHERE peer_pubkey=? AND session_id=? AND counter<=?",
                 (peer_pubkey, row["session_id"], max(0, max(highest, counter) - REPLAY_WINDOW))
+            )
+            # Rows from superseded sessions can never match the per-session
+            # cleanup above (save_session mints a new session_id on every
+            # rekey), so prune them by age or they accumulate forever.
+            self.conn.execute(
+                "DELETE FROM recv_counters WHERE peer_pubkey=? AND session_id<>? AND seen_at<=?",
+                (peer_pubkey, row["session_id"], utc_ts() - SESSION_TTL)
             )
             self.conn.commit()
 
@@ -1062,14 +1160,14 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def group_role(self, group_id: str, pubkey: str) -> Optional[str]:
+    def group_role(self, group_id: str, pubkey: str) -> str | None:
         with self.lock:
             row = self.conn.execute(
                 "SELECT role FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pubkey)
             ).fetchone()
             return row["role"] if row else None
 
-    def groups_for(self, pubkey: str) -> List[Dict[str, Any]]:
+    def groups_for(self, pubkey: str) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT g.group_id, g.name, g.created_at, g.owner_pubkey, g.epoch "
@@ -1079,13 +1177,13 @@ class Database:
             )
             return [dict(r) for r in rows]
 
-    def group_members(self, group_id: str) -> List[str]:
+    def group_members(self, group_id: str) -> list[str]:
         with self.lock:
             return [r["pubkey"] for r in self.conn.execute(
                 "SELECT pubkey FROM group_members WHERE group_id=?", (group_id,)
             )]
 
-    def group_details_for(self, pubkey: str) -> List[Dict[str, Any]]:
+    def group_details_for(self, pubkey: str) -> list[dict[str, Any]]:
         groups = self.groups_for(pubkey)
         for group in groups:
             group["members"] = self.group_members(group["group_id"])
@@ -1105,7 +1203,7 @@ class Database:
             self.conn.execute("UPDATE groups SET epoch=? WHERE group_id=?", (epoch, group_id))
             self.conn.commit()
 
-    def get_group_key(self, group_id: str, epoch: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def get_group_key(self, group_id: str, epoch: int | None = None) -> dict[str, Any] | None:
         with self.lock:
             if epoch is None:
                 row = self.conn.execute(
@@ -1125,7 +1223,7 @@ class Database:
     # ── Messages ──────────────────────────────────────────────────────────────
 
     def save_message(self, msg_id: str, sender: str, body: str, direction: str,
-                     recipient: Optional[str] = None, group_id: Optional[str] = None,
+                     recipient: str | None = None, group_id: str | None = None,
                      delivered: bool = False, status: str = "sent") -> bool:
         plaintext = body.encode("utf-8")
         aad = f"message:{msg_id}:{sender}:{recipient or ''}:{group_id or ''}".encode()
@@ -1192,7 +1290,7 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def _hydrate_message_row(self, r: sqlite3.Row) -> Dict[str, Any]:
+    def _hydrate_message_row(self, r: sqlite3.Row) -> dict[str, Any]:
         d = dict(r)
         raw = d["body"]
         raw_b = raw.encode("utf-8", "surrogateescape") if isinstance(raw, str) else raw
@@ -1202,14 +1300,14 @@ class Database:
         d.pop("body_nonce", None)
         return d
 
-    def recent_messages(self, limit: int = MESSAGE_PAGE_SIZE) -> List[Dict[str, Any]]:
+    def recent_messages(self, limit: int = MESSAGE_PAGE_SIZE) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self._hydrate_message_row(r) for r in reversed(rows)]
 
-    def messages_before(self, before_id: int, limit: int = MESSAGE_PAGE_SIZE) -> List[Dict[str, Any]]:
+    def messages_before(self, before_id: int, limit: int = MESSAGE_PAGE_SIZE) -> list[dict[str, Any]]:
         """Fetch an older page of messages for 'load more history' in the UI."""
         with self.lock:
             rows = self.conn.execute(
@@ -1224,8 +1322,8 @@ class Database:
                 "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (before_id,)
             ).fetchone() is not None
 
-    def search_messages(self, query: str, target: Optional[str] = None,
-                        limit: int = 100, scan_limit: int = 20000) -> List[Dict[str, Any]]:
+    def search_messages(self, query: str, target: str | None = None,
+                        limit: int = 100, scan_limit: int = 20000) -> list[dict[str, Any]]:
         """Case-insensitive substring search across message history.
 
         Message bodies are encrypted at rest (see encrypt_blob), so this
@@ -1299,7 +1397,7 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def get_reactions(self, msg_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    def get_reactions(self, msg_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
         if not msg_ids:
             return {}
         with self.lock:
@@ -1309,7 +1407,7 @@ class Database:
                 f"FROM reactions WHERE msg_id IN ({placeholders})",
                 msg_ids
             ).fetchall()
-        result: Dict[str, List[Dict[str, Any]]] = {}
+        result: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             result.setdefault(r["msg_id"], []).append(dict(r))
         return result
@@ -1326,7 +1424,7 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def get_read_receipts(self, msg_ids: List[str]) -> Dict[str, int]:
+    def get_read_receipts(self, msg_ids: list[str]) -> dict[str, int]:
         if not msg_ids:
             return {}
         with self.lock:
@@ -1339,7 +1437,7 @@ class Database:
 
     # ── Files ─────────────────────────────────────────────────────────────────
 
-    def recent_files(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def recent_files(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,)
@@ -1352,9 +1450,9 @@ class Database:
             return files
 
     def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str,
-                  path: str, recipient: Optional[str] = None, group_id: Optional[str] = None,
-                  file_nonce: Optional[bytes] = None, replace: bool = False,
-                  mime_type: Optional[str] = None) -> bool:
+                  path: str, recipient: str | None = None, group_id: str | None = None,
+                  file_nonce: bytes | None = None, replace: bool = False,
+                  mime_type: str | None = None) -> bool:
         file_id = validate_file_id(file_id)
         filename = safe_filename(filename)
         sql = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
@@ -1371,7 +1469,7 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+    def get_file(self, file_id: str) -> dict[str, Any] | None:
         file_id = validate_file_id(file_id)
         with self.lock:
             row = self.conn.execute(
@@ -1381,17 +1479,34 @@ class Database:
 
     # ── Outbox ────────────────────────────────────────────────────────────────
 
-    def queue_outbox(self, target_pubkey: str, payload: Dict[str, Any]) -> None:
+    def queue_outbox(self, target_pubkey: str, payload: dict[str, Any]) -> None:
         now = utc_ts()
+        # Payloads whose ciphertext is bound to a pairwise session key (chat,
+        # file transfers, group-invite key packets) go stale when that session
+        # rekeys — the 24h session TTL guarantees this eventually happens for
+        # anything queued while a peer is offline. Recording the session id at
+        # queue time lets flush_outbox detect and retire those items instead
+        # of delivering ciphertext the peer can only reject as garbage.
+        session_id = None
+        # send_relay queues the full relay envelope, but tolerate a bare
+        # payload shape too.
+        kind = payload.get("kind")
+        if not kind and isinstance(payload.get("payload"), dict):
+            kind = payload["payload"].get("kind")
+        if kind in SESSION_BOUND_KINDS:
+            row = self.conn.execute(
+                "SELECT session_id FROM sessions WHERE peer_pubkey=?", (target_pubkey,)
+            ).fetchone()
+            session_id = row["session_id"] if row else None
         with self.lock:
             self.conn.execute(
-                "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at) "
-                "VALUES (?, ?, 'queued', 0, ?, ?)",
-                (target_pubkey, json.dumps(payload), now, now)
+                "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at, session_id) "
+                "VALUES (?, ?, 'queued', 0, ?, ?, ?)",
+                (target_pubkey, json.dumps(payload), now, now, session_id)
             )
             self.conn.commit()
 
-    def queued_outbox(self, target_pubkey: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def queued_outbox(self, target_pubkey: str, limit: int = 50) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM outbox WHERE target_pubkey=? AND status='queued' "
@@ -1400,15 +1515,15 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def mark_outbox_sent(self, outbox_id: int) -> None:
+    def mark_outbox_sent(self, outbox_id: int, status: str = "sent") -> None:
         with self.lock:
             self.conn.execute(
-                "UPDATE outbox SET status='sent', updated_at=? WHERE id=?", (utc_ts(), outbox_id)
+                "UPDATE outbox SET status=?, updated_at=? WHERE id=?", (status, utc_ts(), outbox_id)
             )
             self.conn.commit()
 
     def save_file_chunk(self, file_id: str, chunk_index: int, total_chunks: int, path: str,
-                       chunk_nonce: Optional[bytes] = None) -> bool:
+                       chunk_nonce: bytes | None = None) -> bool:
         file_id = validate_file_id(file_id)
         with self.lock:
             cur = self.conn.execute(
@@ -1419,14 +1534,14 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def file_chunks(self, file_id: str) -> List[Dict[str, Any]]:
+    def file_chunks(self, file_id: str) -> list[dict[str, Any]]:
         file_id = validate_file_id(file_id)
         with self.lock:
             return [dict(r) for r in self.conn.execute(
                 "SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)
             )]
 
-    def delete_file_chunks(self, file_id: str) -> List[Dict[str, Any]]:
+    def delete_file_chunks(self, file_id: str) -> list[dict[str, Any]]:
         """Remove and return chunk rows for a file, e.g. once reassembly is done."""
         file_id = validate_file_id(file_id)
         with self.lock:
@@ -1445,7 +1560,7 @@ class Database:
             )
             self.conn.commit()
 
-    def metrics(self) -> Dict[str, int]:
+    def metrics(self) -> dict[str, int]:
         with self.lock:
             return {r["name"]: int(r["value"]) for r in self.conn.execute("SELECT name, value FROM metrics")}
 
@@ -1466,12 +1581,12 @@ class PendingOffer:
     session_id: str
     kem_secret_key: bytes
     created_at: int
-    offer_payload: Dict[str, Any]
+    offer_payload: dict[str, Any]
 
 
 class QuantumNode:
     def __init__(self, db_path: str = DB_FILE, signaling_url: str = DEFAULT_SIGNALING_URL,
-                 direct_url: Optional[str] = None, enable_direct: bool = True,
+                 direct_url: str | None = None, enable_direct: bool = True,
                  max_storage_bytes: int = DEFAULT_MAX_STORAGE_MB * 1024 * 1024) -> None:
         self.crypto = QuantumCrypto()
         # Separate nodes commonly run from one checkout during local testing.
@@ -1495,20 +1610,27 @@ class QuantumNode:
             self.db.save_identity(self.public_key, self.secret_key)
         self.signaling_url = signaling_url
         self.signaling_ws: Any = None
-        self.ui_clients: Set[Any] = set()
-        self.online_peers: Set[str] = set()
-        self.pending_offers: Dict[str, PendingOffer] = {}
-        self.sessions: Dict[str, bytes] = {}
-        self.group_members: Dict[str, Set[str]] = {}
+        self.ui_clients: set[Any] = set()
+        self.online_peers: set[str] = set()
+        self.pending_offers: dict[str, PendingOffer] = {}
+        self.sessions: dict[str, bytes] = {}
+        self.group_members: dict[str, set[str]] = {}
         self.ui_token = secrets.token_urlsafe(32)
         self.expected_public_key_bytes = self.crypto.sign_public_key_bytes
         self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
         self.direct_url = direct_url
         self.enable_direct = enable_direct
-        self.peer_direct: Dict[str, str] = {}
-        self._typing_timers: Dict[str, asyncio.TimerHandle] = {}
+        self.peer_direct: dict[str, str] = {}
+        self._typing_timers: dict[str, asyncio.TimerHandle] = {}
         self.max_storage_bytes = max_storage_bytes
-        self._direct_rate: Dict[str, List[int]] = {}
+        self._direct_rate: dict[str, list[int]] = {}
+        # Pooled keep-alive direct-peer connections: direct_url -> open
+        # WebSocket, reused across payloads so each file chunk doesn't pay a
+        # fresh TCP+WS handshake. _direct_send_locks serializes send+ack per
+        # URL so concurrent sends can't interleave their acks.
+        self._direct_pool: dict[str, Any] = {}
+        self._direct_send_locks: dict[str, asyncio.Lock] = {}
+        self._direct_pool_lock = asyncio.Lock()
         # peer_pubkey -> {"call_id", "role" ("caller"/"callee"), "media"
         # ("audio"/"video"), "state" ("ringing"/"active")}. Call *signaling*
         # (offer/answer/ICE candidates) rides the same PQ-authenticated
@@ -1517,12 +1639,12 @@ class QuantumNode:
         # negotiated directly browser-to-browser after signaling completes —
         # that leg is not post-quantum, since no mainstream browser offers a
         # PQ WebRTC media path yet. See README for the full caveat.
-        self.active_calls: Dict[str, Dict[str, Any]] = {}
+        self.active_calls: dict[str, dict[str, Any]] = {}
         self.ice_servers = self._load_ice_servers()
         self._load_state()
 
     @staticmethod
-    def _load_ice_servers() -> List[Dict[str, Any]]:
+    def _load_ice_servers() -> list[dict[str, Any]]:
         raw = os.environ.get("QUANTUM_CHAT_ICE_SERVERS")
         if raw:
             try:
@@ -1553,10 +1675,14 @@ class QuantumNode:
                 self.db.group_members(group["group_id"])
             )
 
-    async def broadcast_ui(self, event: Dict[str, Any]) -> None:
+    async def broadcast_ui(self, event: dict[str, Any]) -> None:
         payload = json.dumps(event)
         dead = []
-        for ws in self.ui_clients:
+        # Snapshot the client set: awaiting a send suspends this coroutine, and
+        # a UI tab opening/closing meanwhile would mutate the set mid-iteration
+        # ("Set changed size during iteration"), aborting the broadcast so
+        # later clients silently miss the event.
+        for ws in list(self.ui_clients):
             try:
                 await ws.send(payload)
             except Exception as exc:
@@ -1565,7 +1691,7 @@ class QuantumNode:
         for ws in dead:
             self.ui_clients.discard(ws)
 
-    def _with_message_metadata(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _with_message_metadata(self, msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         msg_ids = [m["msg_id"] for m in msgs]
         reactions = self.db.get_reactions(msg_ids)
         read_receipts = self.db.get_read_receipts(msg_ids)
@@ -1574,7 +1700,7 @@ class QuantumNode:
             m["read_at"] = read_receipts.get(m["msg_id"])
         return msgs
 
-    def _public_file(self, row: Dict[str, Any]) -> Dict[str, Any]:
+    def _public_file(self, row: dict[str, Any]) -> dict[str, Any]:
         """Return the stable, non-sensitive file shape consumed by the UI."""
         return {
             "file_id": row["file_id"],
@@ -1590,7 +1716,7 @@ class QuantumNode:
             "url": f"/files/{row['file_id']}",
         }
 
-    def state_payload(self) -> Dict[str, Any]:
+    def state_payload(self) -> dict[str, Any]:
         msgs = self._with_message_metadata(self.db.recent_messages())
         has_more = bool(msgs) and self.db.has_messages_before(msgs[0]["id"])
         return {
@@ -1607,15 +1733,17 @@ class QuantumNode:
             "has_more_messages": has_more,
             "files": [QuantumNode._public_file(self, f) for f in self.db.recent_files()],
             "sessions": self.db.session_summary(),
+            "session_ttl": SESSION_TTL,
+            "session_warn_secs": SESSION_WARN_SECS,
             "storage_bytes": self._storage_bytes_used(),
             "max_storage_bytes": self.max_storage_bytes,
             "version": VERSION,
             "ice_servers": self.ice_servers,
         }
 
-    async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any],
+    async def send_relay(self, peer_pubkey: str, payload: dict[str, Any],
                          queue_on_failure: bool = False, ephemeral: bool = False) -> None:
-        envelope: Dict[str, Any] = {"type": "relay", "to": peer_pubkey, "payload": payload}
+        envelope: dict[str, Any] = {"type": "relay", "to": peer_pubkey, "payload": payload}
         if ephemeral:
             # Tell the relay this is best-effort, ephemeral traffic (typing
             # indicators, ICE candidates, device-sync pings) that should be
@@ -1638,23 +1766,43 @@ class QuantumNode:
         await self.signaling_ws.send(json.dumps(envelope))
         self.db.metric_inc("relay_sent")
 
-    async def send_direct(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
-        websockets = require_websockets()
+    async def send_direct(self, peer_pubkey: str, payload: dict[str, Any]) -> None:
         direct_url = self.peer_direct[peer_pubkey]
         hello = {"from": self.public_key, "to": peer_pubkey, "sent_at": utc_ts(), "payload": payload}
         sig = b64e(self.crypto.sign(self.secret_key, canonical_json(hello)))
-        async with websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2) as ws:
-            await ws.send(json.dumps({"type": "direct", **hello, "signature": sig}))
-            ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        frame = json.dumps({"type": "direct", **hello, "signature": sig})
+        # The per-URL lock serializes send+ack on a pooled connection so two
+        # concurrent sends can't interleave their acks; different peers (and
+        # therefore different URLs) still send in parallel.
+        async with self._direct_send_locks.setdefault(direct_url, asyncio.Lock()):
+            ack: dict[str, Any] = {}
+            for attempt in range(2):
+                ws = await self._acquire_direct_conn(direct_url)
+                try:
+                    await ws.send(frame)
+                    ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                    break
+                except Exception:
+                    self._drop_direct_conn(direct_url, ws)
+                    if attempt:
+                        raise
+                    LOG.debug("Pooled direct connection to %s was stale; redialing once", short_key(peer_pubkey))
             if ack.get("type") != "direct_ack":
                 raise RuntimeError("Direct peer did not acknowledge payload")
 
     def _direct_rate_ok(self, remote: str, limit: int = 30, window: int = 60) -> bool:
         now = utc_ts()
         events = [t for t in self._direct_rate.get(remote, []) if now - t < window]
+        # Only record the attempt when it is admitted: appending rejected
+        # attempts too would let a hammering source grow its bucket linearly
+        # with send rate for the whole window (memory lever), and keep-alive
+        # traffic would pin buckets against _direct_rate_gc forever.
+        if len(events) >= limit:
+            self._direct_rate[remote] = events
+            return False
         events.append(now)
         self._direct_rate[remote] = events
-        return len(events) <= limit
+        return True
 
     def _direct_rate_gc(self, window: int = 60) -> None:
         """Drop rate-limit buckets whose entries have all aged out so the
@@ -1667,57 +1815,126 @@ class QuantumNode:
             self._direct_rate.pop(host, None)
 
     async def handle_direct_peer(self, ws: Any) -> None:
+        """Receive loop for the direct-peer transport.
+
+        One long-lived connection now carries many frames — matching the
+        sender's connection pool in send_direct, which used to dial a fresh
+        WebSocket (full TCP+WS handshake) for every single payload. Auth,
+        freshness, rate limiting, and dispatch therefore all happen per
+        frame; a bad frame answers with an error frame instead of tearing
+        the socket down."""
         self._direct_rate_gc()
         remote = getattr(ws, "remote_address", None)
         remote_host = str(remote[0]) if remote else "unknown"
-        if not self._direct_rate_ok(remote_host):
-            await ws.close(code=1008, reason="Rate limit exceeded")
-            return
         try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=5)
-            msg = json.loads(raw)
-            if msg.get("type") != "direct" or msg.get("to") != self.public_key:
-                raise ValueError("Invalid direct peer frame")
-            peer = self.validate_peer_key(msg.get("from", ""))
-            sig = b64d(msg.get("signature", ""))
-            hello = {"from": peer, "to": self.public_key, "sent_at": msg.get("sent_at"), "payload": msg.get("payload")}
-            if not self.crypto.verify(bytes.fromhex(peer), canonical_json(hello), sig):
-                raise ValueError("Invalid direct peer signature")
-            if not self.db.is_friend(peer):
-                raise ValueError("Direct peer is not a trusted friend")
-            await self.handle_relay_payload(peer, msg.get("payload"))
-            await ws.send(json.dumps({"type": "direct_ack"}))
-            self.db.metric_inc("direct_received")
+            async for raw in ws:
+                # Per-frame rate limiting keeps a single keep-alive
+                # connection from carrying an unbounded frame stream.
+                if not self._direct_rate_ok(remote_host):
+                    await ws.close(code=1008, reason="Rate limit exceeded")
+                    return
+                try:
+                    msg = json.loads(raw)
+                    if msg.get("type") != "direct" or msg.get("to") != self.public_key:
+                        raise ValueError("Invalid direct peer frame")
+                    peer = self.validate_peer_key(msg.get("from", ""))
+                    sig = b64d(msg.get("signature", ""))
+                    hello = {"from": peer, "to": self.public_key, "sent_at": msg.get("sent_at"), "payload": msg.get("payload")}
+                    if not self.crypto.verify(bytes.fromhex(peer), canonical_json(hello), sig):
+                        raise ValueError("Invalid direct peer signature")
+                    # The signature covers sent_at, so an on-path observer can replay
+                    # a captured frame verbatim; a freshness bound keeps that window
+                    # short. (Session-bound payloads are additionally protected by
+                    # their replay counters; this guards the signed-but-counterless
+                    # kinds like receipts and reactions.)
+                    sent_at = int(hello["sent_at"] or 0)
+                    if abs(utc_ts() - sent_at) > DIRECT_FRAME_MAX_AGE:
+                        raise ValueError("Direct peer frame is too old or from the future")
+                    if not self.db.is_friend(peer):
+                        raise ValueError("Direct peer is not a trusted friend")
+                    await self.handle_relay_payload(peer, msg.get("payload"))
+                    await ws.send(json.dumps({"type": "direct_ack"}))
+                    self.db.metric_inc("direct_received")
+                except Exception as exc:
+                    self.db.metric_inc("direct_rejected")
+                    LOG.warning("Rejected direct peer frame from %s: %s: %s", remote_host, type(exc).__name__, exc)
+                    LOG.debug("Direct peer frame traceback", exc_info=True)
+                    try:
+                        await ws.send(json.dumps({"type": "error", "text": str(exc)}))
+                    except Exception as send_exc:
+                        LOG.debug("Could not report the error to direct peer %s: %s", remote_host, send_exc)
         except Exception as exc:
-            self.db.metric_inc("direct_rejected")
-            LOG.warning("Rejected direct peer frame from %s: %s: %s", remote_host, type(exc).__name__, exc)
-            LOG.debug("Direct peer frame traceback", exc_info=True)
+            LOG.debug("Direct peer connection from %s ended: %s", remote_host, exc)
+
+    async def _acquire_direct_conn(self, direct_url: str) -> Any:
+        """Return a live pooled connection for this direct URL, dialing a new
+        one only when the pool has none. Reusing connections removes a full
+        TCP+WebSocket handshake from every file chunk / message delivery."""
+        pooled = self._direct_pool.get(direct_url)
+        if pooled is not None:
+            return pooled
+        async with self._direct_pool_lock:
+            pooled = self._direct_pool.get(direct_url)
+            if pooled is None:
+                websockets = require_websockets()
+                pooled = await websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2)
+                self._direct_pool[direct_url] = pooled
+            return pooled
+
+    def _drop_direct_conn(self, direct_url: str, ws: Any) -> None:
+        """Forget a pooled connection that errored mid-use so later sends
+        redial instead of writing into a dead socket."""
+        if self._direct_pool.get(direct_url) is ws:
+            self._direct_pool.pop(direct_url, None)
+
+    async def close_direct_pool(self) -> None:
+        for url, ws in list(self._direct_pool.items()):
+            self._direct_pool.pop(url, None)
             try:
-                await ws.send(json.dumps({"type": "error", "text": str(exc)}))
-            except Exception as send_exc:
-                LOG.debug("Could not report the error to direct peer %s: %s", remote_host, send_exc)
+                await ws.close()
+            except Exception as exc:
+                LOG.debug("Closing pooled direct connection to %s failed: %s", url, exc)
 
     async def flush_outbox(self, peer_pubkey: str) -> None:
         if not self.signaling_ws:
             return
+        current_session = self.db.get_session(peer_pubkey)
+        current_sid = current_session["session_id"] if current_session else None
+        expired = 0
         for item in self.db.queued_outbox(peer_pubkey):
+            # A queued payload sealed under a session that has since rekeyed
+            # can never decrypt on the peer (the receiver raises before any
+            # ack), so sending it would silently strand the message as
+            # "sent_to_relay" forever. Retire it visibly instead.
+            if item.get("session_id") and item["session_id"] != current_sid:
+                self.db.mark_outbox_sent(item["id"], status="expired")
+                expired += 1
+                continue
             await self.signaling_ws.send(item["payload"])
             self.db.mark_outbox_sent(item["id"])
+        if expired:
+            LOG.warning("Retired %d queued message(s) for %s: their session rekeyed while offline",
+                        expired, short_key(peer_pubkey))
+            await self.broadcast_ui({
+                "type": "notice", "level": "error",
+                "text": f"{expired} queued message(s) to {short_key(peer_pubkey)} could not be delivered "
+                        "because the secure session was re-established — please resend.",
+            })
 
     def validate_peer_key(self, pubkey: str) -> str:
         return validate_public_key(pubkey, self.expected_public_key_bytes)
 
-    def encrypt_for_disk(self, raw: bytes, file_id: str) -> Tuple[bytes, Optional[bytes]]:
+    def encrypt_for_disk(self, raw: bytes, file_id: str) -> tuple[bytes, bytes | None]:
         encrypted, nonce, _ = self.db.encrypt_blob(raw, f"file:{file_id}".encode())
         return encrypted, nonce
 
-    def decrypt_from_disk(self, raw: bytes, file_id: str, nonce: Optional[bytes]) -> bytes:
+    def decrypt_from_disk(self, raw: bytes, file_id: str, nonce: bytes | None) -> bytes:
         return self.db.decrypt_blob(raw, nonce, f"file:{file_id}".encode())
 
-    def encrypt_chunk_for_disk(self, raw: bytes, file_id: str, chunk_index: int) -> Tuple[bytes, Optional[bytes]]:
+    def encrypt_chunk_for_disk(self, raw: bytes, file_id: str, chunk_index: int) -> tuple[bytes, bytes | None]:
         return self.db.encrypt_blob(raw, f"file-chunk:{file_id}:{chunk_index}".encode())[:2]
 
-    def decrypt_chunk_from_disk(self, raw: bytes, file_id: str, chunk_index: int, nonce: Optional[bytes]) -> bytes:
+    def decrypt_chunk_from_disk(self, raw: bytes, file_id: str, chunk_index: int, nonce: bytes | None) -> bytes:
         return self.db.decrypt_blob(raw, nonce, f"file-chunk:{file_id}:{chunk_index}".encode())
 
     # ── Storage accounting / quota ────────────────────────────────────────────
@@ -1749,12 +1966,12 @@ class QuantumNode:
     def _track_storage(self, delta_bytes: int) -> None:
         self.db.metric_inc("storage_bytes", delta_bytes)
 
-    def signed_payload(self, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def signed_payload(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         envelope = {"kind": kind, "payload": payload}
         sig = self.crypto.sign(self.secret_key, canonical_json(envelope))
         return {"kind": kind, "payload": payload, "signature": b64e(sig)}
 
-    def verify_signed(self, peer_pubkey: str, data: Dict[str, Any]) -> bool:
+    def verify_signed(self, peer_pubkey: str, data: dict[str, Any]) -> bool:
         sig = b64d(data.get("signature", ""))
         envelope = {"kind": data.get("kind"), "payload": data.get("payload")}
         return self.crypto.verify(bytes.fromhex(peer_pubkey), canonical_json(envelope), sig)
@@ -1768,7 +1985,7 @@ class QuantumNode:
         for peer in expired:
             self.pending_offers.pop(peer, None)
 
-    def health(self) -> Dict[str, Any]:
+    def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
             "version": VERSION,
@@ -1791,8 +2008,8 @@ class QuantumNode:
     # ── Session management ────────────────────────────────────────────────────
 
     def session_fresh(self, peer_pubkey: str) -> bool:
-        session = self.db.get_session(peer_pubkey)
-        return bool(session and utc_ts() - int(session["established_at"]) < SESSION_TTL)
+        established = self.db.session_established_at(peer_pubkey)
+        return bool(established and utc_ts() - established < SESSION_TTL)
 
     async def require_fresh_session(self, peer_pubkey: str, outgoing: bool = True) -> bytes:
         if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
@@ -1829,15 +2046,19 @@ class QuantumNode:
             "text": f"Session offer sent to {short_key(peer_pubkey)}"
         })
 
-    async def handle_session_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_session_offer(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        # Verify the signature BEFORE consulting the address book: checking
+        # is_friend first made friendship status observable from untrusted
+        # input (a stranger's offer was answered with a different notice than
+        # a forged one from a key we happen to know).
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid session offer signature")
         if not self.db.is_friend(peer_pubkey):
             await self.broadcast_ui({
                 "type": "notice", "level": "warning",
                 "text": f"Rejected untrusted session offer from {short_key(peer_pubkey)}"
             })
             return
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid session offer signature")
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Session offer routing metadata mismatch")
@@ -1871,19 +2092,58 @@ class QuantumNode:
             "text": f"Secure session established with {short_key(peer_pubkey)}"
         })
         await self.broadcast_ui(self.state_payload())
+        await self._deliver_group_keys_to(peer_pubkey)
 
-    async def handle_session_accept(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def _deliver_group_keys_to(self, peer_pubkey: str) -> None:
+        """Re-deliver the current epoch key for every group we own that this
+        peer belongs to, after a pairwise session (re)establishes.
+
+        Group invites ride on the recipient's pairwise session, so a member
+        added — or a key rotated — while their session was down would
+        otherwise never receive the key and then silently drop every
+        subsequent group message ("Missing group epoch key") with no way to
+        request it. Re-sending the current epoch key is idempotent for peers
+        that already hold it, so erring toward redelivery is safe."""
+        try:
+            owned = [g for g in self.db.groups_for(self.public_key)
+                     if g.get("owner_pubkey") == self.public_key]
+            for group in owned:
+                gid = group["group_id"]
+                if peer_pubkey not in self.db.group_members(gid):
+                    continue
+                key = self.db.get_group_key(gid)
+                if not key:
+                    continue
+                invite = {
+                    "group_id": gid, "name": group["name"],
+                    "members": self.db.group_members(gid),
+                    "from": self.public_key, "to": peer_pubkey,
+                    "epoch": int(key["epoch"]),
+                }
+                try:
+                    await self.send_group_invite(peer_pubkey, invite, key["key"])
+                except Exception as exc:
+                    LOG.warning("Could not re-deliver group key for %s to %s: %s",
+                                gid[:8], short_key(peer_pubkey), exc)
+        except Exception as exc:
+            LOG.debug("Group-key re-delivery after session setup failed: %s", exc)
+
+    async def handle_session_accept(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid session accept signature")
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Session accept routing metadata mismatch")
-        pending = self.pending_offers.pop(peer_pubkey, None)
+        pending = self.pending_offers.get(peer_pubkey)
         if not pending or pending.session_id != payload["session_id"]:
             raise ValueError("Session accept does not match an active offer")
         if payload.get("protocol") != "quantum-chat-v4":
             raise ValueError("Unsupported session protocol")
+        # Validate everything (and only consume the pending offer once the
+        # decapsulation has succeeded) so a malformed or hostile accept can't
+        # burn the offer and force the initiator to run a whole new handshake.
         secret = self.crypto.kem_decapsulate(pending.kem_secret_key, b64d(payload["ciphertext"]))
+        self.pending_offers.pop(peer_pubkey, None)
         transcript = {
             "offer": pending.offer_payload,
             "ciphertext": payload["ciphertext"],
@@ -1900,11 +2160,12 @@ class QuantumNode:
             "text": f"Secure session established with {short_key(peer_pubkey)}"
         })
         await self.broadcast_ui(self.state_payload())
+        await self._deliver_group_keys_to(peer_pubkey)
 
     # ── Chat ──────────────────────────────────────────────────────────────────
 
     async def send_chat(self, peer_pubkey: str, text: str,
-                        group_id: Optional[str] = None) -> None:
+                        group_id: str | None = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
@@ -1966,7 +2227,7 @@ class QuantumNode:
             "body": text, "delivered": False, "status": "sent_to_relay",
         })
 
-    async def handle_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_chat(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
@@ -2015,23 +2276,32 @@ class QuantumNode:
         if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
             return  # silently skip, session may not exist yet
         try:
-            await self.send_relay(peer_pubkey, {
-                "kind": "typing",
+            await self.send_relay(peer_pubkey, self.signed_payload("typing", {
                 "from": self.public_key,
                 "to": peer_pubkey,
-                "active": active,
-            }, ephemeral=True)
+                "active": bool(active),
+            }), ephemeral=True)
         except Exception as exc:
             # Typing indicators are ephemeral, so a failure must not break the
             # caller — but it still points at a transport problem worth seeing.
             LOG.debug("Failed to send typing indicator to %s: %s", short_key(peer_pubkey), exc)
 
-    async def handle_typing(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_typing(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if self.db.is_blocked(peer_pubkey):
             return  # a blocked peer must not drive our UI
-        if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
+        # Typing frames are signed like every other peer frame now (they used
+        # to be bare, which let a hostile relay fabricate presence activity
+        # for any identity). A bad signature is dropped rather than raised —
+        # best-effort metadata must not tear down the relay connection — but
+        # it is logged, because an invalid typing frame means either a broken
+        # peer or a spoofing attempt against the UI's presence display.
+        if not self.verify_signed(peer_pubkey, data):
+            LOG.warning("Dropping typing indicator from %s: invalid signature", short_key(peer_pubkey))
             return
-        active = bool(data.get("active"))
+        payload = data.get("payload", {})
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            return
+        active = bool(payload.get("active"))
         # Cancel any pending clear timer
         if peer_pubkey in self._typing_timers:
             self._typing_timers[peer_pubkey].cancel()
@@ -2063,7 +2333,7 @@ class QuantumNode:
         except Exception as exc:
             LOG.debug("Failed to send read receipt: %s", exc)
 
-    async def handle_read_receipt(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_read_receipt(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if self.db.is_blocked(peer_pubkey):
             raise ValueError("Read receipt from a blocked peer")
         if not self.verify_signed(peer_pubkey, data):
@@ -2115,7 +2385,7 @@ class QuantumNode:
             "emoji": emoji, "action": action,
         })
 
-    async def handle_reaction(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_reaction(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if self.db.is_blocked(peer_pubkey):
             raise ValueError("Reaction from a blocked peer")
         if not self.verify_signed(peer_pubkey, data):
@@ -2140,7 +2410,7 @@ class QuantumNode:
 
     # ── Multi-device sync ────────────────────────────────────────────────────
 
-    async def sync_to_devices(self, event: str, data: Dict[str, Any]) -> None:
+    async def sync_to_devices(self, event: str, data: dict[str, Any]) -> None:
         """Best-effort fan-out of a local event (a message we just sent or
         received, or a read/unread change) to any other device that shares
         this identity's secret key. Addressed to our own public key so the
@@ -2160,7 +2430,7 @@ class QuantumNode:
         except Exception as exc:
             LOG.debug("Device sync fan-out skipped: %s", exc)
 
-    async def _handle_device_sync(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
+    async def _handle_device_sync(self, peer_pubkey: str, payload: dict[str, Any]) -> None:
         if peer_pubkey != self.public_key or not self.verify_signed(self.public_key, payload):
             raise ValueError("Invalid device sync frame")
         key = self.crypto.derive_device_sync_key(self.secret_key)
@@ -2194,7 +2464,7 @@ class QuantumNode:
 
     # ── Voice/video calls (WebRTC signaling over the authenticated relay) ───
 
-    async def send_call_offer(self, peer_pubkey: str, sdp: Dict[str, Any], media: str = "video") -> None:
+    async def send_call_offer(self, peer_pubkey: str, sdp: dict[str, Any], media: str = "video") -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         if not self.db.is_friend(peer_pubkey):
             raise ValueError("Add this public key as a friend before calling")
@@ -2214,7 +2484,7 @@ class QuantumNode:
             "state": "ringing", "role": "caller", "media": media,
         })
 
-    async def handle_call_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_call_offer(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if not self.db.is_friend(peer_pubkey):
             LOG.warning("Ignoring call offer from non-friend %s", short_key(peer_pubkey))
             return
@@ -2244,7 +2514,7 @@ class QuantumNode:
             "media": media, "sdp": payload.get("sdp"),
         })
 
-    async def send_call_answer(self, peer_pubkey: str, sdp: Dict[str, Any]) -> None:
+    async def send_call_answer(self, peer_pubkey: str, sdp: dict[str, Any]) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         call = self.active_calls.get(peer_pubkey)
         if not call or call["role"] != "callee":
@@ -2259,7 +2529,7 @@ class QuantumNode:
             "state": "active", "role": "callee", "media": call["media"],
         })
 
-    async def handle_call_answer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_call_answer(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid call answer signature")
         payload = data["payload"]
@@ -2274,7 +2544,7 @@ class QuantumNode:
             "call_id": call["call_id"], "sdp": payload.get("sdp"),
         })
 
-    async def send_call_ice(self, peer_pubkey: str, candidate: Dict[str, Any]) -> None:
+    async def send_call_ice(self, peer_pubkey: str, candidate: dict[str, Any]) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         call = self.active_calls.get(peer_pubkey)
         if not call:
@@ -2284,7 +2554,9 @@ class QuantumNode:
             "call_id": call["call_id"], "candidate": candidate,
         }), ephemeral=True)
 
-    async def handle_call_ice(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_call_ice(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        if self.db.is_blocked(peer_pubkey):
+            return  # blocking drops the session; it must not leave a live call channel
         if not self.verify_signed(peer_pubkey, data):
             # Dropped rather than raised because trickle-ICE is best-effort and
             # a single bad candidate shouldn't tear down the relay connection,
@@ -2319,16 +2591,29 @@ class QuantumNode:
             "call_id": call["call_id"], "state": "ended", "reason": reason,
         })
 
-    async def handle_call_end(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        payload = data.get("payload", {}) if isinstance(data, dict) else {}
-        call = self.active_calls.pop(peer_pubkey, None)
+    async def handle_call_end(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        # call_end mutates call state, so it is authenticated like
+        # call_offer/call_answer: without a signature check any peer (or a
+        # hostile relay, which stamps "from") could tear down an active call.
+        if self.db.is_blocked(peer_pubkey):
+            return  # a blocked peer must not end or influence our calls
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid call end signature")
+        payload = data.get("payload", {})
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Call end routing mismatch")
+        call = self.active_calls.get(peer_pubkey)
+        if call and call.get("call_id") != payload.get("call_id"):
+            LOG.debug("Ignoring call_end for a stale call_id from %s", short_key(peer_pubkey))
+            return
+        self.active_calls.pop(peer_pubkey, None)
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey,
             "call_id": (call or {}).get("call_id") or payload.get("call_id"),
             "state": "ended", "reason": payload.get("reason", "hangup"),
         })
 
-    async def send_group_invite(self, peer_pubkey: str, invite: Dict[str, Any], group_key: bytes) -> None:
+    async def send_group_invite(self, peer_pubkey: str, invite: dict[str, Any], group_key: bytes) -> None:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         counter = self.db.next_send_counter(peer_pubkey)
         invite = {**invite, "counter": counter}
@@ -2365,6 +2650,11 @@ class QuantumNode:
                     await self.send_group_invite(member, invite, new_key)
                 except Exception as exc:
                     LOG.warning("Failed to deliver rotated group key to %s: %s", short_key(member), exc)
+            else:
+                # Member's session is down: start a handshake so the fresh
+                # epoch key reaches them via _deliver_group_keys_to once the
+                # session establishes, instead of silently cutting them off.
+                await self._handshake_for_group_keys(member)
 
         await asyncio.gather(*(deliver_key(m) for m in members if m != self.public_key))
         await self.broadcast_ui({
@@ -2372,6 +2662,14 @@ class QuantumNode:
             "text": f"Group key rotated (epoch {new_epoch})"
         })
         await self.broadcast_ui(self.state_payload())
+
+    async def _handshake_for_group_keys(self, member: str) -> None:
+        """Best-effort handshake initiation so pending group keys can flow."""
+        try:
+            await self.connect_peer(member)
+        except Exception as exc:
+            LOG.warning("Could not start handshake with %s for group key delivery: %s",
+                        short_key(member), exc)
 
     async def remove_group_member(self, group_id: str, pubkey: str) -> None:
         if self.db.group_role(group_id, self.public_key) != "owner":
@@ -2433,7 +2731,7 @@ class QuantumNode:
         }})
 
     async def send_group_file(self, group_id: str, filename: str, encoded: str,
-                              content_type: Optional[str] = None) -> None:
+                              content_type: str | None = None) -> None:
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
@@ -2449,8 +2747,8 @@ class QuantumNode:
     # ── File transfer ─────────────────────────────────────────────────────────
 
     async def send_file(self, peer_pubkey: str, filename: str, encoded: str,
-                        group_id: Optional[str] = None,
-                        content_type: Optional[str] = None) -> None:
+                        group_id: str | None = None,
+                        content_type: str | None = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         raw = b64d(encoded)
         if len(raw) > MAX_FILE_BYTES:
@@ -2482,7 +2780,7 @@ class QuantumNode:
         # those out with bounded concurrency rather than one at a time. The
         # receive-side replay window (REPLAY_WINDOW) comfortably tolerates
         # the resulting out-of-order arrival.
-        counters = [self.db.next_send_counter(peer_pubkey) for _ in range(total_chunks)]
+        counters = self.db.reserve_send_counters(peer_pubkey, total_chunks)
         chunk_semaphore = asyncio.Semaphore(FILE_CHUNK_CONCURRENCY)
 
         async def send_chunk(idx: int, counter: int) -> None:
@@ -2508,7 +2806,7 @@ class QuantumNode:
             "storage_bytes": self._storage_bytes_used(),
         })
 
-    async def handle_file(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_file(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         # Backward-compatible single-packet file receiver.
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
         meta = data["payload"]
@@ -2521,7 +2819,7 @@ class QuantumNode:
         self.db.mark_recv_counter(peer_pubkey, counter)
         await self._store_complete_file(peer_pubkey, meta, raw, file_id)
 
-    async def handle_file_manifest(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_file_manifest(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid file manifest signature")
         meta = data.get("payload", {})
@@ -2535,12 +2833,13 @@ class QuantumNode:
             raise ValueError("File exceeds configured limit")
         if total_chunks != expected_chunks or int(meta.get("chunk_size", 0)) != MAX_CHUNK_BYTES:
             raise ValueError("Invalid file manifest chunk layout")
-        safe_filename(meta.get("filename"))
-        safe_content_type(meta.get("mime_type"), str(meta.get("filename") or ""))
+        # Manifest metadata is re-sanitized where it is actually persisted
+        # (_store_complete_file); calling the validators here and discarding
+        # the results validated nothing.
         self._check_storage_quota(size)
         self.db.metric_inc("file_manifests_received")
 
-    async def handle_file_chunk(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_file_chunk(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
         meta = data["payload"]
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
@@ -2593,7 +2892,7 @@ class QuantumNode:
             self._cleanup_file_chunks(file_id, chunks)
             await self._store_complete_file(peer_pubkey, meta, raw, file_id)
 
-    def _cleanup_file_chunks(self, file_id: str, chunks: List[Dict[str, Any]]) -> None:
+    def _cleanup_file_chunks(self, file_id: str, chunks: list[dict[str, Any]]) -> None:
         """Delete on-disk chunk shards and their DB rows once a transfer is
         reassembled (or has failed), so no encrypted-at-rest debris or stale
         rows linger, and the storage quota accounting stays accurate."""
@@ -2618,7 +2917,7 @@ class QuantumNode:
         if freed:
             self._track_storage(-freed)
 
-    async def _store_complete_file(self, peer_pubkey: str, meta: Dict[str, Any], raw: bytes, file_id: str) -> None:
+    async def _store_complete_file(self, peer_pubkey: str, meta: dict[str, Any], raw: bytes, file_id: str) -> None:
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError("File exceeds configured limit")
         if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
@@ -2642,7 +2941,7 @@ class QuantumNode:
                 "storage_bytes": self._storage_bytes_used(),
             })
 
-    async def handle_group_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+    async def handle_group_chat(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid group message signature")
         payload = data.get("payload", {})
@@ -2659,7 +2958,10 @@ class QuantumNode:
         inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
                                         delivered=True, status="delivered")
         if inserted:
-            self.db.increment_unread(peer_pubkey)
+            # Group traffic deliberately does NOT bump the sender's 1:1 unread
+            # counter: that badge belongs to the private conversation with
+            # this friend, and a group message must not light it up (the UI
+            # tracks per-group unread badges itself).
             await self.broadcast_ui({"type": "message", "message": {
                 "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": None, "group_id": group_id, "body": text,
@@ -2669,7 +2971,7 @@ class QuantumNode:
 
     # ── Relay dispatch ────────────────────────────────────────────────────────
 
-    async def handle_relay_payload(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
+    async def handle_relay_payload(self, peer_pubkey: str, payload: dict[str, Any]) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         if not isinstance(payload, dict):
             raise ValueError("Relay payload must be an object")
@@ -2726,7 +3028,13 @@ class QuantumNode:
                 raise ValueError("Group invite metadata mismatch")
             group_id = validate_file_id(data["group_id"])
             self.db.create_group(group_id, data.get("name") or f"Group {group_id[:8]}", self.public_key)
-            for member in data.get("members", []):
+            members = data.get("members", [])
+            # The local create-group path caps membership; the inbound invite
+            # path must enforce the same cap or a hostile "friend" can inflate
+            # the members table row by row.
+            if not isinstance(members, list) or len(members) > MAX_GROUP_MEMBERS:
+                raise ValueError("Group invite has too many members")
+            for member in members:
                 self.db.add_group_member(group_id, self.validate_peer_key(member))
             if payload.get("packet"):
                 session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
@@ -2738,12 +3046,13 @@ class QuantumNode:
                 self.db.save_group_key(group_id, int(data.get("epoch", 1)), group_key, peer_pubkey)
             await self.broadcast_ui(self.state_payload())
         else:
-            # An unrecognized kind was previously dropped without a trace, so a
-            # peer on a newer protocol (or an attacker probing the dispatcher)
-            # looked exactly like a successful delivery. Raise so the caller
-            # logs it and the direct transport answers with an error frame
-            # instead of a silent ack.
-            raise ValueError(f"Unsupported relay payload kind: {kind!r}")
+            # An unrecognized kind is logged and ignored rather than raising:
+            # raising here would tear down the whole signaling connection the
+            # moment a peer on a newer protocol sends an extension frame we
+            # don't know about, breaking every future conversation. The log
+            # record keeps probing visible to the operator instead of letting
+            # unknown frames vanish without a trace.
+            LOG.warning("Ignoring unsupported relay payload kind %r from %s", kind, peer_pubkey)
 
     # ── UI WebSocket ──────────────────────────────────────────────────────────
 
@@ -2795,7 +3104,7 @@ class QuantumNode:
         finally:
             self.ui_clients.discard(ws)
 
-    async def _dispatch_ui(self, ws: Any, msg: Dict[str, Any]) -> None:
+    async def _dispatch_ui(self, ws: Any, msg: dict[str, Any]) -> None:
         typ = msg.get("type")
         if typ == "add_friend":
             pubkey = self.validate_peer_key(msg["pubkey"])
@@ -2804,7 +3113,15 @@ class QuantumNode:
             self.db.add_friend(pubkey, msg.get("nickname"))
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
         elif typ == "remove_friend":
-            self.db.remove_friend(self.validate_peer_key(msg["pubkey"]))
+            pubkey = self.validate_peer_key(msg["pubkey"])
+            self.db.remove_friend(pubkey)
+            # Purge in-memory state too: stale session keys must not stay
+            # resident, and send_relay would otherwise keep dialing the removed
+            # peer's advertised direct URL.
+            self.sessions.pop(pubkey, None)
+            self.pending_offers.pop(pubkey, None)
+            self.peer_direct.pop(pubkey, None)
+            self.active_calls.pop(pubkey, None)
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
         elif typ == "verify_friend":
             self.db.verify_friend(self.validate_peer_key(msg["pubkey"]), bool(msg.get("verified", True)))
@@ -2815,9 +3132,13 @@ class QuantumNode:
             self.db.block_friend(pubkey, blocked)
             if blocked:
                 # Drop in-memory session state too — a blocked peer must not
-                # be able to keep sending on the existing session key.
+                # be able to keep sending on the existing session key — along
+                # with their direct-transport hint and any live call, whose
+                # ICE/end handlers only consult active_calls.
                 self.sessions.pop(pubkey, None)
                 self.pending_offers.pop(pubkey, None)
+                self.peer_direct.pop(pubkey, None)
+                self.active_calls.pop(pubkey, None)
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
             await self.broadcast_ui(self.state_payload())
         elif typ == "rename_friend":
@@ -2853,13 +3174,21 @@ class QuantumNode:
                 member = self.validate_peer_key(member)
                 if self.db.is_friend(member):
                     self.db.add_group_member(group_id, member)
-                    if member in self.sessions:
+                    if member in self.sessions and self.session_fresh(member):
                         invite = {
                             "group_id": group_id, "name": name,
                             "members": self.db.group_members(group_id),
                             "from": self.public_key, "to": member, "epoch": 1,
                         }
                         await self.send_group_invite(member, invite, group_key)
+                    else:
+                        # No live pairwise session: the invite can't be sealed
+                        # yet. Start the PQ handshake now instead of skipping
+                        # the member — once the session establishes,
+                        # _deliver_group_keys_to re-sends the current epoch
+                        # key automatically, so this member actually joins the
+                        # group rather than silently dropping every message.
+                        asyncio.ensure_future(self._handshake_for_group_keys(member))
             await self.broadcast_ui(self.state_payload())
         elif typ == "add_group_member":
             group_id = str(msg["group_id"])
@@ -2981,16 +3310,17 @@ class QuantumNode:
                                 "relay_alias": self.relay_alias, "direct_url": self.direct_url,
                             }))
                         else:
-                            await ws.send(json.dumps({
-                                "type": "register", "pubkey": self.public_key,
-                                "relay_alias": self.relay_alias, "direct_url": self.direct_url,
-                            }))
-                            await self._handle_signaling_message(first)
+                            # A compliant relay always opens with a challenge.
+                            # Anything else means we are talking to something
+                            # that will reject a signed registration anyway, so
+                            # surface it and let the reconnect backoff retry.
+                            raise ValueError("Signaling server did not issue a registration challenge")
                     except asyncio.TimeoutError:
-                        await ws.send(json.dumps({
-                            "type": "register", "pubkey": self.public_key,
-                            "relay_alias": self.relay_alias, "direct_url": self.direct_url,
-                        }))
+                        # No challenge within 2s: the peer is not a compliant
+                        # relay (registration is always challenge-signed), so
+                        # retrying the connection beats sending an unsigned
+                        # register that can only be rejected.
+                        raise ValueError("Signaling server did not issue a registration challenge")
                     await self.broadcast_ui({
                         "type": "notice", "level": "success",
                         "text": "Connected to signaling server"
@@ -3000,6 +3330,12 @@ class QuantumNode:
                             await self._handle_signaling_message(json.loads(raw))
                         except Exception as exc:
                             LOG.warning("Ignored malformed signaling message: %s", exc)
+                    # The `async with` also exits without raising when the
+                    # relay closes the connection cleanly (restart, deploy).
+                    # Nulling the reference here is what lets send_relay queue
+                    # to the outbox during the backoff window instead of
+                    # raising ConnectionClosed into a dead socket.
+                    self.signaling_ws = None
             except asyncio.CancelledError:
                 # Cooperative cancellation during shutdown — don't reconnect.
                 self.signaling_ws = None
@@ -3023,7 +3359,7 @@ class QuantumNode:
                 await asyncio.sleep(wait)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
-    async def _handle_signaling_message(self, msg: Dict[str, Any]) -> None:
+    async def _handle_signaling_message(self, msg: dict[str, Any]) -> None:
         if msg.get("type") == "peers":
             raw_peers = msg.get("peers", [])
             if isinstance(raw_peers, dict):
@@ -3031,10 +3367,20 @@ class QuantumNode:
                 for peer, meta in raw_peers.items():
                     if peer != self.public_key and isinstance(meta, dict):
                         direct_url = validate_direct_url(meta.get("direct_url"))
+                        old_url = self.peer_direct.get(peer)
                         if direct_url:
                             self.peer_direct[peer] = direct_url
+                            # A peer that re-advertised a different direct URL
+                            # (restart, port change) invalidates pooled
+                            # connections to the old endpoint.
+                            if old_url and old_url != direct_url:
+                                self._direct_pool.pop(old_url, None)
+                                self._direct_send_locks.pop(old_url, None)
                         else:
                             self.peer_direct.pop(peer, None)
+                            if old_url:
+                                self._direct_pool.pop(old_url, None)
+                                self._direct_send_locks.pop(old_url, None)
                         self.db.set_friend_transport(peer, meta.get("relay_alias"), direct_url)
             else:
                 self.online_peers = set(raw_peers) - {self.public_key}
@@ -3058,21 +3404,22 @@ class SignalingServer:
         # is what makes multi-device support possible: two devices holding
         # the same identity can both stay registered and connected at once,
         # and relay/self-sync traffic fans out to every socket in the set.
-        self.clients: Dict[str, Set[Any]] = {}
-        self.aliases: Dict[str, str] = {}
-        self.peer_meta: Dict[str, Dict[str, Any]] = {}
-        self.offline: Dict[str, List[Dict[str, Any]]] = {}
+        self.clients: dict[str, set[Any]] = {}
+        self.aliases: dict[str, str] = {}
+        self.peer_meta: dict[str, dict[str, Any]] = {}
+        self.offline: dict[str, list[dict[str, Any]]] = {}
         self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), check_same_thread=False)
         self.relay_db.execute("CREATE TABLE IF NOT EXISTS offline_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        self.relay_db.execute("CREATE INDEX IF NOT EXISTS idx_offline_queue_target ON offline_queue(target, id)")
         self.relay_db.commit()
         self.crypto = QuantumCrypto()
-        self.rate: Dict[Any, List[int]] = {}
+        self.rate: dict[Any, list[int]] = {}
         # Per-socket rate limiting (self.rate) is no longer sufficient on its
         # own once one identity can hold several simultaneous connections —
         # an attacker who registers many device sockets under one signed
         # identity could otherwise multiply their effective send rate. This
         # tracks an aggregate ceiling per pubkey across all of its sockets.
-        self.pubkey_rate: Dict[str, List[int]] = {}
+        self.pubkey_rate: dict[str, list[int]] = {}
 
     def _rate_ok(self, ws: Any, limit: int = 120, window: int = 60) -> bool:
         now = utc_ts()
@@ -3251,9 +3598,23 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class ChatHTTPHandler(BaseHTTPRequestHandler):
+    # Class-level values are only fallbacks for direct instantiation (tests).
+    # Real servers bind per-instance copies in __init__ — see start_http — so
+    # two nodes in one process never share (and overwrite) each other's state.
     node: QuantumNode = None  # type: ignore
     ui_ws_port: int = UI_WS_PORT
     require_http_auth: bool = False
+
+    def __init__(self, request: Any, client_address: Any, server: Any) -> None:
+        # BaseHTTPRequestHandler.__init__ runs the whole request lifecycle,
+        # so per-server state must be bound to the instance *before* the
+        # superclass walks in. Reading it off the HTTPServer instance (set by
+        # start_http) keeps multiple nodes in one process isolated.
+        self.node = getattr(server, "node", None) or type(self).node
+        self.ui_ws_port = getattr(server, "ui_ws_port", None) or type(self).ui_ws_port
+        auth = getattr(server, "require_http_auth", None)
+        self.require_http_auth = type(self).require_http_auth if auth is None else auth
+        super().__init__(request, client_address, server)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -3349,12 +3710,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self._security_headers()
             self.end_headers()
-        elif path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._security_headers()
-            self.end_headers()
-        elif path == "/version":
+        elif path == "/health" or path == "/version":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._security_headers()
@@ -3376,48 +3732,66 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "File not found")
             return
 
-        # Read/decrypt failures used to escape into BaseHTTPRequestHandler,
-        # which drops the connection without a status line; the browser then
-        # shows an opaque network error for what is really a server-side
-        # problem. Report it as a 500 and log the cause.
+        total_size = max(0, int(meta.get("size") or 0))
+        wants_inline = parse_qs(parsed.query).get("view", [""])[0] == "1"
+        ctype = safe_content_type(meta.get("mime_type"), meta["filename"])
+        # Attachments are named AND typed by the sender, so "?view=1" may only
+        # render inline for formats browsers treat as inert data. HTML, SVG,
+        # and XML execute script when rendered on the app's own origin — where
+        # the page can read the UI token out of "/" and drive the local
+        # WebSocket API — so anything not on this allowlist is forced to a
+        # download regardless of what the sender claimed.
+        inline = wants_inline and ctype in INLINE_CONTENT_TYPES
+
+        data = b""
+        if not head_only:
+            # Read/decrypt failures used to escape into BaseHTTPRequestHandler,
+            # which drops the connection without a status line; the browser then
+            # shows an opaque network error for what is really a server-side
+            # problem. Report it as a 500 and log the cause.
+            try:
+                stored = Path(meta["storage_path"]).read_bytes()
+                data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
+                        if self.node else stored)
+            except OSError as exc:
+                LOG.error("Could not read attachment %s from %s: %s", file_id, meta["storage_path"], exc)
+                self.send_error(500, "Attachment could not be read")
+                return
+            except Exception:
+                LOG.exception("Could not decrypt attachment %s", file_id)
+                self.send_error(500, "Attachment could not be decrypted")
+                return
         try:
-            stored = Path(meta["storage_path"]).read_bytes()
-            data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
-                    if self.node else stored)
-        except OSError as exc:
-            LOG.error("Could not read attachment %s from %s: %s", file_id, meta["storage_path"], exc)
-            self.send_error(500, "Attachment could not be read")
-            return
-        except Exception:
-            LOG.exception("Could not decrypt attachment %s", file_id)
-            self.send_error(500, "Attachment could not be decrypted")
-            return
-        try:
-            byte_range = parse_http_range(self.headers.get("Range", ""), len(data))
+            byte_range = parse_http_range(self.headers.get("Range", ""), len(data) or total_size)
         except ValueError:
             self.send_response(416)
-            self.send_header("Content-Range", f"bytes */{len(data)}")
+            self.send_header("Content-Range", f"bytes */{total_size}")
             self.send_header("Accept-Ranges", "bytes")
             self._security_headers(download=True)
             self.end_headers()
             return
 
-        start, end = byte_range if byte_range else (0, max(0, len(data) - 1))
+        start, end = byte_range if byte_range else (0, max(0, (len(data) or total_size) - 1))
         body = data[start:end + 1] if data else b""
-        inline = parse_qs(parsed.query).get("view", [""])[0] == "1"
-        ctype = safe_content_type(meta.get("mime_type"), meta["filename"])
         self.send_response(206 if byte_range else 200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
         if byte_range:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data) or total_size}")
         disposition = "inline" if inline else "attachment"
         self.send_header(
             "Content-Disposition",
             f"{disposition}; filename*=UTF-8''{quote(meta['filename'])}"
         )
         self._security_headers(download=not inline)
+        if inline:
+            # Defense in depth for sender-controlled content that is allowed
+            # to render: an opaque-origin sandbox with scripts, forms, and
+            # popups disabled. Media/img rendering from the chat UI is
+            # unaffected because embedded subresources ignore the response's
+            # CSP; this only constrains top-level "?view=1" navigation.
+            self.send_header("Content-Security-Policy", "sandbox")
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
@@ -3431,6 +3805,13 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                        "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;")
         if self.require_http_auth:
             host = (self.headers.get("Host", "") or "").strip()
+            # Only interpolate a syntactically valid host[:port] into the CSP.
+            # The Host header is client-controlled; a value containing ';'
+            # would terminate connect-src early and let an injected directive
+            # (first occurrence wins) weaken the policy for the victim's page.
+            if not re.fullmatch(
+                    r"[0-9A-Za-z.\-]+(?::\d{1,5})?|\[[0-9A-Fa-f:]+\](?::\d{1,5})?", host):
+                host = ""
             if host:
                 host = host.split("/", 1)[0]
                 connect_src = (
@@ -5202,6 +5583,19 @@ let wsRetryDelay = 1000;
 let mode = 'friends';          // 'friends' | 'groups'
 let selectedTarget = null;     // {type:'friend'|'group', id:string}
 let typing = {};               // peer_pubkey -> timestamp
+let typingClearTimers = {};    // peer_pubkey -> timeout id for the clear timer
+// Per-group unread counts, persisted locally so badges survive a reload.
+// Group traffic never touches the server-side per-friend unread counter —
+// that badge belongs to the 1:1 conversation.
+let groupUnread = (() => { try { return JSON.parse(localStorage.getItem('qc_group_unread')||'{}') || {}; } catch(_) { return {}; } })();
+function saveGroupUnread() { try { localStorage.setItem('qc_group_unread', JSON.stringify(groupUnread)); } catch(_){} }
+function bumpGroupUnread(group_id) {
+  groupUnread[group_id] = (groupUnread[group_id]||0) + 1;
+  saveGroupUnread();
+}
+function clearGroupUnread(group_id) {
+  if(groupUnread[group_id]) { delete groupUnread[group_id]; saveGroupUnread(); }
+}
 let typingTimer = null;
 let myTypingActive = false;
 let myTypingTimeout = null;
@@ -5396,12 +5790,15 @@ function handle(d) {
       const friend = state.friends.find(f => f.pubkey === d.message.sender_pubkey);
       const name = friend?.nickname || short(d.message.sender_pubkey);
       notify(name, d.message.body);
-      bumpUnread(d.message.sender_pubkey);
+      if(d.message.group_id) bumpGroupUnread(d.message.group_id);
+      else bumpUnread();
     }
     renderMessages();
     renderSidebar();
     if(isSelected && keepAtBottom) scrollBottom(false);
-    if(isSelected && d.message.direction === 'in') {
+    // Reading a group conversation must not clear the sender's 1:1 badge —
+    // group unread is tracked per group instead.
+    if(isSelected && d.message.direction === 'in' && !d.message.group_id) {
       send({type:'clear_unread', pubkey: d.message.sender_pubkey});
     }
   } else if(d.type === 'file') {
@@ -5415,21 +5812,28 @@ function handle(d) {
     renderMessages();
     if(selectedTarget) scrollBottom(false);
     const isSelected = selectedTarget && matchTarget(fileMessage(file));
-    if(isSelected && file.direction === 'in') send({type:'clear_unread', pubkey:file.sender_pubkey});
+    if(isSelected && file.direction === 'in' && !file.group_id) send({type:'clear_unread', pubkey:file.sender_pubkey});
     if(!isSelected && file.direction === 'in') {
       const friend = state.friends.find(f => f.pubkey === file.sender_pubkey);
       notify(friend?.nickname || short(file.sender_pubkey), `Sent ${file.filename}`);
-      bumpUnread(file.sender_pubkey);
+      if(file.group_id) bumpGroupUnread(file.group_id);
+      else bumpUnread();
     }
     toast(`${file.direction === 'in' ? '📥 Received' : '📤 Sent'} ${file.filename}`, 'success');
   } else if(d.type === 'typing') {
     if(d.active) {
       typing[d.peer] = Date.now();
-      setTimeout(() => {
+      // One clear timer per peer: overlapping timers meant a resumed typist's
+      // indicator was cleared early by the previous timer's expiry.
+      clearTimeout(typingClearTimers[d.peer]);
+      typingClearTimers[d.peer] = setTimeout(() => {
         delete typing[d.peer];
+        delete typingClearTimers[d.peer];
         renderTyping();
       }, 6000);
     } else {
+      clearTimeout(typingClearTimers[d.peer]);
+      delete typingClearTimers[d.peer];
       delete typing[d.peer];
     }
     renderTyping();
@@ -5565,6 +5969,7 @@ function renderSidebar() {
     }
     groups.forEach(g => {
       const isSelected = selectedTarget?.type === 'group' && selectedTarget?.id === g.group_id;
+      const unread = groupUnread[g.group_id] || 0;
       const div = document.createElement('div');
       div.className = 'friend-item' + (isSelected ? ' active' : '');
       div.onclick = () => selectGroup(g.group_id);
@@ -5576,6 +5981,7 @@ function renderSidebar() {
           <div class="friend-name">${esc(g.name)}</div>
           <div class="friend-preview">${(g.members||[]).length} members</div>
         </div>
+        ${unread ? `<div class="friend-meta"><div class="unread-badge">${unread}</div></div>` : ''}
       `;
       el.appendChild(div);
     });
@@ -5726,13 +6132,14 @@ function renderSessions() {
     el.innerHTML = '<span class="muted" style="font-size:12px">No sessions yet</span>';
     return;
   }
-  const SESSION_TTL = 86400;
+  const SESSION_TTL = state.session_ttl || 86400;
+  const WARN_SECS = state.session_warn_secs || 3600;
   el.innerHTML = entries.map(([peer, s]) => {
     const f = state.friends.find(x=>x.pubkey===peer);
     const name = f?.nickname || short(peer);
     const pct = Math.min(100, Math.round((s.expires_in/SESSION_TTL)*100));
-    const cls = pct > 50 ? '' : pct > 20 ? 'warn' : 'danger';
-    const expiresLabel = s.expires_in > 3600
+    const cls = pct*SESSION_TTL > WARN_SECS ? '' : pct*SESSION_TTL > WARN_SECS/3 ? 'warn' : 'danger';
+    const expiresLabel = s.expires_in > WARN_SECS
       ? `${Math.floor(s.expires_in/3600)}h remaining`
       : s.expires_in > 60
       ? `${Math.floor(s.expires_in/60)}m remaining`
@@ -5923,6 +6330,7 @@ function selectFriend(pubkey) {
 
 function selectGroup(group_id) {
   selectedTarget = {type:'group', id:group_id};
+  clearGroupUnread(group_id);
   renderSidebar();
   renderChatHeader();
   renderMessages();
@@ -6090,7 +6498,8 @@ function renderSearchResults(query, results) {
     return;
   }
   el.innerHTML = results.map(m => {
-    const snippet = m.body.length > 160 ? m.body.slice(0, 160) + '…' : m.body;
+    const body = String(m.body ?? '');
+    const snippet = body.length > 160 ? body.slice(0, 160) + '…' : body;
     const who = m.direction === 'out' ? 'You' : short(m.sender_pubkey);
     return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}')">
       <div class="search-result-meta">${esc(who)} · ${relTime(m.timestamp)}</div>
@@ -6427,30 +6836,38 @@ async function toggleVoiceRecording() {
     discardRecording = false;
     const preferred = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'];
     const mimeType = preferred.find(t => MediaRecorder.isTypeSupported?.(t));
-    mediaRecorder = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
-    mediaRecorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onerror = () => {
+    const recorder = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
+    mediaRecorder = recorder;
+    recorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
+    recorder.onerror = () => {
       discardRecording = true;
       stream.getTracks().forEach(t => t.stop());
       toast('Voice recording failed', 'error');
     };
-    mediaRecorder.onstop = () => {
+    // Close over THIS recording's recorder/timer. Reading the globals inside
+    // onstop used to mislabel the blob and clear the wrong timer if a new
+    // recording started before the old one's stop event fired.
+    recorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
       clearInterval(recordTimer);
       $('recIndicator').innerHTML = '';
       $('micBtn').classList.remove('recording');
-      const blob = new Blob(recordedChunks, {type: mediaRecorder.mimeType || 'audio/webm'});
-      const kind = mediaRecorder.mimeType || 'audio/webm';
+      const chunks = recordedChunks;
+      recordedChunks = [];
+      const blob = new Blob(chunks, {type: recorder.mimeType || 'audio/webm'});
+      const kind = recorder.mimeType || 'audio/webm';
       const ext = kind.includes('ogg') ? 'ogg' : kind.includes('mp4') ? 'm4a' : 'webm';
       if(!discardRecording && blob.size > 0) {
         sendFileBlob(blob, `voice-message-${Date.now()}.${ext}`, recordingTarget);
       } else if(!discardRecording) {
         toast('No audio was captured', 'warning');
       }
-      mediaRecorder = null;
-      recordingTarget = null;
+      if(mediaRecorder === recorder) {
+        mediaRecorder = null;
+        recordingTarget = null;
+      }
     };
-    mediaRecorder.start(1000);
+    recorder.start(1000);
     recordStart = Date.now();
     $('micBtn').classList.add('recording');
     recordTimer = setInterval(() => {
@@ -6473,7 +6890,6 @@ function stopVoiceRecording(discard=false) {
   discardRecording = discard;
   mediaRecorder.stop();
 }
-
 // ─── Identity backup / restore ──────────────────────────────────────────────
 function openBackupModal() {
   $('backupModal').classList.add('open');
@@ -6606,7 +7022,7 @@ function isNearBottom() {
 }
 
 // ─── Unread ───────────────────────────────────────────────────────────────────
-function bumpUnread(pubkey) {
+function bumpUnread() {
   unreadTitle++;
   updateTitle();
 }
@@ -6687,10 +7103,13 @@ wsConnect();
 
 def start_http(node: QuantumNode, host: str, port: int,
                ui_ws_port: int = UI_WS_PORT, require_http_auth: bool = False) -> ThreadedHTTPServer:
-    ChatHTTPHandler.node = node
-    ChatHTTPHandler.ui_ws_port = ui_ws_port
-    ChatHTTPHandler.require_http_auth = require_http_auth
     httpd = ThreadedHTTPServer((host, port), ChatHTTPHandler)
+    # State lives on the server instance, not on the handler class: class
+    # attributes are process-global, so starting a second node used to
+    # silently re-point the first node's HTTP routes at the wrong database.
+    httpd.node = node  # type: ignore[attr-defined]
+    httpd.ui_ws_port = ui_ws_port  # type: ignore[attr-defined]
+    httpd.require_http_auth = require_http_auth  # type: ignore[attr-defined]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -6708,21 +7127,31 @@ async def start_direct_peer(node: QuantumNode, host: str, port: int) -> None:
         await asyncio.Future()
 
 
-async def start_signaling(host: str, port: int) -> None:
+async def start_signaling(host: str, port: int) -> SignalingServer:
     websockets = require_websockets()
     server = SignalingServer()
     async with websockets.serve(server.handle, host, port, max_size=MAX_FILE_BYTES * 2):
         LOG.info("Signaling server listening on ws://%s:%d", host, port)
         print(f"Signaling server listening on ws://{host}:{port}")
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        finally:
+            # The relay's offline-queue database must be closed by whoever
+            # owns the server object — the node's client socket never had a
+            # reference to it.
+            try:
+                server.relay_db.close()
+            except Exception as exc:
+                LOG.warning("Relay database did not close cleanly: %s", exc)
+    return server
 
 
 def _is_local_host(host: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
-async def _cleanup_runtime_tasks(tasks: List[Any]) -> None:
-    pending: List[asyncio.Task[Any]] = []
+async def _cleanup_runtime_tasks(tasks: list[Any]) -> None:
+    pending: list[asyncio.Task[Any]] = []
     for task in tasks:
         if isinstance(task, asyncio.Task):
             if not task.done():
@@ -6825,6 +7254,14 @@ async def run_node(args: argparse.Namespace) -> None:
         if 'stop_task' in locals() and not stop_task.done():
             stop_task.cancel()
         await _cleanup_runtime_tasks(tasks)
+        # If the stop event won the race while a long-lived task failed at the
+        # same moment, its exception would otherwise never be retrieved
+        # ("Task exception was never retrieved" noise at loop close).
+        if 'gather_task' in locals() and gather_task.done() and not gather_task.cancelled():
+            exc = gather_task.exception()
+            if exc:
+                LOG.warning("Background task failed during shutdown: %s: %s",
+                            type(exc).__name__, exc)
         # Shutdown steps are independent: one failure must not skip the rest,
         # but a database that refuses to close can mean unflushed writes, so
         # none of these are swallowed silently.
@@ -6833,20 +7270,21 @@ async def run_node(args: argparse.Namespace) -> None:
         except Exception as exc:
             LOG.warning("HTTP server did not shut down cleanly: %s", exc)
         try:
+            httpd.server_close()
+        except Exception as exc:
+            LOG.warning("HTTP server socket did not close cleanly: %s", exc)
+        try:
+            await node.close_direct_pool()
+        except Exception as exc:
+            LOG.warning("Direct-peer connection pool did not close cleanly: %s", exc)
+        try:
             node.db.close()
         except Exception as exc:
             LOG.error("Local database did not close cleanly — recent writes may be lost: %s", exc)
-        # Also close the signaling server's relay DB if we started one.
-        try:
-            relay_db = getattr(getattr(node, "signaling_ws", None), "relay_db", None)
-            if relay_db:
-                relay_db.close()
-        except Exception as exc:
-            LOG.warning("Relay database did not close cleanly: %s", exc)
         print("Goodbye.")
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=f"Quantum Chat v{VERSION} — post-quantum P2P encrypted chat"
     )
@@ -6897,7 +7335,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level, logging.WARNING),

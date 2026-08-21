@@ -6,12 +6,10 @@ This exercises the real pqcrypto + Kyber + Dilithium + AES-GCM crypto path
 end to end, including the critical verify() fix from v3.1.0."""
 
 from __future__ import annotations
+
 import asyncio
-import json
-import os
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -26,8 +24,10 @@ PORTS = {
 }
 
 sys.path.insert(0, str(ROOT))
-import chat
 import logging
+
+import chat
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
 
@@ -45,11 +45,16 @@ async def run_node(db_path: str, http_port: int, ui_port: int, direct_port: int,
     node.allow_remote_ui = False
     # Start the HTTP server (synchronous, in a thread).
     chat.start_http(node, "127.0.0.1", http_port, ui_port, require_http_auth=False)
-    # Start the UI WS, direct peer, and signaling client tasks.
-    asyncio.create_task(chat.start_ui_ws(node, "127.0.0.1", ui_port))
-    asyncio.create_task(chat.start_direct_peer(node, "127.0.0.1", direct_port))
-    asyncio.create_task(node.connect_signaling_loop())
-    return node
+    # Start the UI WS, direct peer, and signaling client tasks. References are
+    # retained by the caller: create_task results are only weakly referenced
+    # by the loop, so an unreferenced background task can be garbage-collected
+    # mid-execution and leave half-open sockets behind.
+    tasks = [
+        asyncio.create_task(chat.start_ui_ws(node, "127.0.0.1", ui_port)),
+        asyncio.create_task(chat.start_direct_peer(node, "127.0.0.1", direct_port)),
+        asyncio.create_task(node.connect_signaling_loop()),
+    ]
+    return node, tasks
 
 
 async def wait_for_signaling(node: chat.QuantumNode, timeout: float = 10.0) -> bool:
@@ -100,13 +105,13 @@ async def main():
 
     # Start Alice and Bob.
     print("Starting Alice (http:", PORTS["alice_http"], ")")
-    alice = await run_node(
+    alice, alice_tasks = await run_node(
         str(WORKDIR / "alice.db"), PORTS["alice_http"], PORTS["alice_ui"],
         PORTS["alice_direct"], PORTS["signaling"],
     )
     print(f"  Alice pubkey: {alice.public_key[:32]}…")
     print("Starting Bob (http:", PORTS["bob_http"], ")")
-    bob = await run_node(
+    bob, bob_tasks = await run_node(
         str(WORKDIR / "bob.db"), PORTS["bob_http"], PORTS["bob_ui"],
         PORTS["bob_direct"], PORTS["signaling"],
     )
@@ -229,21 +234,27 @@ async def main():
     alice.db.block_friend(bob.public_key, blocked=False)
     check("blocking-bob-drops-alice-session-row", blocked_session_dropped)
 
-    # Clean shutdown.
+    # Clean shutdown: cancel every background task (node tasks and the relay)
+    # and await their exit before closing databases, so pooled direct
+    # connections and WS servers tear down in an orderly way.
     print("Shutting down…")
     alice._shutting_down = True
     bob._shutting_down = True
-    signaling_task.cancel()
-    try:
-        await asyncio.sleep(0.5)
-    except Exception:
-        pass
+    all_tasks = [*alice_tasks, *bob_tasks, signaling_task]
+    for t in all_tasks:
+        t.cancel()
+    await asyncio.gather(*all_tasks, return_exceptions=True)
+    for node in (alice, bob):
+        try:
+            await node.close_direct_pool()
+        except Exception as exc:
+            print(f"  note: {type(exc).__name__} while closing direct pool: {exc}")
     alice.db.close()
     bob.db.close()
 
-    passed = sum(1 for n in failures if n not in failures)  # silly
-    total = len(failures) + (15 - len(failures))  # we ran ~15 checks
-    print(f"\n=== E2E summary: {15 - len(failures)}/15 passed, {len(failures)} failed ===")
+    passed = 15 - len(failures)
+    total = 15
+    print(f"\n=== E2E summary: {passed}/{total} passed, {len(failures)} failed ===")
     if failures:
         print("Failed checks:")
         for n in failures:

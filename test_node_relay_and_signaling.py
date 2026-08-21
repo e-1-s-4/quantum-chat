@@ -324,7 +324,7 @@ def test_relay_registration_publishes_alias_and_peer_metadata(relay, tmp_path):
         node.db.close()
 
 
-def test_relay_rejects_a_stale_challenge_and_duplicate_unsigned_registration(relay, tmp_path):
+def test_relay_rejects_a_stale_challenge_and_any_unsigned_registration(relay, tmp_path):
     node = make_node(tmp_path, "stale")
     try:
         socket = run_relay_socket(relay, lambda nonce: [
@@ -332,14 +332,19 @@ def test_relay_rejects_a_stale_challenge_and_duplicate_unsigned_registration(rel
         ])
         assert any(f.get("text") == "Invalid registration signature" for f in socket.frames())
 
-        # An unsigned registration can't prove it holds the identity, so it is
-        # only accepted while that identity has no live socket.
-        relay.clients[node.public_key] = {object()}
+        # Registration is always challenge-signed: an unsigned register cannot
+        # prove it holds the identity's secret key, so it is rejected even when
+        # the identity has no live socket — accepting it would let anyone claim
+        # an offline identity, occupy its routing entry, and drain its queued
+        # envelopes. (Multi-device support is served by *signed* registrations
+        # fanning out to a set of sockets, not by unsigned fallbacks.)
+        relay.clients.pop(node.public_key, None)
         socket = run_relay_socket(relay, lambda nonce: [
             json.dumps({"type": "register", "pubkey": node.public_key}),
         ])
-        assert any(f.get("text") == "Duplicate unsigned registration rejected"
+        assert any(f.get("text") == "Invalid registration signature"
                    for f in socket.frames())
+        assert not any(f.get("type") == "registered" for f in socket.frames())
     finally:
         node.db.close()
 
@@ -1113,7 +1118,13 @@ def test_direct_peer_rejects_a_forged_signature_and_a_rate_flood(pair):
     assert any("signature" in f.get("text", "") for f in socket.frames())
     assert bob.db.metrics()["direct_rejected"] == 1
 
-    flood = FakeSocket()
+    # Rate limiting is enforced per *frame* now that direct connections are
+    # long-lived and carry many frames, so a flooded keep-alive connection is
+    # closed as soon as any frame exceeds the bucket.
+    flood = FakeSocket([
+        json.dumps({"type": "direct", **hello, "signature": b64e(b"\x00" * 64)})
+        for _ in range(3)
+    ])
     flood.remote_address = ("203.0.113.9", 1234)
     bob._direct_rate["203.0.113.9"] = [chat_module.utc_ts()] * 40
     asyncio.run(bob.handle_direct_peer(flood))

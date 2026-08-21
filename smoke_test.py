@@ -6,19 +6,28 @@ Starts a fresh node on a private DB + ports, hits /health, /version,
 verify the graceful-shutdown path. Prints a summary at the end."""
 
 from __future__ import annotations
+
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
-import json
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 WORKDIR = ROOT / "scripts" / "smoke-run"
 WORKDIR.mkdir(parents=True, exist_ok=True)
+
+# Read the application version straight from the source (the smoke test
+# deliberately runs chat.py as a subprocess, not as an imported module).
+APP_VERSION = next(
+    line.split("=")[1].strip().strip('"')
+    for line in (ROOT / "chat.py").read_text().splitlines()
+    if line.startswith('VERSION = "')
+)
 
 # Use private ports so we don't clash with anything else.
 HTTP_PORT = 18080
@@ -82,7 +91,7 @@ if __name__ == "__main__":
             with urllib.request.urlopen(f"{base}/version") as r:
                 data = json.loads(r.read().decode())
             check("version-payload-has-version-and-app",
-                  data.get("version") == "3.3.0" and data.get("app") == "Quantum Chat",
+                  data.get("version") == APP_VERSION and data.get("app") == "Quantum Chat",
                   str(data))
         except Exception as e:
             check("version-payload-has-version-and-app", False, str(e))

@@ -8,3 +8,5 @@ files/
 *.db.key
 *.key.tmp
 scripts/*-run/
+.coverage
+.pytest_cache/
