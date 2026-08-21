@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v3.4.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v3.4.1 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v3.4.1:
+- Fixed: the incoming-call ringtone kept playing for its full timeout after a
+  call was accepted or declined; it is now silenced together with the modal
+  (accept, decline, hangup, and caller-cancel paths), and stale auto-stop
+  timers can no longer cut a later ring short
+- Improved: the ringtone pulses in a classic ring cadence instead of a
+  continuous tone and never overlaps/leaks a previous AudioContext
+- Fixed: group chats now show who sent each incoming message (nickname when
+  the sender is a friend, shortened key otherwise) across text messages,
+  attachments, live delivery, and history; 1:1 chats are unchanged
 
 New in v3.4.0:
 - Security: sender-controlled attachments can no longer render inline as
@@ -83,7 +94,7 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -4368,6 +4379,17 @@ body {
 .msg-group.out { align-items: flex-end; }
 .msg-group.in { align-items: flex-start; }
 
+.msg-sender {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+  margin: 0 6px 2px;
+  max-width: 70%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .msg-bubble {
   max-width: 70%;
   padding: 12px 16px;
@@ -6060,6 +6082,9 @@ function renderMessages() {
     const isOut = m.direction === 'out';
     const sameGroup = m.sender_pubkey === lastSender && idx > 0;
     lastSender = m.sender_pubkey;
+    // Group chats must show who sent each incoming message; consecutive
+    // messages from the same sender are labeled once, like mainstream UIs.
+    const showSender = selectedTarget.type === 'group' && !isOut && !sameGroup;
 
     const statusIcon = isOut ? msgStatus(m) : '';
 
@@ -6083,6 +6108,7 @@ function renderMessages() {
 
     html += `
       <div class="msg-group ${isOut?'out':'in'}" data-msg-id="${esc(m.msg_id)}">
+        ${showSender ? `<div class="msg-sender" title="${esc(m.sender_pubkey)}">${esc(displayName(m.sender_pubkey))}</div>` : ''}
         <div class="msg-bubble" style="${sameGroup?'margin-top:1px':''}">
           ${reactionBar}
           ${bodyHtml}
@@ -6527,6 +6553,10 @@ function jumpToMessage(msgId) {
 function friendName(pubkey) {
   return state.friends.find(f=>f.pubkey===pubkey)?.nickname || short(pubkey);
 }
+function displayName(pubkey) {
+  if(pubkey && pubkey === state.public_key) return 'You';
+  return friendName(pubkey);
+}
 
 async function startCall(media) {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
@@ -6598,7 +6628,7 @@ function handleCallIncoming(d) {
 }
 
 async function acceptCall() {
-  $('incomingCallModal').classList.remove('open');
+  closeIncomingCallUI();
   if(!currentCall || currentCall.role !== 'callee') return;
   if(!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
     toast('Calls are not supported in this browser', 'error');
@@ -6632,9 +6662,16 @@ async function acceptCall() {
 }
 
 function declineCall() {
-  $('incomingCallModal').classList.remove('open');
+  closeIncomingCallUI();
   if(currentCall) send({type:'call_end', pubkey: currentCall.peer, reason:'declined'});
   currentCall = null;
+}
+
+// Dismiss the incoming-call modal and silence the ringtone together — the
+// ringtone used to keep beeping for its full timeout after accept/decline.
+function closeIncomingCallUI() {
+  $('incomingCallModal').classList.remove('open');
+  stopRingtone();
 }
 
 async function handleCallAnswered(d) {
@@ -6720,20 +6757,39 @@ function toggleCallCamera() {
 }
 
 let ringtoneOsc = null;
+let ringPulseTimer = null;
+let ringAutoStopTimer = null;
 function playRingtone() {
+  stopRingtone();  // never let two ringtones overlap or leak AudioContexts
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
+    osc.type = 'sine';
     osc.frequency.value = 440;
-    gain.gain.value = 0.05;
+    gain.gain.value = 0;
     osc.connect(gain).connect(ctx.destination);
     osc.start();
+    // Classic ring cadence (short pulse, pause) instead of a continuous tone.
+    const pulse = () => {
+      try {
+        const t = ctx.currentTime;
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.linearRampToValueAtTime(0.06, t + 0.05);
+        gain.gain.setValueAtTime(0.06, t + 1.1);
+        gain.gain.linearRampToValueAtTime(0.0001, t + 1.2);
+      } catch(err) { console.warn('Ringtone pulse failed', err); }
+    };
+    pulse();
+    ringPulseTimer = setInterval(pulse, 3000);
     ringtoneOsc = {ctx, osc};
-    setTimeout(stopRingtone, 20000);  // stop on its own if never answered/declined
+    ringAutoStopTimer = setTimeout(stopRingtone, 45000);  // stop on its own if never answered/declined
   } catch(err) { console.warn('Could not play the ringtone', err); }
 }
 function stopRingtone() {
+  clearInterval(ringPulseTimer); ringPulseTimer = null;
+  clearTimeout(ringAutoStopTimer); ringAutoStopTimer = null;
   if(ringtoneOsc) {
     try { ringtoneOsc.osc.stop(); ringtoneOsc.ctx.close(); }
     catch(err) { console.warn('Could not stop the ringtone cleanly', err); }

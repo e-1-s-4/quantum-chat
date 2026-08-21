@@ -35,6 +35,16 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 
 ---
 
+## What's new in v3.4.1
+
+v3.4.1 is a small bug-fix release for two user-visible defects. Wire-compatible with v3.4 peers.
+
+- **Fixed: the call bell kept ringing after a call was accepted or declined.** `acceptCall()`/`declineCall()` closed the incoming-call modal but never stopped the ringtone, which played on until its own timeout (up to 20 s) — often straight into the connected call. Modal dismissal and ringtone stop are now one operation used by every exit path (accept, decline, hangup, and the caller cancelling while your phone rings). The stale auto-stop timer is also cancelled, so it can no longer silence a *later* call's ring early, and `playRingtone()` stops any previous tone first so overlapping offers can't leak AudioContexts.
+- **Improved ringtone:** pulses in a classic ring cadence instead of a continuous 440 Hz tone.
+- **Fixed: group chats didn't show who sent each message.** Every incoming bubble looked identical regardless of author. Group conversations now render a sender label above each incoming message — the friend's nickname when set, otherwise a shortened public key with the full key as tooltip — shown once per run of consecutive messages from the same sender, and applied to attachments as well as text. Own outgoing messages and 1:1 chats are unchanged.
+
+---
+
 ## What's new in v3.4.0
 
 v3.4.0 is a security, correctness, and performance release found by auditing the whole codebase against its own test suite (two tests had drifted out of sync with the hardened relay behavior and now pass again). Wire-compatible with v3.3 peers.
