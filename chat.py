@@ -60,7 +60,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import quote, urlparse, parse_qs
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 APP_NAME = "Quantum Chat"
 VERSION = "3.3.0"
@@ -228,6 +228,24 @@ def unpad_plaintext(data: bytes) -> bytes:
 
 def canonical_json(value: Dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def aead_aad(*parts: Any) -> bytes:
+    """Build an AEAD associated-data label from colon-joined parts.
+
+    Every encrypt/decrypt pair for a stored value must agree byte-for-byte on
+    its label, so both sides build it here instead of repeating an f-string.
+    None is rendered as an empty part so optional columns keep a stable label.
+    """
+    return ":".join("" if p is None else str(p) for p in parts).encode()
+
+
+async def ws_send_json(ws: Any, payload: Dict[str, Any]) -> None:
+    await ws.send(json.dumps(payload))
+
+
+async def ws_send_error(ws: Any, text: str) -> None:
+    await ws_send_json(ws, {"type": "error", "text": text})
 
 
 def short_key(pubkey: str) -> str:
@@ -744,6 +762,33 @@ class Database:
                 if name not in existing:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
+    # ── SQL helpers ───────────────────────────────────────────────────────────
+
+    def _write(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
+        """Execute one statement under the connection lock, commit, and return
+        its cursor (callers check ``rowcount``)."""
+        return self._write_many((sql, params))
+
+    def _write_many(self, *statements: Tuple[str, Sequence[Any]]) -> sqlite3.Cursor:
+        """Execute several statements as one locked, committed unit so related
+        rows can never be observed half-written; returns the first cursor."""
+        with self.lock:
+            cursors = [self.conn.execute(sql, params) for sql, params in statements]
+            self.conn.commit()
+            return cursors[0]
+
+    def _fetch_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def _fetch_all(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    @staticmethod
+    def _placeholders(values: Sequence[Any]) -> str:
+        return ",".join("?" * len(values))
+
     # ── AEAD helpers ──────────────────────────────────────────────────────────
 
     def _aead(self):
@@ -770,83 +815,61 @@ class Database:
     # ── Identity ──────────────────────────────────────────────────────────────
 
     def load_identity(self) -> Optional[Tuple[str, bytes]]:
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT public_key, secret_key, secret_nonce FROM identity WHERE id=1"
-            ).fetchone()
-            if not row:
-                return None
-            secret = self.decrypt_blob(row["secret_key"], row["secret_nonce"],
-                                       f"identity:{row['public_key']}".encode())
-            return (row["public_key"], secret)
+        row = self._fetch_one("SELECT public_key, secret_key, secret_nonce FROM identity WHERE id=1")
+        if not row:
+            return None
+        secret = self.decrypt_blob(row["secret_key"], row["secret_nonce"],
+                                   aead_aad("identity", row["public_key"]))
+        return (row["public_key"], secret)
 
     def save_identity(self, public_key: str, secret_key: bytes) -> None:
-        blob, nonce, version = self.encrypt_blob(secret_key, f"identity:{public_key}".encode())
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO identity "
-                "(id, public_key, secret_key, created_at, secret_nonce, key_version) "
-                "VALUES (1, ?, ?, ?, ?, ?)",
-                (public_key, blob, utc_ts(), nonce, version),
-            )
-            self.conn.commit()
+        blob, nonce, version = self.encrypt_blob(secret_key, aead_aad("identity", public_key))
+        self._write(
+            "INSERT OR REPLACE INTO identity (id, public_key, secret_key, created_at, secret_nonce, key_version) VALUES (1, ?, ?, ?, ?, ?)",
+            (public_key, blob, utc_ts(), nonce, version),
+        )
 
     # ── Friends ───────────────────────────────────────────────────────────────
 
     def add_friend(self, pubkey: str, nickname: Optional[str] = None) -> None:
         nickname = validate_label(nickname, "Nickname", MAX_NICKNAME_CHARS) or None
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO friends (pubkey, nickname, added_at, unread, verified, blocked) VALUES (?, ?, ?, 0, 0, 0) "
-                "ON CONFLICT(pubkey) DO UPDATE SET "
-                "nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1, blocked=0",
-                (pubkey, nickname, utc_ts()),
-            )
-            self.conn.commit()
+        self._write(
+            "INSERT INTO friends (pubkey, nickname, added_at, unread, verified, blocked) VALUES (?, ?, ?, 0, 0, 0) "
+            "ON CONFLICT(pubkey) DO UPDATE SET nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1, blocked=0",
+            (pubkey, nickname, utc_ts()),
+        )
 
     def remove_friend(self, pubkey: str) -> None:
-        with self.lock:
-            self.conn.execute("DELETE FROM friends WHERE pubkey=?", (pubkey,))
-            self.conn.execute("DELETE FROM sessions WHERE peer_pubkey=?", (pubkey,))
-            self.conn.commit()
+        self._write_many(
+            ("DELETE FROM friends WHERE pubkey=?", (pubkey,)),
+            ("DELETE FROM sessions WHERE peer_pubkey=?", (pubkey,)),
+        )
 
     def get_friends(self) -> List[Dict[str, Any]]:
-        with self.lock:
-            friends = []
-            for r in self.conn.execute(
-                "SELECT pubkey, nickname, last_seen, unread, verified, blocked, relay_alias, direct_url FROM friends ORDER BY added_at DESC"
-            ):
-                d = dict(r)
-                d["fingerprint"] = key_fingerprint(d["pubkey"])
-                friends.append(d)
-            return friends
+        friends = []
+        for r in self._fetch_all(
+            "SELECT pubkey, nickname, last_seen, unread, verified, blocked, relay_alias, direct_url FROM friends ORDER BY added_at DESC"
+        ):
+            d = dict(r)
+            d["fingerprint"] = key_fingerprint(d["pubkey"])
+            friends.append(d)
+        return friends
 
     def is_friend(self, pubkey: str) -> bool:
-        with self.lock:
-            return self.conn.execute(
-                "SELECT 1 FROM friends WHERE pubkey=? AND blocked=0", (pubkey,)
-            ).fetchone() is not None
+        return self._fetch_one("SELECT 1 FROM friends WHERE pubkey=? AND blocked=0", (pubkey,)) is not None
 
     def touch_friend(self, pubkey: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey)
-            )
-            self.conn.commit()
+        self._write("UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey))
 
     def set_friend_transport(self, pubkey: str, relay_alias: Optional[str] = None,
                              direct_url: Optional[str] = None) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE friends SET relay_alias=COALESCE(?, relay_alias), direct_url=COALESCE(?, direct_url) WHERE pubkey=?",
-                (relay_alias, direct_url, pubkey)
-            )
-            self.conn.commit()
+        self._write(
+            "UPDATE friends SET relay_alias=COALESCE(?, relay_alias), direct_url=COALESCE(?, direct_url) WHERE pubkey=?",
+            (relay_alias, direct_url, pubkey),
+        )
 
     def verify_friend(self, pubkey: str, verified: bool = True) -> None:
-        with self.lock:
-            self.conn.execute("UPDATE friends SET verified=? WHERE pubkey=?", (int(verified), pubkey))
-            self.conn.commit()
+        self._write("UPDATE friends SET verified=? WHERE pubkey=?", (int(verified), pubkey))
 
     def rename_friend(self, pubkey: str, nickname: Optional[str]) -> str:
         """Update the nickname of an existing friend. Returns the stored
@@ -854,87 +877,66 @@ class Database:
         illegal nickname never reaches the DB."""
         nickname = validate_label(nickname, "Nickname", MAX_NICKNAME_CHARS) or None
         with self.lock:
-            row = self.conn.execute("SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)).fetchone()
-            if not row:
+            if not self._fetch_one("SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)):
                 raise ValueError("No such friend to rename")
-            self.conn.execute(
-                "UPDATE friends SET nickname=? WHERE pubkey=?", (nickname, pubkey)
-            )
-            self.conn.commit()
+            self._write("UPDATE friends SET nickname=? WHERE pubkey=?", (nickname, pubkey))
         return nickname
 
     def block_friend(self, pubkey: str, blocked: bool = True) -> None:
-        with self.lock:
-            self.conn.execute("UPDATE friends SET blocked=? WHERE pubkey=?", (int(blocked), pubkey))
-            self.conn.commit()
-            # Dropping the live session on block means an attacker who later
-            # steals the friend's identity can't keep using an existing key;
-            # they'd have to complete a fresh signed handshake first.
-            if blocked:
-                self.conn.execute("DELETE FROM sessions WHERE peer_pubkey=?", (pubkey,))
-                self.conn.commit()
+        statements: List[Tuple[str, Sequence[Any]]] = [
+            ("UPDATE friends SET blocked=? WHERE pubkey=?", (int(blocked), pubkey))
+        ]
+        # Dropping the live session on block means an attacker who later
+        # steals the friend's identity can't keep using an existing key;
+        # they'd have to complete a fresh signed handshake first.
+        if blocked:
+            statements.append(("DELETE FROM sessions WHERE peer_pubkey=?", (pubkey,)))
+        self._write_many(*statements)
 
     def increment_unread(self, pubkey: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE friends SET unread=unread+1 WHERE pubkey=?", (pubkey,)
-            )
-            self.conn.commit()
+        self._write("UPDATE friends SET unread=unread+1 WHERE pubkey=?", (pubkey,))
 
     def clear_unread(self, pubkey: str) -> None:
-        with self.lock:
-            self.conn.execute("UPDATE friends SET unread=0 WHERE pubkey=?", (pubkey,))
-            self.conn.commit()
+        self._write("UPDATE friends SET unread=0 WHERE pubkey=?", (pubkey,))
 
     # ── Sessions ──────────────────────────────────────────────────────────────
 
     def session_summary(self) -> Dict[str, Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT peer_pubkey, session_id, established_at, initiator, "
-                "send_counter, recv_counter FROM sessions"
-            )
-            return {
-                r["peer_pubkey"]: {
-                    "session_id": r["session_id"],
-                    "established_at": r["established_at"],
-                    "initiator": bool(r["initiator"]),
-                    "send_counter": r["send_counter"],
-                    "recv_counter": r["recv_counter"],
-                    "age_secs": utc_ts() - r["established_at"],
-                    "expires_in": max(0, SESSION_TTL - (utc_ts() - r["established_at"])),
-                }
-                for r in rows
+        rows = self._fetch_all("SELECT peer_pubkey, session_id, established_at, initiator, send_counter, recv_counter FROM sessions")
+        return {
+            r["peer_pubkey"]: {
+                "session_id": r["session_id"],
+                "established_at": r["established_at"],
+                "initiator": bool(r["initiator"]),
+                "send_counter": r["send_counter"],
+                "recv_counter": r["recv_counter"],
+                "age_secs": utc_ts() - r["established_at"],
+                "expires_in": max(0, SESSION_TTL - (utc_ts() - r["established_at"])),
             }
+            for r in rows
+        }
 
     def save_session(self, peer_pubkey: str, session_id: str, key: bytes, initiator: bool) -> None:
-        blob, nonce, version = self.encrypt_blob(key, f"session:{peer_pubkey}:{session_id}".encode())
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO sessions "
-                "(peer_pubkey, session_id, key, established_at, initiator, key_nonce, key_version, "
-                "send_counter, recv_counter) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, "
-                "COALESCE((SELECT send_counter FROM sessions WHERE peer_pubkey=?),0), "
-                "COALESCE((SELECT recv_counter FROM sessions WHERE peer_pubkey=?),0))",
-                (peer_pubkey, session_id, blob, utc_ts(), int(initiator), nonce, version,
-                 peer_pubkey, peer_pubkey),
-            )
-            self.conn.commit()
+        blob, nonce, version = self.encrypt_blob(key, aead_aad("session", peer_pubkey, session_id))
+        self._write(
+            "INSERT OR REPLACE INTO sessions (peer_pubkey, session_id, key, established_at, initiator, "
+            "key_nonce, key_version, send_counter, recv_counter) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, "
+            "COALESCE((SELECT send_counter FROM sessions WHERE peer_pubkey=?),0), "
+            "COALESCE((SELECT recv_counter FROM sessions WHERE peer_pubkey=?),0))",
+            (peer_pubkey, session_id, blob, utc_ts(), int(initiator), nonce, version, peer_pubkey, peer_pubkey),
+        )
 
     def get_session(self, peer_pubkey: str) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT * FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
-            ).fetchone()
-            if not row:
-                return None
-            data = dict(row)
-            data["key"] = self.decrypt_blob(
-                data["key"], data.get("key_nonce"),
-                f"session:{peer_pubkey}:{data['session_id']}".encode()
-            )
-            return data
+        row = self._fetch_one("SELECT * FROM sessions WHERE peer_pubkey=?", (peer_pubkey,))
+        if not row:
+            return None
+        data = dict(row)
+        data["key"] = self.decrypt_blob(
+            data["key"], data.get("key_nonce"),
+            aead_aad("session", peer_pubkey, data["session_id"])
+        )
+        return data
 
     def next_send_counter(self, peer_pubkey: str) -> int:
         with self.lock:
@@ -984,58 +986,36 @@ class Database:
 
     def create_group(self, group_id: str, name: str, owner_pubkey: str) -> None:
         name = validate_label(name, "Group name", MAX_GROUP_NAME_CHARS, required=True)
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO groups (group_id, name, created_at, owner_pubkey, epoch) "
-                "VALUES (?, ?, ?, ?, 1)",
-                (group_id, name, utc_ts(), owner_pubkey)
-            )
-            self.conn.execute(
-                "INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) "
-                "VALUES (?, ?, ?, ?)",
-                (group_id, owner_pubkey, "owner", utc_ts())
-            )
-            self.conn.commit()
+        self._write_many(
+            ("INSERT OR IGNORE INTO groups (group_id, name, created_at, owner_pubkey, epoch) VALUES (?, ?, ?, ?, 1)",
+             (group_id, name, utc_ts(), owner_pubkey)),
+            ("INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) VALUES (?, ?, ?, ?)",
+             (group_id, owner_pubkey, "owner", utc_ts())),
+        )
 
     def add_group_member(self, group_id: str, pubkey: str, role: str = "member") -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) "
-                "VALUES (?, ?, ?, ?)",
-                (group_id, pubkey, role, utc_ts())
-            )
-            self.conn.commit()
+        self._write("INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) VALUES (?, ?, ?, ?)", (group_id, pubkey, role, utc_ts()))
 
     def remove_group_member(self, group_id: str, pubkey: str) -> bool:
-        with self.lock:
-            cur = self.conn.execute(
-                "DELETE FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pubkey)
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write("DELETE FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pubkey))
+        return cur.rowcount > 0
 
     def group_role(self, group_id: str, pubkey: str) -> Optional[str]:
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT role FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pubkey)
-            ).fetchone()
-            return row["role"] if row else None
+        row = self._fetch_one("SELECT role FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pubkey))
+        return row["role"] if row else None
 
     def groups_for(self, pubkey: str) -> List[Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT g.group_id, g.name, g.created_at, g.owner_pubkey, g.epoch "
-                "FROM groups g JOIN group_members gm ON g.group_id=gm.group_id "
-                "WHERE gm.pubkey=? ORDER BY g.created_at DESC",
-                (pubkey,),
-            )
-            return [dict(r) for r in rows]
+        return [dict(r) for r in self._fetch_all(
+            "SELECT g.group_id, g.name, g.created_at, g.owner_pubkey, g.epoch "
+            "FROM groups g JOIN group_members gm ON g.group_id=gm.group_id "
+            "WHERE gm.pubkey=? ORDER BY g.created_at DESC",
+            (pubkey,),
+        )]
 
     def group_members(self, group_id: str) -> List[str]:
-        with self.lock:
-            return [r["pubkey"] for r in self.conn.execute(
-                "SELECT pubkey FROM group_members WHERE group_id=?", (group_id,)
-            )]
+        return [r["pubkey"] for r in self._fetch_all(
+            "SELECT pubkey FROM group_members WHERE group_id=?", (group_id,)
+        )]
 
     def group_details_for(self, pubkey: str) -> List[Dict[str, Any]]:
         groups = self.groups_for(pubkey)
@@ -1048,31 +1028,26 @@ class Database:
         return groups
 
     def save_group_key(self, group_id: str, epoch: int, key: bytes, created_by: str) -> None:
-        blob, nonce, _ = self.encrypt_blob(key, f"group:{group_id}:{epoch}".encode())
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO group_epochs (group_id, epoch, key, key_nonce, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                (group_id, epoch, blob, nonce, utc_ts(), created_by)
-            )
-            self.conn.execute("UPDATE groups SET epoch=? WHERE group_id=?", (epoch, group_id))
-            self.conn.commit()
+        blob, nonce, _ = self.encrypt_blob(key, aead_aad("group", group_id, epoch))
+        self._write_many(
+            ("INSERT OR REPLACE INTO group_epochs (group_id, epoch, key, key_nonce, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+             (group_id, epoch, blob, nonce, utc_ts(), created_by)),
+            ("UPDATE groups SET epoch=? WHERE group_id=?", (epoch, group_id)),
+        )
 
     def get_group_key(self, group_id: str, epoch: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            if epoch is None:
-                row = self.conn.execute(
-                    "SELECT ge.* FROM group_epochs ge JOIN groups g ON ge.group_id=g.group_id AND ge.epoch=g.epoch WHERE ge.group_id=?",
-                    (group_id,)
-                ).fetchone()
-            else:
-                row = self.conn.execute(
-                    "SELECT * FROM group_epochs WHERE group_id=? AND epoch=?", (group_id, epoch)
-                ).fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["key"] = self.decrypt_blob(d["key"], d.get("key_nonce"), f"group:{group_id}:{d['epoch']}".encode())
-            return d
+        if epoch is None:
+            row = self._fetch_one(
+                "SELECT ge.* FROM group_epochs ge JOIN groups g ON ge.group_id=g.group_id AND ge.epoch=g.epoch WHERE ge.group_id=?",
+                (group_id,),
+            )
+        else:
+            row = self._fetch_one("SELECT * FROM group_epochs WHERE group_id=? AND epoch=?", (group_id, epoch))
+        if not row:
+            return None
+        d = dict(row)
+        d["key"] = self.decrypt_blob(d["key"], d.get("key_nonce"), aead_aad("group", group_id, d["epoch"]))
+        return d
 
     # ── Messages ──────────────────────────────────────────────────────────────
 
@@ -1080,36 +1055,23 @@ class Database:
                      recipient: Optional[str] = None, group_id: Optional[str] = None,
                      delivered: bool = False, status: str = "sent") -> bool:
         plaintext = body.encode("utf-8")
-        aad = f"message:{msg_id}:{sender}:{recipient or ''}:{group_id or ''}".encode()
+        aad = aead_aad("message", msg_id, sender, recipient, group_id)
         blob, nonce, version = self.encrypt_blob(plaintext, aad)
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO messages "
-                "(msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, "
-                "timestamp, delivered, status, body_nonce, key_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, sender, recipient, group_id,
-                 blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
-                 direction, utc_ts(), int(delivered), status, nonce, version),
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write(
+            "INSERT OR IGNORE INTO messages (msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, "
+            "timestamp, delivered, status, body_nonce, key_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (msg_id, sender, recipient, group_id,
+             blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
+             direction, utc_ts(), int(delivered), status, nonce, version),
+        )
+        return cur.rowcount > 0
 
     def update_message_status(self, msg_id: str, status: str, delivered: bool = False) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE messages SET status=?, delivered=? WHERE msg_id=?",
-                (status, int(delivered), msg_id)
-            )
-            self.conn.commit()
+        self._write("UPDATE messages SET status=?, delivered=? WHERE msg_id=?", (status, int(delivered), msg_id))
 
     def mark_message_read(self, msg_id: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE messages SET read_at=? WHERE msg_id=? AND read_at IS NULL",
-                (utc_ts(), msg_id)
-            )
-            self.conn.commit()
+        self._write("UPDATE messages SET read_at=? WHERE msg_id=? AND read_at IS NULL", (utc_ts(), msg_id))
 
     def mark_remote_read(self, msg_id: str, read_at: int) -> None:
         """Stamp an outgoing message's read_at column when the remote peer
@@ -1119,12 +1081,7 @@ class Database:
         with our own clock, and we update unconditionally (not just when
         read_at IS NULL) so a late-arriving receipt with a more accurate
         timestamp can correct an earlier estimate."""
-        with self.lock:
-            self.conn.execute(
-                "UPDATE messages SET read_at=? WHERE msg_id=?",
-                (int(read_at), msg_id)
-            )
-            self.conn.commit()
+        self._write("UPDATE messages SET read_at=? WHERE msg_id=?", (int(read_at), msg_id))
 
     def delete_message(self, msg_id: str) -> bool:
         """Permanently remove one message and its local-only metadata.
@@ -1137,44 +1094,34 @@ class Database:
         msg_id = str(msg_id or "").strip()
         if not msg_id:
             raise ValueError("Message id is required")
-        with self.lock:
-            cur = self.conn.execute("DELETE FROM messages WHERE msg_id=?", (msg_id,))
-            self.conn.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
-            self.conn.execute("DELETE FROM read_receipts WHERE msg_id=?", (msg_id,))
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write_many(
+            ("DELETE FROM messages WHERE msg_id=?", (msg_id,)),
+            ("DELETE FROM reactions WHERE msg_id=?", (msg_id,)),
+            ("DELETE FROM read_receipts WHERE msg_id=?", (msg_id,)),
+        )
+        return cur.rowcount > 0
 
     def _hydrate_message_row(self, r: sqlite3.Row) -> Dict[str, Any]:
         d = dict(r)
         raw = d["body"]
         raw_b = raw.encode("utf-8", "surrogateescape") if isinstance(raw, str) else raw
-        aad = (f"message:{d['msg_id']}:{d['sender_pubkey']}:"
-               f"{d.get('recipient_pubkey') or ''}:{d.get('group_id') or ''}").encode()
+        aad = aead_aad("message", d["msg_id"], d["sender_pubkey"],
+                       d.get("recipient_pubkey"), d.get("group_id"))
         d["body"] = self.decrypt_blob(raw_b, d.get("body_nonce"), aad).decode("utf-8")
         d.pop("body_nonce", None)
         return d
 
     def recent_messages(self, limit: int = MESSAGE_PAGE_SIZE) -> List[Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)
-            ).fetchall()
+        rows = self._fetch_all("SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,))
         return [self._hydrate_message_row(r) for r in reversed(rows)]
 
     def messages_before(self, before_id: int, limit: int = MESSAGE_PAGE_SIZE) -> List[Dict[str, Any]]:
         """Fetch an older page of messages for 'load more history' in the UI."""
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT * FROM messages WHERE id < ? ORDER BY timestamp DESC, id DESC LIMIT ?",
-                (before_id, limit)
-            ).fetchall()
+        rows = self._fetch_all("SELECT * FROM messages WHERE id < ? ORDER BY timestamp DESC, id DESC LIMIT ?", (before_id, limit))
         return [self._hydrate_message_row(r) for r in reversed(rows)]
 
     def has_messages_before(self, before_id: int) -> bool:
-        with self.lock:
-            return self.conn.execute(
-                "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (before_id,)
-            ).fetchone() is not None
+        return self._fetch_one("SELECT 1 FROM messages WHERE id < ? LIMIT 1", (before_id,)) is not None
 
     def search_messages(self, query: str, target: Optional[str] = None,
                         limit: int = 100, scan_limit: int = 20000) -> List[Dict[str, Any]]:
@@ -1192,22 +1139,15 @@ class Database:
         query = (query or "").strip().lower()
         if not query:
             return []
-        with self.lock:
-            if target and UUID_RE.match(target):
-                rows = self.conn.execute(
-                    "SELECT * FROM messages WHERE group_id=? ORDER BY timestamp DESC, id DESC LIMIT ?",
-                    (target, scan_limit)
-                ).fetchall()
-            elif target:
-                rows = self.conn.execute(
-                    "SELECT * FROM messages WHERE sender_pubkey=? OR recipient_pubkey=? "
-                    "ORDER BY timestamp DESC, id DESC LIMIT ?",
-                    (target, target, scan_limit)
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (scan_limit,)
-                ).fetchall()
+        if target and UUID_RE.match(target):
+            rows = self._fetch_all("SELECT * FROM messages WHERE group_id=? ORDER BY timestamp DESC, id DESC LIMIT ?", (target, scan_limit))
+        elif target:
+            rows = self._fetch_all(
+                "SELECT * FROM messages WHERE sender_pubkey=? OR recipient_pubkey=? ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (target, target, scan_limit),
+            )
+        else:
+            rows = self._fetch_all("SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (scan_limit,))
         results = []
         for r in rows:
             try:
@@ -1224,34 +1164,23 @@ class Database:
 
     def add_reaction(self, msg_id: str, peer_pubkey: str, emoji: str,
                      direction: str = "in") -> bool:
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO reactions (msg_id, peer_pubkey, emoji, direction, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (msg_id, peer_pubkey, emoji, direction, utc_ts())
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write(
+            "INSERT OR IGNORE INTO reactions (msg_id, peer_pubkey, emoji, direction, added_at) VALUES (?, ?, ?, ?, ?)",
+            (msg_id, peer_pubkey, emoji, direction, utc_ts()),
+        )
+        return cur.rowcount > 0
 
     def remove_reaction(self, msg_id: str, peer_pubkey: str, emoji: str) -> bool:
-        with self.lock:
-            cur = self.conn.execute(
-                "DELETE FROM reactions WHERE msg_id=? AND peer_pubkey=? AND emoji=?",
-                (msg_id, peer_pubkey, emoji)
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write("DELETE FROM reactions WHERE msg_id=? AND peer_pubkey=? AND emoji=?", (msg_id, peer_pubkey, emoji))
+        return cur.rowcount > 0
 
     def get_reactions(self, msg_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
         if not msg_ids:
             return {}
-        with self.lock:
-            placeholders = ",".join("?" * len(msg_ids))
-            rows = self.conn.execute(
-                f"SELECT msg_id, peer_pubkey, emoji, direction, added_at "
-                f"FROM reactions WHERE msg_id IN ({placeholders})",
-                msg_ids
-            ).fetchall()
+        rows = self._fetch_all(
+            f"SELECT msg_id, peer_pubkey, emoji, direction, added_at FROM reactions WHERE msg_id IN ({self._placeholders(msg_ids)})",
+            msg_ids,
+        )
         result: Dict[str, List[Dict[str, Any]]] = {}
         for r in rows:
             result.setdefault(r["msg_id"], []).append(dict(r))
@@ -1260,39 +1189,24 @@ class Database:
     # ── Read Receipts ─────────────────────────────────────────────────────────
 
     def save_read_receipt(self, msg_id: str, reader_pubkey: str) -> bool:
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO read_receipts (msg_id, reader_pubkey, read_at) "
-                "VALUES (?, ?, ?)",
-                (msg_id, reader_pubkey, utc_ts())
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write("INSERT OR IGNORE INTO read_receipts (msg_id, reader_pubkey, read_at) VALUES (?, ?, ?)", (msg_id, reader_pubkey, utc_ts()))
+        return cur.rowcount > 0
 
     def get_read_receipts(self, msg_ids: List[str]) -> Dict[str, int]:
         if not msg_ids:
             return {}
-        with self.lock:
-            placeholders = ",".join("?" * len(msg_ids))
-            rows = self.conn.execute(
-                f"SELECT msg_id, read_at FROM read_receipts WHERE msg_id IN ({placeholders})",
-                msg_ids
-            ).fetchall()
+        rows = self._fetch_all(f"SELECT msg_id, read_at FROM read_receipts WHERE msg_id IN ({self._placeholders(msg_ids)})", msg_ids)
         return {r["msg_id"]: r["read_at"] for r in rows}
 
     # ── Files ─────────────────────────────────────────────────────────────────
 
     def recent_files(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,)
-            )
-            files = []
-            for r in rows:
-                d = dict(r)
-                d.pop("file_nonce", None)
-                files.append(d)
-            return files
+        files = []
+        for r in self._fetch_all("SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,)):
+            d = dict(r)
+            d.pop("file_nonce", None)
+            files.append(d)
+        return files
 
     def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str,
                   path: str, recipient: Optional[str] = None, group_id: Optional[str] = None,
@@ -1301,100 +1215,70 @@ class Database:
         file_id = validate_file_id(file_id)
         filename = safe_filename(filename)
         sql = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
-        with self.lock:
-            cur = self.conn.execute(
-                f"{sql} INTO files "
-                "(file_id, filename, sender_pubkey, recipient_pubkey, group_id, "
-                "size, sha256, storage_path, uploaded_at, file_nonce, key_version, mime_type) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_id, filename, sender, recipient, group_id, size, sha256, path,
-                 utc_ts(), file_nonce, 1 if file_nonce else 0,
-                 safe_content_type(mime_type, filename)),
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write(
+            f"{sql} INTO files (file_id, filename, sender_pubkey, recipient_pubkey, group_id, size, sha256, "
+            "storage_path, uploaded_at, file_nonce, key_version, mime_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_id, filename, sender, recipient, group_id, size, sha256, path,
+             utc_ts(), file_nonce, 1 if file_nonce else 0, safe_content_type(mime_type, filename)),
+        )
+        return cur.rowcount > 0
 
     def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
         file_id = validate_file_id(file_id)
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT * FROM files WHERE file_id=?", (file_id,)
-            ).fetchone()
-            return dict(row) if row else None
+        row = self._fetch_one("SELECT * FROM files WHERE file_id=?", (file_id,))
+        return dict(row) if row else None
 
     # ── Outbox ────────────────────────────────────────────────────────────────
 
     def queue_outbox(self, target_pubkey: str, payload: Dict[str, Any]) -> None:
         now = utc_ts()
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at) "
-                "VALUES (?, ?, 'queued', 0, ?, ?)",
-                (target_pubkey, json.dumps(payload), now, now)
-            )
-            self.conn.commit()
+        self._write(
+            "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at) VALUES (?, ?, 'queued', 0, ?, ?)",
+            (target_pubkey, json.dumps(payload), now, now),
+        )
 
     def queued_outbox(self, target_pubkey: str, limit: int = 50) -> List[Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT * FROM outbox WHERE target_pubkey=? AND status='queued' "
-                "ORDER BY created_at ASC LIMIT ?",
-                (target_pubkey, limit)
-            ).fetchall()
-            return [dict(r) for r in rows]
+        return [dict(r) for r in self._fetch_all(
+            "SELECT * FROM outbox WHERE target_pubkey=? AND status='queued' "
+            "ORDER BY created_at ASC LIMIT ?",
+            (target_pubkey, limit)
+        )]
 
     def mark_outbox_sent(self, outbox_id: int) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE outbox SET status='sent', updated_at=? WHERE id=?", (utc_ts(), outbox_id)
-            )
-            self.conn.commit()
+        self._write("UPDATE outbox SET status='sent', updated_at=? WHERE id=?", (utc_ts(), outbox_id))
 
     def save_file_chunk(self, file_id: str, chunk_index: int, total_chunks: int, path: str,
                        chunk_nonce: Optional[bytes] = None) -> bool:
         file_id = validate_file_id(file_id)
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO file_chunks (file_id, chunk_index, total_chunks, storage_path, chunk_nonce, received_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (file_id, chunk_index, total_chunks, path, chunk_nonce, utc_ts())
-            )
-            self.conn.commit()
-            return cur.rowcount > 0
+        cur = self._write(
+            "INSERT OR IGNORE INTO file_chunks (file_id, chunk_index, total_chunks, storage_path, chunk_nonce, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (file_id, chunk_index, total_chunks, path, chunk_nonce, utc_ts()),
+        )
+        return cur.rowcount > 0
 
     def file_chunks(self, file_id: str) -> List[Dict[str, Any]]:
         file_id = validate_file_id(file_id)
-        with self.lock:
-            return [dict(r) for r in self.conn.execute(
-                "SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)
-            )]
+        return [dict(r) for r in self._fetch_all(
+            "SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)
+        )]
 
     def delete_file_chunks(self, file_id: str) -> List[Dict[str, Any]]:
         """Remove and return chunk rows for a file, e.g. once reassembly is done."""
         file_id = validate_file_id(file_id)
         with self.lock:
-            rows = [dict(r) for r in self.conn.execute(
-                "SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)
-            )]
-            self.conn.execute("DELETE FROM file_chunks WHERE file_id=?", (file_id,))
-            self.conn.commit()
+            rows = self.file_chunks(file_id)
+            self._write("DELETE FROM file_chunks WHERE file_id=?", (file_id,))
             return rows
 
     def metric_inc(self, name: str, amount: int = 1) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO metrics (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
-                (name, amount)
-            )
-            self.conn.commit()
+        self._write("INSERT INTO metrics (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", (name, amount))
 
     def metrics(self) -> Dict[str, int]:
-        with self.lock:
-            return {r["name"]: int(r["value"]) for r in self.conn.execute("SELECT name, value FROM metrics")}
+        return {r["name"]: int(r["value"]) for r in self._fetch_all("SELECT name, value FROM metrics")}
 
     def outbox_depth(self) -> int:
-        with self.lock:
-            return int(self.conn.execute("SELECT COUNT(*) FROM outbox WHERE status='queued'").fetchone()[0])
+        return int(self._fetch_one("SELECT COUNT(*) FROM outbox WHERE status='queued'")[0])
 
     def close(self) -> None:
         with self.lock:
@@ -1506,6 +1390,10 @@ class QuantumNode:
         for ws in dead:
             self.ui_clients.discard(ws)
 
+    async def broadcast_friends(self) -> None:
+        """Push the current friend list (with unread counts) to every UI client."""
+        await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+
     def _with_message_metadata(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         msg_ids = [m["msg_id"] for m in msgs]
         reactions = self.db.get_reactions(msg_ids)
@@ -1576,7 +1464,7 @@ class QuantumNode:
                 self.db.queue_outbox(peer_pubkey, envelope)
                 return
             raise RuntimeError("Not connected to signaling server")
-        await self.signaling_ws.send(json.dumps(envelope))
+        await ws_send_json(self.signaling_ws, envelope)
         self.db.metric_inc("relay_sent")
 
     async def send_direct(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
@@ -1585,7 +1473,7 @@ class QuantumNode:
         hello = {"from": self.public_key, "to": peer_pubkey, "sent_at": utc_ts(), "payload": payload}
         sig = b64e(self.crypto.sign(self.secret_key, canonical_json(hello)))
         async with websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2) as ws:
-            await ws.send(json.dumps({"type": "direct", **hello, "signature": sig}))
+            await ws_send_json(ws, {"type": "direct", **hello, "signature": sig})
             ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             if ack.get("type") != "direct_ack":
                 raise RuntimeError("Direct peer did not acknowledge payload")
@@ -1627,12 +1515,12 @@ class QuantumNode:
             if not self.db.is_friend(peer):
                 raise ValueError("Direct peer is not a trusted friend")
             await self.handle_relay_payload(peer, msg.get("payload"))
-            await ws.send(json.dumps({"type": "direct_ack"}))
+            await ws_send_json(ws, {"type": "direct_ack"})
             self.db.metric_inc("direct_received")
         except Exception as exc:
             self.db.metric_inc("direct_rejected")
             try:
-                await ws.send(json.dumps({"type": "error", "text": str(exc)}))
+                await ws_send_error(ws, str(exc))
             except Exception:
                 pass  # peer may already be gone
 
@@ -1647,17 +1535,17 @@ class QuantumNode:
         return validate_public_key(pubkey, self.expected_public_key_bytes)
 
     def encrypt_for_disk(self, raw: bytes, file_id: str) -> Tuple[bytes, Optional[bytes]]:
-        encrypted, nonce, _ = self.db.encrypt_blob(raw, f"file:{file_id}".encode())
+        encrypted, nonce, _ = self.db.encrypt_blob(raw, aead_aad("file", file_id))
         return encrypted, nonce
 
     def decrypt_from_disk(self, raw: bytes, file_id: str, nonce: Optional[bytes]) -> bytes:
-        return self.db.decrypt_blob(raw, nonce, f"file:{file_id}".encode())
+        return self.db.decrypt_blob(raw, nonce, aead_aad("file", file_id))
 
     def encrypt_chunk_for_disk(self, raw: bytes, file_id: str, chunk_index: int) -> Tuple[bytes, Optional[bytes]]:
-        return self.db.encrypt_blob(raw, f"file-chunk:{file_id}:{chunk_index}".encode())[:2]
+        return self.db.encrypt_blob(raw, aead_aad("file-chunk", file_id, chunk_index))[:2]
 
     def decrypt_chunk_from_disk(self, raw: bytes, file_id: str, chunk_index: int, nonce: Optional[bytes]) -> bytes:
-        return self.db.decrypt_blob(raw, nonce, f"file-chunk:{file_id}:{chunk_index}".encode())
+        return self.db.decrypt_blob(raw, nonce, aead_aad("file-chunk", file_id, chunk_index))
 
     # ── Storage accounting / quota ────────────────────────────────────────────
 
@@ -1697,6 +1585,32 @@ class QuantumNode:
         sig = b64d(data.get("signature", ""))
         envelope = {"kind": data.get("kind"), "payload": data.get("payload")}
         return self.crypto.verify(bytes.fromhex(peer_pubkey), canonical_json(envelope), sig)
+
+    def verified_payload(self, peer_pubkey: str, data: Dict[str, Any], label: str) -> Dict[str, Any]:
+        """Check a signed inbound envelope and return its payload.
+
+        Every signed peer-to-peer frame is validated the same way: the
+        signature must verify against the sender's identity key, and the
+        payload's own from/to fields must match the transport-level sender and
+        this node — otherwise a friend could relay a frame that was signed for
+        somebody else. `label` only shapes the error message.
+        """
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError(f"Invalid {label} signature")
+        payload = data.get("payload") or {}
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError(f"{label.capitalize()} routing mismatch")
+        return payload
+
+    async def send_signed(self, peer_pubkey: str, kind: str, payload: Dict[str, Any],
+                          queue_on_failure: bool = False, ephemeral: bool = False) -> None:
+        """Sign an outbound frame (stamping the routing fields verified_payload
+        checks on the far side) and hand it to the relay/direct transport."""
+        envelope = self.signed_payload(kind, {
+            "from": self.public_key, "to": peer_pubkey, **payload,
+        })
+        await self.send_relay(peer_pubkey, envelope,
+                              queue_on_failure=queue_on_failure, ephemeral=ephemeral)
 
     def cleanup_pending_offers(self) -> None:
         now = utc_ts()
@@ -1991,19 +1905,14 @@ class QuantumNode:
         if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
             return
         try:
-            await self.send_relay(peer_pubkey, self.signed_payload("read_receipt", {
-                "from": self.public_key, "to": peer_pubkey,
-                "msg_id": msg_id, "read_at": utc_ts(),
-            }), queue_on_failure=True)
+            await self.send_signed(peer_pubkey, "read_receipt",
+                                   {"msg_id": msg_id, "read_at": utc_ts()},
+                                   queue_on_failure=True)
         except Exception as exc:
             LOG.debug("Failed to send read receipt: %s", exc)
 
     async def handle_read_receipt(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid read receipt signature")
-        payload = data["payload"]
-        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
-            raise ValueError("Read receipt routing mismatch")
+        payload = self.verified_payload(peer_pubkey, data, "read receipt")
         msg_id = str(payload.get("msg_id", ""))
         # Use the receipt's own timestamp so the read_at column reflects
         # when the *reader* actually read it, not when we happened to
@@ -2034,10 +1943,9 @@ class QuantumNode:
         if action not in ("add", "remove"):
             raise ValueError("Reaction action must be 'add' or 'remove'")
         await self.require_fresh_session(peer_pubkey, outgoing=True)
-        await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
-            "from": self.public_key, "to": peer_pubkey,
-            "msg_id": msg_id, "emoji": emoji, "action": action,
-        }), queue_on_failure=True)
+        await self.send_signed(peer_pubkey, "reaction",
+                               {"msg_id": msg_id, "emoji": emoji, "action": action},
+                               queue_on_failure=True)
         if action == "add":
             self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
         else:
@@ -2049,11 +1957,7 @@ class QuantumNode:
         })
 
     async def handle_reaction(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid reaction signature")
-        payload = data["payload"]
-        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
-            raise ValueError("Reaction routing mismatch")
+        payload = self.verified_payload(peer_pubkey, data, "reaction")
         emoji = validate_emoji(payload.get("emoji", ""))
         action = payload.get("action", "add")
         if action not in ("add", "remove"):
@@ -2121,7 +2025,7 @@ class QuantumNode:
             peer = str(data.get("peer_pubkey", ""))
             if peer:
                 self.db.clear_unread(peer)
-                await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+                await self.broadcast_friends()
 
     # ── Voice/video calls (WebRTC signaling over the authenticated relay) ───
 
@@ -2136,10 +2040,9 @@ class QuantumNode:
         await self.require_fresh_session(peer_pubkey, outgoing=True)
         call_id = str(uuid.uuid4())
         self.active_calls[peer_pubkey] = {"call_id": call_id, "role": "caller", "media": media, "state": "ringing"}
-        await self.send_relay(peer_pubkey, self.signed_payload("call_offer", {
-            "from": self.public_key, "to": peer_pubkey, "call_id": call_id,
-            "media": media, "sdp": sdp, "sent_at": utc_ts(),
-        }))
+        await self.send_signed(peer_pubkey, "call_offer", {
+            "call_id": call_id, "media": media, "sdp": sdp, "sent_at": utc_ts(),
+        })
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey, "call_id": call_id,
             "state": "ringing", "role": "caller", "media": media,
@@ -2148,21 +2051,16 @@ class QuantumNode:
     async def handle_call_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if not self.db.is_friend(peer_pubkey):
             return  # silently ignore call attempts from non-friends
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid call offer signature")
-        payload = data["payload"]
-        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
-            raise ValueError("Call offer routing mismatch")
+        payload = self.verified_payload(peer_pubkey, data, "call offer")
         media = payload.get("media") if payload.get("media") in ("audio", "video") else "video"
         if peer_pubkey in self.active_calls:
             # Already ringing/active with this peer (or with someone else,
             # scoped per-peer here) — tell the caller we're busy instead of
             # silently dropping their offer.
             try:
-                await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
-                    "from": self.public_key, "to": peer_pubkey,
+                await self.send_signed(peer_pubkey, "call_end", {
                     "call_id": payload.get("call_id"), "reason": "busy",
-                }))
+                })
             except Exception:
                 pass
             return
@@ -2179,10 +2077,9 @@ class QuantumNode:
         call = self.active_calls.get(peer_pubkey)
         if not call or call["role"] != "callee":
             raise ValueError("No incoming call from this friend to answer")
-        await self.send_relay(peer_pubkey, self.signed_payload("call_answer", {
-            "from": self.public_key, "to": peer_pubkey, "call_id": call["call_id"],
-            "sdp": sdp, "sent_at": utc_ts(),
-        }))
+        await self.send_signed(peer_pubkey, "call_answer", {
+            "call_id": call["call_id"], "sdp": sdp, "sent_at": utc_ts(),
+        })
         call["state"] = "active"
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey, "call_id": call["call_id"],
@@ -2190,11 +2087,7 @@ class QuantumNode:
         })
 
     async def handle_call_answer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid call answer signature")
-        payload = data["payload"]
-        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
-            raise ValueError("Call answer routing mismatch")
+        payload = self.verified_payload(peer_pubkey, data, "call answer")
         call = self.active_calls.get(peer_pubkey)
         if not call or call["call_id"] != payload.get("call_id") or call["role"] != "caller":
             raise ValueError("Call answer does not match an active outgoing call")
@@ -2209,10 +2102,9 @@ class QuantumNode:
         call = self.active_calls.get(peer_pubkey)
         if not call:
             return  # call already ended locally; drop stray trickle-ICE candidates
-        await self.send_relay(peer_pubkey, self.signed_payload("call_ice", {
-            "from": self.public_key, "to": peer_pubkey,
-            "call_id": call["call_id"], "candidate": candidate,
-        }), ephemeral=True)
+        await self.send_signed(peer_pubkey, "call_ice",
+                               {"call_id": call["call_id"], "candidate": candidate},
+                               ephemeral=True)
 
     async def handle_call_ice(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
@@ -2231,10 +2123,8 @@ class QuantumNode:
         if not call:
             return
         try:
-            await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
-                "from": self.public_key, "to": peer_pubkey,
-                "call_id": call["call_id"], "reason": reason,
-            }))
+            await self.send_signed(peer_pubkey, "call_end",
+                                   {"call_id": call["call_id"], "reason": reason})
         except Exception:
             pass  # best-effort — the local call state is already cleared either way
         await self.broadcast_ui({
@@ -2445,11 +2335,7 @@ class QuantumNode:
         await self._store_complete_file(peer_pubkey, meta, raw, file_id)
 
     async def handle_file_manifest(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if not self.verify_signed(peer_pubkey, data):
-            raise ValueError("Invalid file manifest signature")
-        meta = data.get("payload", {})
-        if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
-            raise ValueError("File manifest routing mismatch")
+        meta = self.verified_payload(peer_pubkey, data, "file manifest")
         validate_file_id(meta.get("file_id", ""))
         size = int(meta.get("size", -1))
         total_chunks = int(meta.get("total_chunks", 0))
@@ -2624,11 +2510,7 @@ class QuantumNode:
         elif kind == "call_end":
             await self.handle_call_end(peer_pubkey, payload)
         elif kind == "delivery_ack":
-            if not self.verify_signed(peer_pubkey, payload):
-                raise ValueError("Invalid delivery acknowledgement")
-            data = payload.get("payload", {})
-            if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
-                raise ValueError("Delivery ack routing mismatch")
+            data = self.verified_payload(peer_pubkey, payload, "delivery ack")
             self.db.update_message_status(str(data.get("msg_id", "")),
                                           "delivered_to_peer", delivered=True)
             await self.broadcast_ui({
@@ -2682,7 +2564,7 @@ class QuantumNode:
             await ws.close(code=1008, reason="Unauthorized UI socket")
             return
         self.ui_clients.add(ws)
-        await ws.send(json.dumps(self.state_payload()))
+        await ws_send_json(ws, self.state_payload())
         try:
             async for raw in ws:
                 try:
@@ -2690,9 +2572,7 @@ class QuantumNode:
                     await self._dispatch_ui(ws, msg)
                 except Exception as exc:
                     LOG.warning("UI command rejected: %s", exc)
-                    await ws.send(json.dumps({
-                        "type": "notice", "level": "error", "text": str(exc)
-                    }))
+                    await ws_send_json(ws, {"type": "notice", "level": "error", "text": str(exc)})
         finally:
             self.ui_clients.discard(ws)
 
@@ -2703,13 +2583,13 @@ class QuantumNode:
             if pubkey == self.public_key:
                 raise ValueError("You cannot add your own public key as a friend")
             self.db.add_friend(pubkey, msg.get("nickname"))
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
         elif typ == "remove_friend":
             self.db.remove_friend(self.validate_peer_key(msg["pubkey"]))
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
         elif typ == "verify_friend":
             self.db.verify_friend(self.validate_peer_key(msg["pubkey"]), bool(msg.get("verified", True)))
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
         elif typ == "block_friend":
             pubkey = self.validate_peer_key(msg["pubkey"])
             blocked = bool(msg.get("blocked", True))
@@ -2719,12 +2599,12 @@ class QuantumNode:
                 # be able to keep sending on the existing session key.
                 self.sessions.pop(pubkey, None)
                 self.pending_offers.pop(pubkey, None)
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
             await self.broadcast_ui(self.state_payload())
         elif typ == "rename_friend":
             pubkey = self.validate_peer_key(msg["pubkey"])
             self.db.rename_friend(pubkey, str(msg.get("nickname") or ""))
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
         elif typ == "connect":
             await self.connect_peer(msg["pubkey"])
         elif typ == "send_message":
@@ -2782,7 +2662,7 @@ class QuantumNode:
             blob = pack_identity_backup(self.public_key, self.secret_key, passphrase)
             # Sent directly to the requesting client only — never broadcast,
             # since this blob (with the passphrase) reconstructs the identity.
-            await ws.send(json.dumps({"type": "identity_backup", "backup": blob}))
+            await ws_send_json(ws, {"type": "identity_backup", "backup": blob})
         elif typ == "import_backup":
             if self.db.get_friends() or self.db.recent_messages(limit=1):
                 raise ValueError(
@@ -2805,7 +2685,7 @@ class QuantumNode:
         elif typ == "read_receipt":
             await self.send_read_receipt(msg["pubkey"], str(msg["msg_id"]))
             self.db.clear_unread(msg["pubkey"])
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
             await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"]})
         elif typ == "reaction":
             await self.send_reaction(
@@ -2820,7 +2700,7 @@ class QuantumNode:
         elif typ == "clear_unread":
             pubkey = self.validate_peer_key(msg["pubkey"])
             self.db.clear_unread(pubkey)
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            await self.broadcast_friends()
             await self.sync_to_devices("read_local", {"peer_pubkey": pubkey})
         elif typ == "refresh":
             await self.broadcast_ui(self.state_payload())
@@ -2828,18 +2708,14 @@ class QuantumNode:
             before_id = int(msg.get("before_id", 0))
             older = self._with_message_metadata(self.db.messages_before(before_id, MESSAGE_PAGE_SIZE))
             has_more = bool(older) and self.db.has_messages_before(older[0]["id"])
-            await ws.send(json.dumps({
-                "type": "history", "messages": older, "has_more_messages": has_more
-            }))
+            await ws_send_json(ws, {"type": "history", "messages": older, "has_more_messages": has_more})
         elif typ == "search_messages":
             query = str(msg.get("query") or "")
             target = msg.get("pubkey") or msg.get("group_id")
             results = self._with_message_metadata(
                 self.db.search_messages(query, target=str(target) if target else None)
             )
-            await ws.send(json.dumps({
-                "type": "search_results", "query": query, "results": results
-            }))
+            await ws_send_json(ws, {"type": "search_results", "query": query, "results": results})
         elif typ == "call_offer":
             await self.send_call_offer(msg["pubkey"], msg["sdp"], str(msg.get("media", "video")))
         elif typ == "call_answer":
@@ -2852,6 +2728,21 @@ class QuantumNode:
             raise ValueError(f"Unknown command: {typ}")
 
     # ── Signaling loop ────────────────────────────────────────────────────────
+
+    def _register_frame(self, signature: Optional[str] = None,
+                        challenge: Optional[str] = None) -> Dict[str, Any]:
+        """Build the relay registration frame, signed when the relay issued a
+        challenge (older relays don't, so the proof fields stay absent)."""
+        frame: Dict[str, Any] = {
+            "type": "register",
+            "pubkey": self.public_key,
+            "relay_alias": self.relay_alias,
+            "direct_url": self.direct_url,
+        }
+        if signature is not None:
+            frame["signature"] = signature
+            frame["challenge"] = challenge
+        return frame
 
     async def connect_signaling_loop(self) -> None:
         websockets = require_websockets()
@@ -2876,22 +2767,14 @@ class QuantumNode:
                                 "pubkey": self.public_key,
                             }
                             sig = b64e(self.crypto.sign(self.secret_key, canonical_json(challenge)))
-                            await ws.send(json.dumps({
-                                "type": "register", "pubkey": self.public_key,
-                                "signature": sig, "challenge": first["nonce"],
-                                "relay_alias": self.relay_alias, "direct_url": self.direct_url,
-                            }))
+                            await ws_send_json(ws, self._register_frame(sig, first["nonce"]))
                         else:
-                            await ws.send(json.dumps({
-                                "type": "register", "pubkey": self.public_key,
-                                "relay_alias": self.relay_alias, "direct_url": self.direct_url,
-                            }))
+                            await ws_send_json(ws, self._register_frame())
                             await self._handle_signaling_message(first)
                     except asyncio.TimeoutError:
-                        await ws.send(json.dumps({
-                            "type": "register", "pubkey": self.public_key,
-                            "relay_alias": self.relay_alias, "direct_url": self.direct_url,
-                        }))
+                        # Older relays send no challenge; register unsigned so
+                        # we still come online (the relay rejects duplicates).
+                        await ws_send_json(ws, self._register_frame())
                     await self.broadcast_ui({
                         "type": "notice", "level": "success",
                         "text": "Connected to signaling server"
@@ -2998,11 +2881,11 @@ class SignalingServer:
     async def handle(self, ws: Any) -> None:
         pubkey = None
         nonce = secrets.token_urlsafe(32)
-        await ws.send(json.dumps({"type": "register_challenge", "nonce": nonce}))
+        await ws_send_json(ws, {"type": "register_challenge", "nonce": nonce})
         try:
             async for raw in ws:
                 if not self._rate_ok(ws):
-                    await ws.send(json.dumps({"type": "error", "text": "Rate limit exceeded"}))
+                    await ws_send_error(ws, "Rate limit exceeded")
                     continue
                 try:
                     msg = json.loads(raw)
@@ -3022,15 +2905,10 @@ class SignalingServer:
                                         bytes.fromhex(candidate),
                                         canonical_json(challenge), b64d(sig)
                                     )):
-                                await ws.send(json.dumps({
-                                    "type": "error", "text": "Invalid registration signature"
-                                }))
+                                await ws_send_error(ws, "Invalid registration signature")
                                 continue
                         elif self.clients.get(candidate):
-                            await ws.send(json.dumps({
-                                "type": "error",
-                                "text": "Duplicate unsigned registration rejected"
-                            }))
+                            await ws_send_error(ws, "Duplicate unsigned registration rejected")
                             continue
                         pubkey = candidate
                         relay_alias = str(msg.get("relay_alias") or hashlib.sha256(candidate.encode()).hexdigest())
@@ -3048,7 +2926,7 @@ class SignalingServer:
                         self.aliases[relay_alias] = pubkey
                         self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
                         for queued in self.offline.pop(pubkey, []):
-                            await ws.send(json.dumps(queued))
+                            await ws_send_json(ws, queued)
                         rows = self.relay_db.execute("SELECT id, envelope FROM offline_queue WHERE target=? ORDER BY id LIMIT 500", (pubkey,)).fetchall()
                         for qid, envelope in rows:
                             await ws.send(envelope)
@@ -3057,12 +2935,10 @@ class SignalingServer:
                         await self.broadcast_peers()
                     elif msg.get("type") == "relay":
                         if not pubkey:
-                            await ws.send(json.dumps({
-                                "type": "error", "text": "Register before relaying"
-                            }))
+                            await ws_send_error(ws, "Register before relaying")
                             continue
                         if not self._pubkey_rate_ok(pubkey):
-                            await ws.send(json.dumps({"type": "error", "text": "Rate limit exceeded"}))
+                            await ws_send_error(ws, "Rate limit exceeded")
                             continue
                         raw_target = str(msg.get("to", ""))
                         try:
@@ -3074,9 +2950,7 @@ class SignalingServer:
                         payload = msg.get("payload")
                         if (not isinstance(payload, dict)
                                 or len(json.dumps(payload)) > MAX_FILE_BYTES * 2):
-                            await ws.send(json.dumps({
-                                "type": "error", "text": "Invalid relay payload"
-                            }))
+                            await ws_send_error(ws, "Invalid relay payload")
                             continue
                         # Fan out to every device socket registered for the
                         # target identity, excluding the sender's own socket
@@ -3100,11 +2974,11 @@ class SignalingServer:
                             # forever for identities that never bring a second
                             # device online, or spam a relay/direct message the
                             # instant a peer reconnects long after it's stale.
-                            await ws.send(json.dumps({"type": "queued", "to": target, "ephemeral": True}))
+                            await ws_send_json(ws, {"type": "queued", "to": target, "ephemeral": True})
                         else:
                             queue = self.offline.setdefault(target, [])
                             if len(queue) >= 500:
-                                await ws.send(json.dumps({"type": "error", "text": "Peer offline queue is full"}))
+                                await ws_send_error(ws, "Peer offline queue is full")
                             else:
                                 queued = {"type": "relay", "from": pubkey, "payload": payload, "offline": True}
                                 queue.append(queued)
@@ -3113,10 +2987,10 @@ class SignalingServer:
                                     (target, json.dumps(queued), utc_ts())
                                 )
                                 self.relay_db.commit()
-                                await ws.send(json.dumps({"type": "queued", "to": target}))
+                                await ws_send_json(ws, {"type": "queued", "to": target})
                 except Exception as exc:
                     LOG.warning("Rejected signaling frame: %s", exc)
-                    await ws.send(json.dumps({"type": "error", "text": str(exc)}))
+                    await ws_send_error(ws, str(exc))
         finally:
             self.rate.pop(ws, None)
             if pubkey and pubkey in self.clients:
@@ -3146,6 +3020,36 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
     ui_ws_port: int = UI_WS_PORT
     require_http_auth: bool = False
 
+    def _index_body(self) -> bytes:
+        return (
+            HTML
+            .replace("__UI_WS_PORT__", str(self.ui_ws_port))
+            .replace("__UI_TOKEN__", self.node.ui_token if self.node else "")
+            .replace("__VERSION__", VERSION)
+        ).encode("utf-8")
+
+    def _health_body(self) -> bytes:
+        return json.dumps(self.node.health() if self.node else {"status": "no node"}).encode()
+
+    def _version_body(self) -> bytes:
+        # Lightweight version probe — useful for monitoring/CI without
+        # pulling the full /health payload (which includes identity).
+        return json.dumps({"version": VERSION, "app": APP_NAME}).encode()
+
+    def _static_route(self, path: str) -> Optional[Tuple[str, Callable[[], bytes]]]:
+        """Map a body-less path to its content type and body builder.
+
+        GET and HEAD must agree on which paths exist and what Content-Type
+        they advertise, so both resolve routes here; HEAD simply never calls
+        the body builder.
+        """
+        routes: Dict[str, Tuple[str, Callable[[], bytes]]] = {
+            "/": ("text/html; charset=utf-8", self._index_body),
+            "/health": ("application/json", self._health_body),
+            "/version": ("application/json", self._version_body),
+        }
+        return routes.get(path)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -3154,26 +3058,10 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(401, "Unauthorized")
             return
 
-        if path == "/":
-            body = (
-                HTML
-                .replace("__UI_WS_PORT__", str(self.ui_ws_port))
-                .replace("__UI_TOKEN__", self.node.ui_token if self.node else "")
-                .replace("__VERSION__", VERSION)
-            ).encode("utf-8")
-            self._send(200, body, "text/html; charset=utf-8")
-            return
-
-        if path == "/health":
-            body = json.dumps(self.node.health() if self.node else {"status": "no node"}).encode()
-            self._send(200, body, "application/json")
-            return
-
-        if path == "/version":
-            # Lightweight version probe — useful for monitoring/CI without
-            # pulling the full /health payload (which includes identity).
-            body = json.dumps({"version": VERSION, "app": APP_NAME}).encode()
-            self._send(200, body, "application/json")
+        route = self._static_route(path)
+        if route:
+            ctype, build_body = route
+            self._send(200, build_body(), ctype)
             return
 
         if path.startswith("/files/"):
@@ -3202,28 +3090,20 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         """HEAD requests return the same Content-Type and security headers as
         GET but no body — useful for monitoring tools that just want /health
-        metadata. We deliberately re-implement routing rather than wrapping
-        do_GET, because BaseHTTPRequestHandler.send_response/send_header all
-        write through ``self.wfile`` — replacing wfile with a null sink would
+        metadata. Routing is shared with do_GET via _static_route, but the
+        response is still emitted here rather than by delegating to do_GET,
+        because BaseHTTPRequestHandler.send_response/send_header all write
+        through ``self.wfile`` — replacing wfile with a null sink would
         discard the status line and headers too, not just the body."""
         parsed = urlparse(self.path)
         path = parsed.path
         if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return
-        if path == "/":
+        route = self._static_route(path)
+        if route:
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._security_headers()
-            self.end_headers()
-        elif path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._security_headers()
-            self.end_headers()
-        elif path == "/version":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", route[0])
             self._security_headers()
             self.end_headers()
         elif path.startswith("/files/"):
@@ -5133,6 +5013,11 @@ const isAudio = (name, type='') => String(type).startsWith('audio/') ||
 const isVideo = (name, type='') => String(type).startsWith('video/') ||
   /\.(mp4|mov|m4v|avi|mkv|webm)$/i.test(name||'');
 const snapshotTarget = () => selectedTarget ? {...selectedTarget} : null;
+// Lookups into the three state collections the UI reads constantly. They all
+// return undefined for a missing/blank id, so callers use `?.` freely.
+const findFriend = pubkey => state.friends.find(f => f.pubkey === pubkey);
+const findGroup = groupId => state.groups.find(g => g.group_id === groupId);
+const findMessage = msgId => state.messages.find(m => m.msg_id === msgId);
 const fileViewUrl = fileId => `/files/${encodeURIComponent(fileId)}?view=1&token=${encodeURIComponent(UI_TOKEN)}`;
 const fileDownloadUrl = fileId => `/files/${encodeURIComponent(fileId)}?token=${encodeURIComponent(UI_TOKEN)}`;
 const normalizeFile = f => ({
@@ -5245,7 +5130,7 @@ function handle(d) {
         ? !d.message.group_id && (d.message.sender_pubkey === selectedTarget.id || d.message.recipient_pubkey === selectedTarget.id)
         : d.message.group_id === selectedTarget.id);
     if(!isSelected && d.message.direction === 'in') {
-      const friend = state.friends.find(f => f.pubkey === d.message.sender_pubkey);
+      const friend = findFriend(d.message.sender_pubkey);
       const name = friend?.nickname || short(d.message.sender_pubkey);
       notify(name, d.message.body);
       bumpUnread(d.message.sender_pubkey);
@@ -5269,7 +5154,7 @@ function handle(d) {
     const isSelected = selectedTarget && matchTarget(fileMessage(file));
     if(isSelected && file.direction === 'in') send({type:'clear_unread', pubkey:file.sender_pubkey});
     if(!isSelected && file.direction === 'in') {
-      const friend = state.friends.find(f => f.pubkey === file.sender_pubkey);
+      const friend = findFriend(file.sender_pubkey);
       notify(friend?.nickname || short(file.sender_pubkey), `Sent ${file.filename}`);
       bumpUnread(file.sender_pubkey);
     }
@@ -5286,13 +5171,13 @@ function handle(d) {
     }
     renderTyping();
   } else if(d.type === 'status_update') {
-    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    const m = findMessage(d.msg_id);
     if(m) { m.status = d.status; renderMessages(); }
   } else if(d.type === 'read_receipt') {
-    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    const m = findMessage(d.msg_id);
     if(m) { m.status = 'read'; m.read_at = d.read_at; renderMessages(); }
   } else if(d.type === 'reaction') {
-    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    const m = findMessage(d.msg_id);
     if(m) {
       if(!m.reactions) m.reactions = [];
       if(d.action === 'add') {
@@ -5563,7 +5448,7 @@ function renderTyping() {
   const target = selectedTarget;
   if(!target || target.type !== 'friend') { el.innerHTML = ''; return; }
   if(typing[target.id]) {
-    const f = state.friends.find(x=>x.pubkey===target.id);
+    const f = findFriend(target.id);
     const name = f?.nickname || short(target.id);
     el.innerHTML = `<span style="color:var(--text2);font-size:12px">${esc(name)} is typing</span><div class="typing-dots"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>`;
   } else {
@@ -5580,7 +5465,7 @@ function renderSessions() {
   }
   const SESSION_TTL = 86400;
   el.innerHTML = entries.map(([peer, s]) => {
-    const f = state.friends.find(x=>x.pubkey===peer);
+    const f = findFriend(peer);
     const name = f?.nickname || short(peer);
     const pct = Math.min(100, Math.round((s.expires_in/SESSION_TTL)*100));
     const cls = pct > 50 ? '' : pct > 20 ? 'warn' : 'danger';
@@ -5650,7 +5535,7 @@ function renderChatHeader() {
     return;
   }
   if(selectedTarget.type === 'friend') {
-    const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
+    const f = findFriend(selectedTarget.id);
     const name = f?.nickname || short(selectedTarget.id);
     const online = state.online.includes(selectedTarget.id);
     const secure = !!(state.sessions&&state.sessions[selectedTarget.id]);
@@ -5684,7 +5569,7 @@ function renderChatHeader() {
       </div>
     `;
   } else {
-    const g = state.groups.find(x=>x.group_id===selectedTarget.id);
+    const g = findGroup(selectedTarget.id);
     const name = g?.name || 'Group';
     const isOwner = g && g.owner_pubkey === state.public_key;
     el.innerHTML = `
@@ -5715,12 +5600,12 @@ function toggleGroupManage() {
 }
 
 function renderGroupManage() {
-  const g = state.groups.find(x=>x.group_id===selectedTarget?.id);
+  const g = findGroup(selectedTarget?.id);
   const el = $('groupManageBody');
   if(!g) { el.innerHTML = ''; return; }
   const isOwner = g.owner_pubkey === state.public_key;
   let html = (g.members||[]).map(pubkey => {
-    const f = state.friends.find(x=>x.pubkey===pubkey);
+    const f = findFriend(pubkey);
     const label = pubkey === state.public_key ? 'You' : (f?.nickname || short(pubkey));
     const role = pubkey === g.owner_pubkey ? 'owner' : 'member';
     const canRemove = isOwner && pubkey !== g.owner_pubkey;
@@ -5859,7 +5744,7 @@ function connectPeer() {
 
 function verifyFriend(verified) {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
-  const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
+  const f = findFriend(selectedTarget.id);
   if(verified && !confirm(`Verify this safety fingerprint?
 
 ${f?.fingerprint||selectedTarget.id}`)) return;
@@ -5868,7 +5753,7 @@ ${f?.fingerprint||selectedTarget.id}`)) return;
 
 function renameFriend() {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
-  const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
+  const f = findFriend(selectedTarget.id);
   const current = f?.nickname || '';
   // prompt() is intentionally simple — it lets the user clear the nickname
   // (Cancel keeps the existing one, OK with empty input clears it).
@@ -5886,7 +5771,7 @@ function blockFriend(blocked) {
 }
 
 function copyMessage(msgId) {
-  const m = state.messages.find(x => x.msg_id === msgId);
+  const m = findMessage(msgId);
   if(!m || !m.body) return;
   // Use the Clipboard API with a textarea fallback for older browsers.
   if(navigator.clipboard?.writeText) {
@@ -5909,8 +5794,8 @@ function deleteMessageLocally(msgId) {
 function openSearchModal() {
   if(!selectedTarget) { toast('Select a friend or group first', 'warning'); return; }
   const label = selectedTarget.type === 'friend'
-    ? (state.friends.find(f=>f.pubkey===selectedTarget.id)?.nickname || short(selectedTarget.id))
-    : (state.groups.find(g=>g.group_id===selectedTarget.id)?.name || 'this group');
+    ? friendName(selectedTarget.id)
+    : (findGroup(selectedTarget.id)?.name || 'this group');
   $('searchScopeHint').textContent = `Searching your conversation with ${label}.`;
   $('searchResults').innerHTML = '';
   $('searchInput').value = '';
@@ -5965,7 +5850,7 @@ function jumpToMessage(msgId) {
 // WebRTC (DTLS-SRTP), negotiated directly browser-to-browser — that leg is not
 // post-quantum, since no mainstream browser offers one yet.
 function friendName(pubkey) {
-  return state.friends.find(f=>f.pubkey===pubkey)?.nickname || short(pubkey);
+  return findFriend(pubkey)?.nickname || short(pubkey);
 }
 
 async function startCall(media) {
@@ -6374,7 +6259,7 @@ function loadMore() {
 
 function toggleReaction(msg_id, peer_pubkey, emoji) {
   if(!peer_pubkey || peer_pubkey === state.public_key) return;
-  const m = state.messages.find(x=>x.msg_id===msg_id);
+  const m = findMessage(msg_id);
   if(!m) return;
   const existing = (m.reactions||[]).find(r=>r.peer_pubkey===state.public_key&&r.emoji===emoji);
   const action = existing ? 'remove' : 'add';
