@@ -952,3 +952,29 @@ def test_run_node_rejects_malformed_ice_servers_cli_flag():
     args = parse_args(["--ice-servers", "{not json", "--no-browser"])
     with pytest.raises(SystemExit):
         asyncio.run(run_node(args))
+
+
+def test_add_group_member_command(tmp_path):
+    pytest.importorskip("cryptography")
+    pytest.importorskip("pqcrypto")
+    import chat as chat_module
+    import tempfile, os, uuid
+
+    db_path = str(tmp_path / "group_add.db")
+    node = chat_module.QuantumNode(db_path, "ws://127.0.0.1:65535", direct_url=None, enable_direct=False)
+    try:
+        pk, _ = node.crypto.new_identity()
+        friend_pk = pk.hex()
+        node.db.add_friend(friend_pk, "Friend 1")
+
+        gid = str(uuid.uuid4())
+        node.db.create_group(gid, "Test Group", node.public_key)
+        assert len(node.db.group_members(gid)) == 1
+
+        # Test adding group member via _dispatch_ui
+        asyncio.run(node._dispatch_ui(None, {"type": "add_group_member", "group_id": gid, "pubkey": friend_pk}))
+        members = node.db.group_members(gid)
+        assert len(members) == 2
+        assert friend_pk in members
+    finally:
+        node.db.close()
