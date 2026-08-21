@@ -404,7 +404,8 @@ requirements.txt                       # Runtime dependencies
 pyproject.toml                         # Package metadata and console entry point
 README.md                              # This document
 LICENSE                                # MIT
-test_validation_and_database.py        # Unit tests (42 cases)
+test_validation_and_database.py        # Unit tests (44 cases)
+test_error_propagation.py              # Error-surfacing tests (6 cases)
 scripts/smoke_test.py                  # Live HTTP smoke test (13 checks)
 scripts/e2e_test.py                    # End-to-end protocol test (15 checks)
 scripts/new_features_test.py           # Multi-device sync, calls, search, parallel file transfer (14 checks)
@@ -442,6 +443,14 @@ pytest test_validation_and_database.py
 ```
 
 43 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
+
+### Error-propagation tests
+
+```bash
+pytest test_error_propagation.py
+```
+
+6 cases pinning the failure paths that must not be silent: an unrecognized relay payload kind is rejected instead of acked, `search_messages` logs the rows it could not decrypt, a failed `chmod` on the local key file warns, chunk cleanup only credits the quota with bytes it actually freed, an undecryptable attachment returns HTTP 500 rather than dropping the connection, and an unexpected error in a UI command is logged with its traceback.
 
 ### Live HTTP smoke test
 

@@ -312,22 +312,28 @@ class PQModule:
             return self.sign_mod.sign(message, secret_key)
 
     def verify(self, public_key: bytes, message: bytes, signature: bytes) -> bool:
-        """Verify a signature. Supports pqcrypto 0.4 (returns True/False) and 1.0 (returns None on success, raises on mismatch)."""
+        """Verify a signature. Supports pqcrypto 0.4 (returns True/False) and 1.0 (returns None on success, raises on mismatch).
+
+        A raised exception is how pqcrypto 1.0 reports a bad signature, so it
+        has to be translated into ``False`` — but it can also mean the
+        arguments were malformed or the backend is broken, which would
+        otherwise look identical to a forged message. Every rejection is
+        therefore logged with its cause instead of being dropped."""
         try:
             result = self.sign_mod.verify(public_key, message, signature)
-            if result is None or result is True:
-                return True
-            return False
         except TypeError:
             try:
                 result = self.sign_mod.verify(message, signature, public_key)
-                if result is None or result is True:
-                    return True
+            except Exception as exc:
+                LOG.debug("Signature verification failed: %s: %s", type(exc).__name__, exc)
                 return False
-            except Exception:
-                return False
-        except Exception:
+        except Exception as exc:
+            LOG.debug("Signature verification failed: %s: %s", type(exc).__name__, exc)
             return False
+        if result is None or result is True:
+            return True
+        LOG.debug("Signature verification returned a falsy result: %r", result)
+        return False
 
     def encapsulate(self, public_key: bytes) -> Tuple[bytes, bytes]:
         if hasattr(self.kem_mod, "encaps"):
@@ -535,13 +541,21 @@ class LocalKeyStore:
             self._write_raw(key)
         return key
 
+    @staticmethod
+    def _restrict_permissions(path: Path) -> None:
+        """Best-effort 0600 on the key file. chmod is a no-op on some
+        filesystems (Windows, FAT, some network mounts) so it can't be fatal,
+        but a failure means the local key may be readable by other users —
+        loud enough to warrant a warning rather than silence."""
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            LOG.warning("Could not restrict permissions on %s to 0600 — the local encryption key may be readable by other users: %s", path, exc)
+
     def _write_raw(self, key: bytes) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(b64e(key), encoding="ascii")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
+        self._restrict_permissions(tmp)
         tmp.replace(self.path)
 
     def _write_wrapped(self, key: bytes) -> None:
@@ -549,10 +563,7 @@ class LocalKeyStore:
         blob = self._wrap_key(key, salt)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(f"QCWRAP2:{b64e(salt)}:{b64e(blob)}", encoding="ascii")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
+        self._restrict_permissions(tmp)
         tmp.replace(self.path)
 
 
@@ -1209,15 +1220,24 @@ class Database:
                     "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (scan_limit,)
                 ).fetchall()
         results = []
+        undecryptable = 0
         for r in rows:
             try:
                 d = self._hydrate_message_row(r)
-            except Exception:
-                continue  # skip rows that fail to decrypt rather than aborting the whole search
+            except Exception as exc:
+                # Skip rows that fail to decrypt rather than aborting the whole
+                # search, but never do it silently: an undecryptable row means a
+                # corrupted database or a changed local key, which the operator
+                # needs to know about because those rows are invisible to search.
+                undecryptable += 1
+                LOG.debug("Skipping undecryptable message row %s during search: %s", r["msg_id"], exc)
+                continue
             if query in d["body"].lower():
                 results.append(d)
                 if len(results) >= limit:
                     break
+        if undecryptable:
+            LOG.warning("Search skipped %d message row(s) that could not be decrypted", undecryptable)
         return results
 
     # ── Reactions ─────────────────────────────────────────────────────────────
@@ -1501,7 +1521,8 @@ class QuantumNode:
         for ws in self.ui_clients:
             try:
                 await ws.send(payload)
-            except Exception:
+            except Exception as exc:
+                LOG.debug("Dropping UI client after a failed send: %s", exc)
                 dead.append(ws)
         for ws in dead:
             self.ui_clients.discard(ws)
@@ -1631,10 +1652,12 @@ class QuantumNode:
             self.db.metric_inc("direct_received")
         except Exception as exc:
             self.db.metric_inc("direct_rejected")
+            LOG.warning("Rejected direct peer frame from %s: %s: %s", remote_host, type(exc).__name__, exc)
+            LOG.debug("Direct peer frame traceback", exc_info=True)
             try:
                 await ws.send(json.dumps({"type": "error", "text": str(exc)}))
-            except Exception:
-                pass  # peer may already be gone
+            except Exception as send_exc:
+                LOG.debug("Could not report the error to direct peer %s: %s", remote_host, send_exc)
 
     async def flush_outbox(self, peer_pubkey: str) -> None:
         if not self.signaling_ws:
@@ -1960,8 +1983,10 @@ class QuantumNode:
                 "to": peer_pubkey,
                 "active": active,
             }, ephemeral=True)
-        except Exception:
-            pass  # typing indicators are ephemeral — failures are acceptable
+        except Exception as exc:
+            # Typing indicators are ephemeral, so a failure must not break the
+            # caller — but it still points at a transport problem worth seeing.
+            LOG.debug("Failed to send typing indicator to %s: %s", short_key(peer_pubkey), exc)
 
     async def handle_typing(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
@@ -2147,7 +2172,8 @@ class QuantumNode:
 
     async def handle_call_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if not self.db.is_friend(peer_pubkey):
-            return  # silently ignore call attempts from non-friends
+            LOG.warning("Ignoring call offer from non-friend %s", short_key(peer_pubkey))
+            return
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid call offer signature")
         payload = data["payload"]
@@ -2163,8 +2189,8 @@ class QuantumNode:
                     "from": self.public_key, "to": peer_pubkey,
                     "call_id": payload.get("call_id"), "reason": "busy",
                 }))
-            except Exception:
-                pass
+            except Exception as exc:
+                LOG.warning("Could not tell %s we are busy: %s", short_key(peer_pubkey), exc)
             return
         self.active_calls[peer_pubkey] = {
             "call_id": payload.get("call_id"), "role": "callee", "media": media, "state": "ringing",
@@ -2216,10 +2242,15 @@ class QuantumNode:
 
     async def handle_call_ice(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if not self.verify_signed(peer_pubkey, data):
+            # Dropped rather than raised because trickle-ICE is best-effort and
+            # a single bad candidate shouldn't tear down the relay connection,
+            # but an unauthenticated candidate is a security-relevant event.
+            LOG.warning("Dropping ICE candidate from %s: invalid signature", short_key(peer_pubkey))
             return
         payload = data["payload"]
         call = self.active_calls.get(peer_pubkey)
         if not call or call["call_id"] != payload.get("call_id"):
+            LOG.debug("Dropping ICE candidate from %s: no matching active call", short_key(peer_pubkey))
             return
         await self.broadcast_ui({
             "type": "call_ice", "peer": peer_pubkey, "candidate": payload.get("candidate"),
@@ -2235,8 +2266,10 @@ class QuantumNode:
                 "from": self.public_key, "to": peer_pubkey,
                 "call_id": call["call_id"], "reason": reason,
             }))
-        except Exception:
-            pass  # best-effort — the local call state is already cleared either way
+        except Exception as exc:
+            # Best-effort — the local call state is already cleared either way,
+            # but the peer may now be stuck showing an active call.
+            LOG.warning("Could not notify %s that the call ended: %s", short_key(peer_pubkey), exc)
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey,
             "call_id": call["call_id"], "state": "ended", "reason": reason,
@@ -2524,15 +2557,19 @@ class QuantumNode:
         for c in chunks:
             path = Path(c["storage_path"])
             try:
-                freed += path.stat().st_size
+                size = path.stat().st_size
                 path.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                # Only count bytes we actually reclaimed, otherwise the quota
+                # counter drifts below real usage every time a shard sticks.
+                LOG.warning("Could not delete chunk shard %s for file %s: %s", path, file_id, exc)
+                continue
+            freed += size
         chunk_dir = self.files_dir / f"{file_id}.chunks"
         try:
             chunk_dir.rmdir()
-        except OSError:
-            pass
+        except OSError as exc:
+            LOG.debug("Chunk directory %s not removed: %s", chunk_dir, exc)
         self.db.delete_file_chunks(file_id)
         if freed:
             self._track_storage(-freed)
@@ -2656,6 +2693,13 @@ class QuantumNode:
                 self.db.mark_recv_counter(peer_pubkey, int(data.get("counter", 0)))
                 self.db.save_group_key(group_id, int(data.get("epoch", 1)), group_key, peer_pubkey)
             await self.broadcast_ui(self.state_payload())
+        else:
+            # An unrecognized kind was previously dropped without a trace, so a
+            # peer on a newer protocol (or an attacker probing the dispatcher)
+            # looked exactly like a successful delivery. Raise so the caller
+            # logs it and the direct transport answers with an error frame
+            # instead of a silent ack.
+            raise ValueError(f"Unsupported relay payload kind: {kind!r}")
 
     # ── UI WebSocket ──────────────────────────────────────────────────────────
 
@@ -2688,10 +2732,21 @@ class QuantumNode:
                 try:
                     msg = json.loads(raw)
                     await self._dispatch_ui(ws, msg)
-                except Exception as exc:
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    # Expected rejections (validation, missing field, no
+                    # transport) carry a message meant for the user.
                     LOG.warning("UI command rejected: %s", exc)
                     await ws.send(json.dumps({
                         "type": "notice", "level": "error", "text": str(exc)
+                    }))
+                except Exception as exc:
+                    # Anything else is a bug rather than bad input: keep the
+                    # UI session alive, but log the full traceback instead of
+                    # reducing it to a one-line message nobody can debug.
+                    LOG.exception("Unexpected error handling UI command")
+                    await ws.send(json.dumps({
+                        "type": "notice", "level": "error",
+                        "text": f"Internal error: {type(exc).__name__}: {exc}"
                     }))
         finally:
             self.ui_clients.discard(ws)
@@ -2992,8 +3047,8 @@ class SignalingServer:
             for ws in list(sockets):
                 try:
                     await ws.send(payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    LOG.debug("Peer-list broadcast to a stale socket failed: %s", exc)
 
     async def handle(self, ws: Any) -> None:
         pubkey = None
@@ -3243,9 +3298,22 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "File not found")
             return
 
-        stored = Path(meta["storage_path"]).read_bytes()
-        data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
-                if self.node else stored)
+        # Read/decrypt failures used to escape into BaseHTTPRequestHandler,
+        # which drops the connection without a status line; the browser then
+        # shows an opaque network error for what is really a server-side
+        # problem. Report it as a 500 and log the cause.
+        try:
+            stored = Path(meta["storage_path"]).read_bytes()
+            data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
+                    if self.node else stored)
+        except OSError as exc:
+            LOG.error("Could not read attachment %s from %s: %s", file_id, meta["storage_path"], exc)
+            self.send_error(500, "Attachment could not be read")
+            return
+        except Exception:
+            LOG.exception("Could not decrypt attachment %s", file_id)
+            self.send_error(500, "Attachment could not be decrypted")
+            return
         try:
             byte_range = parse_http_range(self.headers.get("Range", ""), len(data))
         except ValueError:
@@ -5183,7 +5251,9 @@ function wsConnect() {
     wsRetryTimer = setTimeout(wsConnect, wsRetryDelay);
     wsRetryDelay = Math.min(30000, Math.round(wsRetryDelay * 1.8));
   };
-  ws.onerror = () => {};
+  // onclose always follows onerror and owns the reconnect/UI state, so this
+  // handler only exists to keep the failure visible in the console.
+  ws.onerror = ev => console.warn('UI socket error', ev);
   ws.onmessage = e => {
     try { handle(JSON.parse(e.data)); }
     catch(err) { console.error('Ignored invalid UI socket frame', err); }
@@ -5200,7 +5270,7 @@ function setConn(connected, retrySeconds=0) {
 function send(obj) {
   if(ws && ws.readyState === 1) {
     try { ws.send(JSON.stringify(obj)); return true; }
-    catch(_) { toast('Could not send to the local node', 'error'); return false; }
+    catch(err) { console.error('UI socket send failed', err); toast('Could not send to the local node', 'error'); return false; }
   }
   toast('UI socket not connected', 'warning');
   return false;
@@ -5894,8 +5964,11 @@ function copyMessage(msgId) {
   } else {
     const ta = document.createElement('textarea');
     ta.value = m.body; document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); toast('Message copied', 'success'); }
-    catch(_) { toast('Copy failed', 'error'); }
+    try {
+      if(document.execCommand('copy')) toast('Message copied', 'success');
+      else toast('Copy failed — copy the selected text manually', 'error');
+    }
+    catch(err) { console.warn('Copy failed', err); toast('Copy failed', 'error'); }
     document.body.removeChild(ta);
   }
 }
@@ -6093,7 +6166,8 @@ async function handleCallAnswered(d) {
 async function handleCallIceCandidate(d) {
   if(!currentCall || currentCall.peer !== d.peer || !d.candidate) return;
   if(pc && pc.remoteDescription) {
-    try { await pc.addIceCandidate(d.candidate); } catch(_) {}
+    try { await pc.addIceCandidate(d.candidate); }
+    catch(err) { console.warn('Rejected a remote ICE candidate', err); }
   } else {
     pendingIceQueue.push(d.candidate);
   }
@@ -6102,7 +6176,8 @@ async function handleCallIceCandidate(d) {
 async function flushIceQueue() {
   while(pendingIceQueue.length && pc) {
     const c = pendingIceQueue.shift();
-    try { await pc.addIceCandidate(c); } catch(_) {}
+    try { await pc.addIceCandidate(c); }
+    catch(err) { console.warn('Rejected a queued ICE candidate', err); }
   }
 }
 
@@ -6126,7 +6201,7 @@ function hangupCall() {
 }
 
 function cleanupCall() {
-  if(pc) { try { pc.close(); } catch(_) {} pc = null; }
+  if(pc) { try { pc.close(); } catch(err) { console.warn('Error closing peer connection', err); } pc = null; }
   if(localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   currentCall = null;
   pendingIceQueue = [];
@@ -6169,10 +6244,14 @@ function playRingtone() {
     osc.start();
     ringtoneOsc = {ctx, osc};
     setTimeout(stopRingtone, 20000);  // stop on its own if never answered/declined
-  } catch(_) {}
+  } catch(err) { console.warn('Could not play the ringtone', err); }
 }
 function stopRingtone() {
-  if(ringtoneOsc) { try { ringtoneOsc.osc.stop(); ringtoneOsc.ctx.close(); } catch(_) {} ringtoneOsc = null; }
+  if(ringtoneOsc) {
+    try { ringtoneOsc.osc.stop(); ringtoneOsc.ctx.close(); }
+    catch(err) { console.warn('Could not stop the ringtone cleanly', err); }
+    ringtoneOsc = null;
+  }
 }
 
 function sendMessage() {
@@ -6306,7 +6385,8 @@ async function toggleVoiceRecording() {
       }
     }, 200);
   } catch(err) {
-    toast('Microphone access denied or unavailable', 'error');
+    console.warn('Voice recording could not start', err);
+    toast(`Microphone unavailable: ${err.message || err.name}`, 'error');
   }
 }
 
@@ -6338,8 +6418,17 @@ function copyBackupResult() {
   const el = $('backupExportResult');
   if(!el.value) { toast('Generate a backup first', 'warning'); return; }
   el.select();
-  navigator.clipboard?.writeText(el.value).then(() => toast('Backup copied to clipboard', 'success'))
-    .catch(() => document.execCommand('copy'));
+  const legacyCopy = () => {
+    if(document.execCommand('copy')) toast('Backup copied to clipboard', 'success');
+    else toast('Copy failed — select the backup text and copy it manually', 'error');
+  };
+  if(navigator.clipboard) {
+    navigator.clipboard.writeText(el.value)
+      .then(() => toast('Backup copied to clipboard', 'success'))
+      .catch(err => { console.warn('Clipboard write failed, falling back', err); legacyCopy(); });
+  } else {
+    legacyCopy();
+  }
 }
 function importBackup() {
   const backup = $('backupImportBlob').value.trim();
@@ -6453,7 +6542,7 @@ function notify(title, body) {
   if('Notification' in window && Notification.permission === 'granted') {
     try {
       new Notification(`⚛ ${title}`, {body: body.slice(0,120), icon: ''});
-    } catch(_) {}
+    } catch(err) { console.warn('Desktop notification suppressed', err); }
   }
 }
 
@@ -6598,8 +6687,10 @@ async def run_node(args: argparse.Namespace) -> None:
     if args.open_browser:
         try:
             webbrowser.open(ui_url)
-        except Exception:
-            pass  # headless or no default browser — not fatal
+        except Exception as exc:
+            # Headless or no default browser — not fatal, but the user asked
+            # for a browser, so say why one didn't appear.
+            print(f"Could not open a browser automatically ({exc}). Open {ui_url} manually.")
     tasks = [
         asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
         asyncio.create_task(node.connect_signaling_loop()),
@@ -6656,21 +6747,24 @@ async def run_node(args: argparse.Namespace) -> None:
         if 'stop_task' in locals() and not stop_task.done():
             stop_task.cancel()
         await _cleanup_runtime_tasks(tasks)
+        # Shutdown steps are independent: one failure must not skip the rest,
+        # but a database that refuses to close can mean unflushed writes, so
+        # none of these are swallowed silently.
         try:
             httpd.shutdown()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOG.warning("HTTP server did not shut down cleanly: %s", exc)
         try:
             node.db.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOG.error("Local database did not close cleanly — recent writes may be lost: %s", exc)
         # Also close the signaling server's relay DB if we started one.
         try:
             relay_db = getattr(getattr(node, "signaling_ws", None), "relay_db", None)
             if relay_db:
                 relay_db.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOG.warning("Relay database did not close cleanly: %s", exc)
         print("Goodbye.")
 
 
