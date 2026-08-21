@@ -44,7 +44,7 @@ v3.3.0 focuses on making the browser client dependable and comfortable as a dail
 - **Persistent local deletion.** Deleting a message removes its encrypted database row plus local reaction/read metadata and updates every open browser UI. This remains a local-only operation: it does not claim to erase the peer's copy or copies on other devices.
 - **Safer live updates.** State/history/message events are deduplicated, refreshes reconcile stale selections and headers, and incoming messages no longer force the timeline to the bottom while you are reading older history.
 - **Accessibility and visual polish.** Solid high-contrast surfaces replace decorative glow-heavy styling, focus states are consistently visible, reduced-motion preferences are honored, modals close with Escape, and the composer enforces the server's UTF-8 byte limit before sending.
-- **Tests and metadata.** The unit suite now contains **43 passing tests**, including persistent message-deletion coverage, and package/runtime versions are aligned at `3.3.0`.
+- **Tests and metadata.** The unit suite now contains **105 passing tests** (~83% statement coverage of `chat.py`), including persistent message-deletion coverage, and package/runtime versions are aligned at `3.3.0`.
 
 ---
 
@@ -438,10 +438,23 @@ Important remaining limits:
 ### Unit tests
 
 ```bash
-pytest test_validation_and_database.py
+pytest                                       # both unit suites (105 cases)
+pytest test_validation_and_database.py       # validation, storage, HTTP
+pytest test_node_relay_and_signaling.py      # node/relay protocol behavior
 ```
 
-43 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
+`test_validation_and_database.py` — 44 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
+
+`test_node_relay_and_signaling.py` — 61 cases driving the pieces the suite above
+barely reached: the `SignalingServer.handle` frame loop (registration challenge,
+duplicate/oversized/malformed frames, relay routing, offline queue drain,
+ephemeral drops, rate limits, multi-device fan-out), the `QuantumNode` protocol
+handlers (Kyber handshake, chat/file/group/call/typing/receipt/reaction/device-sync
+dispatch, chunked file reassembly, UI command dispatch, replay and signature
+rejection), and the `PQModule` shim across every `pqcrypto` API spelling. Two
+nodes are wired together in-process — relay traffic is delivered straight into
+the peer's handler and sockets are small fakes — so real post-quantum crypto and
+SQLite persistence are exercised without a network or subprocesses.
 
 ### Live HTTP smoke test
 
