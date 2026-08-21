@@ -290,10 +290,20 @@ class PQModule:
         self.sign_public_key_bytes = len(pk)
 
     def sign_keypair(self) -> Tuple[bytes, bytes]:
-        return self.sign_mod.generate_keypair() if hasattr(self.sign_mod, "generate_keypair") else self.sign_mod.keypair()
+        if hasattr(self.sign_mod, "generate_keypair"):
+            return self.sign_mod.generate_keypair()
+        elif hasattr(self.sign_mod, "keygen"):
+            return self.sign_mod.keygen()
+        else:
+            return self.sign_mod.keypair()
 
     def kem_keypair(self) -> Tuple[bytes, bytes]:
-        return self.kem_mod.generate_keypair() if hasattr(self.kem_mod, "generate_keypair") else self.kem_mod.keypair()
+        if hasattr(self.kem_mod, "generate_keypair"):
+            return self.kem_mod.generate_keypair()
+        elif hasattr(self.kem_mod, "keygen"):
+            return self.kem_mod.keygen()
+        else:
+            return self.kem_mod.keypair()
 
     def sign(self, secret_key: bytes, message: bytes) -> bytes:
         try:
@@ -302,34 +312,47 @@ class PQModule:
             return self.sign_mod.sign(message, secret_key)
 
     def verify(self, public_key: bytes, message: bytes, signature: bytes) -> bool:
-        """Verify a signature. pqcrypto 0.4+ returns True/False from verify()
-        rather than raising, so we must inspect the return value — wrapping the
-        call in a bare ``try: verify(...); return True`` was a critical bug
-        that accepted every signature, valid or not."""
-        # Preferred modern pqcrypto API: (public_key, message, signature) -> bool
+        """Verify a signature. Supports pqcrypto 0.4 (returns True/False) and 1.0 (returns None on success, raises on mismatch)."""
         try:
             result = self.sign_mod.verify(public_key, message, signature)
-            return bool(result)
+            if result is None or result is True:
+                return True
+            return False
         except TypeError:
-            # Older API variants swapped argument order or raised on mismatch.
             try:
                 result = self.sign_mod.verify(message, signature, public_key)
-                return bool(result)
+                if result is None or result is True:
+                    return True
+                return False
             except Exception:
                 return False
         except Exception:
-            # verify() raises (or the lib raises) when bytes are malformed,
-            # the public key is wrong-sized, or the signature is invalid.
             return False
 
     def encapsulate(self, public_key: bytes) -> Tuple[bytes, bytes]:
-        return self.kem_mod.encrypt(public_key) if hasattr(self.kem_mod, "encrypt") else self.kem_mod.encapsulate(public_key)
+        if hasattr(self.kem_mod, "encaps"):
+            return self.kem_mod.encaps(public_key)
+        elif hasattr(self.kem_mod, "encrypt"):
+            return self.kem_mod.encrypt(public_key)
+        else:
+            return self.kem_mod.encapsulate(public_key)
 
     def decapsulate(self, secret_key: bytes, ciphertext: bytes) -> bytes:
-        try:
-            return self.kem_mod.decrypt(secret_key, ciphertext)
-        except TypeError:
-            return self.kem_mod.decapsulate(secret_key, ciphertext)
+        if hasattr(self.kem_mod, "decaps"):
+            try:
+                return self.kem_mod.decaps(secret_key, ciphertext)
+            except TypeError:
+                return self.kem_mod.decaps(ciphertext, secret_key)
+        elif hasattr(self.kem_mod, "decrypt"):
+            try:
+                return self.kem_mod.decrypt(secret_key, ciphertext)
+            except TypeError:
+                return self.kem_mod.decrypt(ciphertext, secret_key)
+        else:
+            try:
+                return self.kem_mod.decapsulate(secret_key, ciphertext)
+            except TypeError:
+                return self.kem_mod.decapsulate(ciphertext, secret_key)
 
 
 class QuantumCrypto:
@@ -2739,6 +2762,15 @@ class QuantumNode:
                         }
                         await self.send_group_invite(member, invite, group_key)
             await self.broadcast_ui(self.state_payload())
+        elif typ == "add_group_member":
+            group_id = str(msg["group_id"])
+            if self.db.group_role(group_id, self.public_key) != "owner":
+                raise ValueError("Only the group owner can add members")
+            member = self.validate_peer_key(msg["pubkey"])
+            if not self.db.is_friend(member):
+                raise ValueError("Add this public key as a friend before adding to group")
+            self.db.add_group_member(group_id, member)
+            await self.rotate_group_key(group_id)
         elif typ == "remove_group_member":
             await self.remove_group_member(str(msg["group_id"]), self.validate_peer_key(msg["pubkey"]))
         elif typ == "rotate_group_key":
@@ -5687,7 +5719,7 @@ function renderGroupManage() {
   const el = $('groupManageBody');
   if(!g) { el.innerHTML = ''; return; }
   const isOwner = g.owner_pubkey === state.public_key;
-  el.innerHTML = (g.members||[]).map(pubkey => {
+  let html = (g.members||[]).map(pubkey => {
     const f = state.friends.find(x=>x.pubkey===pubkey);
     const label = pubkey === state.public_key ? 'You' : (f?.nickname || short(pubkey));
     const role = pubkey === g.owner_pubkey ? 'owner' : 'member';
@@ -5697,7 +5729,22 @@ function renderGroupManage() {
       <span class="mono" title="${esc(pubkey)}">${esc(label)}</span>
       ${canRemove ? `<button class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">✕</button>` : ''}
     </div>`;
-  }).join('') || '<span class="muted" style="font-size:12px">No members</span>';
+  }).join('');
+  if(isOwner) {
+    html += `
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input class="field" id="addMemberKey" placeholder="Friend public key to add">
+        <button class="btn btn-primary btn-sm" onclick="addGroupMember('${esc(g.group_id)}')">Add member</button>
+      </div>
+    `;
+  }
+  el.innerHTML = html || '<span class="muted" style="font-size:12px">No members</span>';
+}
+
+function addGroupMember(group_id) {
+  const pk = ($('addMemberKey')?.value||'').trim();
+  if(!pk) return;
+  send({type:'add_group_member', group_id, pubkey:pk});
 }
 
 function removeGroupMember(group_id, pubkey) {
