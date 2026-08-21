@@ -5,7 +5,7 @@ description = "Single-file post-quantum end-to-end encrypted peer-to-peer chat w
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "cryptography>=42.0.0",
+  "cryptography>=44.0.1",
   "websockets>=12.0",
   "pqcrypto>=0.3.0",
 ]

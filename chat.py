@@ -135,6 +135,31 @@ def validate_emoji(emoji: str) -> str:
     return emoji
 
 
+def validate_direct_url(value: Any) -> Optional[str]:
+    """Return a peer-advertised direct WebSocket URL, or None if unusable.
+
+    The relay hands out this value, so it is attacker-controlled: without a
+    scheme/shape check the node would happily open a connection to any URL a
+    hostile relay or peer chose, turning direct delivery into a request-forgery
+    primitive against hosts reachable from the node.
+    """
+    text = str(value or "").strip()
+    if not text or len(text) > 255:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme not in {"ws", "wss"} or parsed.username or parsed.password:
+        return None
+    if not parsed.hostname or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None and not 0 < port < 65536:
+        return None
+    return text
+
+
 def safe_filename(filename: Any) -> str:
     name = os.path.basename(str(filename or "").replace("\\", "/")).strip() or "download.bin"
     name = name[:MAX_FILENAME_CHARS]
@@ -827,6 +852,18 @@ class Database:
                 "SELECT 1 FROM friends WHERE pubkey=? AND blocked=0", (pubkey,)
             ).fetchone() is not None
 
+    def is_blocked(self, pubkey: str) -> bool:
+        """True only for a peer we explicitly blocked.
+
+        Unlike is_friend() this stays False for peers we simply do not know
+        yet, which matters for events a second device receives before it has
+        synced the friend list.
+        """
+        with self.lock:
+            return self.conn.execute(
+                "SELECT 1 FROM friends WHERE pubkey=? AND blocked=1", (pubkey,)
+            ).fetchone() is not None
+
     def touch_friend(self, pubkey: str) -> None:
         with self.lock:
             self.conn.execute(
@@ -1485,8 +1522,9 @@ class QuantumNode:
 
     def _load_state(self) -> None:
         for friend in self.db.get_friends():
-            if friend.get("direct_url"):
-                self.peer_direct[friend["pubkey"]] = friend["direct_url"]
+            direct_url = validate_direct_url(friend.get("direct_url"))
+            if direct_url:
+                self.peer_direct[friend["pubkey"]] = direct_url
             session = self.db.get_session(friend["pubkey"])
             if session:
                 self.sessions[friend["pubkey"]] = session["key"]
@@ -1964,6 +2002,8 @@ class QuantumNode:
             pass  # typing indicators are ephemeral — failures are acceptable
 
     async def handle_typing(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if self.db.is_blocked(peer_pubkey):
+            return  # a blocked peer must not drive our UI
         if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
             return
         active = bool(data.get("active"))
@@ -1999,6 +2039,8 @@ class QuantumNode:
             LOG.debug("Failed to send read receipt: %s", exc)
 
     async def handle_read_receipt(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if self.db.is_blocked(peer_pubkey):
+            raise ValueError("Read receipt from a blocked peer")
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid read receipt signature")
         payload = data["payload"]
@@ -2049,6 +2091,8 @@ class QuantumNode:
         })
 
     async def handle_reaction(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if self.db.is_blocked(peer_pubkey):
+            raise ValueError("Reaction from a blocked peer")
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid reaction signature")
         payload = data["payload"]
@@ -2624,7 +2668,7 @@ class QuantumNode:
         elif kind == "call_end":
             await self.handle_call_end(peer_pubkey, payload)
         elif kind == "delivery_ack":
-            if not self.verify_signed(peer_pubkey, payload):
+            if self.db.is_blocked(peer_pubkey) or not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid delivery acknowledgement")
             data = payload.get("payload", {})
             if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
@@ -2931,9 +2975,12 @@ class QuantumNode:
                 self.online_peers = set(raw_peers) - {self.public_key}
                 for peer, meta in raw_peers.items():
                     if peer != self.public_key and isinstance(meta, dict):
-                        if meta.get("direct_url"):
-                            self.peer_direct[peer] = meta["direct_url"]
-                        self.db.set_friend_transport(peer, meta.get("relay_alias"), meta.get("direct_url"))
+                        direct_url = validate_direct_url(meta.get("direct_url"))
+                        if direct_url:
+                            self.peer_direct[peer] = direct_url
+                        else:
+                            self.peer_direct.pop(peer, None)
+                        self.db.set_friend_transport(peer, meta.get("relay_alias"), direct_url)
             else:
                 self.online_peers = set(raw_peers) - {self.public_key}
             await self.broadcast_ui(self.state_payload())
@@ -3011,39 +3058,46 @@ class SignalingServer:
                             msg["pubkey"], self.crypto.sign_public_key_bytes
                         )
                         sig = msg.get("signature")
-                        if sig:
-                            challenge = {
-                                "type": "register_challenge",
-                                "nonce": msg.get("challenge"),
-                                "pubkey": candidate,
-                            }
-                            if (msg.get("challenge") != nonce
-                                    or not self.crypto.verify(
-                                        bytes.fromhex(candidate),
-                                        canonical_json(challenge), b64d(sig)
-                                    )):
-                                await ws.send(json.dumps({
-                                    "type": "error", "text": "Invalid registration signature"
-                                }))
-                                continue
-                        elif self.clients.get(candidate):
+                        # Registration is always challenge-signed. An unsigned
+                        # registration cannot prove it holds the identity's
+                        # secret key, so accepting one would let anyone claim
+                        # another identity on the relay: appear online as that
+                        # identity, occupy its routing entry, and drain its
+                        # persisted offline queue.
+                        challenge = {
+                            "type": "register_challenge",
+                            "nonce": msg.get("challenge"),
+                            "pubkey": candidate,
+                        }
+                        if (not sig or msg.get("challenge") != nonce
+                                or not self.crypto.verify(
+                                    bytes.fromhex(candidate),
+                                    canonical_json(challenge), b64d(sig)
+                                )):
                             await ws.send(json.dumps({
-                                "type": "error",
-                                "text": "Duplicate unsigned registration rejected"
+                                "type": "error", "text": "Invalid registration signature"
                             }))
                             continue
-                        pubkey = candidate
                         relay_alias = str(msg.get("relay_alias") or hashlib.sha256(candidate.encode()).hexdigest())
-                        if not HEX_RE.match(relay_alias) or len(relay_alias) > 128:
+                        if not HEX_RE.fullmatch(relay_alias) or len(relay_alias) > 128:
                             raise ValueError("Invalid relay alias")
-                        direct_url = msg.get("direct_url") if isinstance(msg.get("direct_url"), str) else None
-                        # Signed registrations are added alongside any existing
+                        # Aliases are routing targets, so one identity must not
+                        # be able to claim an alias another identity already
+                        # holds — that would redirect envelopes addressed to the
+                        # victim's alias to the claimant instead.
+                        owner = self.aliases.get(relay_alias)
+                        if owner and owner != candidate:
+                            await ws.send(json.dumps({
+                                "type": "error", "text": "Relay alias already in use"
+                            }))
+                            continue
+                        direct_url = validate_direct_url(msg.get("direct_url"))
+                        pubkey = candidate
+                        # Registrations are added alongside any existing
                         # connection for this identity rather than replacing it,
                         # so a second device holding the same identity backup
                         # can stay online at the same time as the first (see
-                        # 'Multi-device support'). Unsigned registrations can't
-                        # prove they hold the identity, so those are still
-                        # rejected outright when the identity is already live.
+                        # 'Multi-device support').
                         self.clients.setdefault(pubkey, set()).add(ws)
                         self.aliases[relay_alias] = pubkey
                         self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
@@ -3150,6 +3204,10 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if not self._host_allowed():
+            self.send_error(421, "Misdirected Request")
+            return
+
         if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return
@@ -3182,6 +3240,23 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
 
         self.send_error(404)
 
+    def _host_allowed(self) -> bool:
+        """Reject requests whose Host header is not a loopback name on a
+        local-only node. Without this, a hostile page can point a hostname it
+        controls at 127.0.0.1 (DNS rebinding), load the UI as its own origin,
+        and read the embedded UI token out of the page — which grants full
+        control of the local node. Requests without a Host header are allowed
+        so non-browser probes (monitoring, HTTP/1.0 clients) still work; those
+        cannot be driven by a rebinding attack."""
+        if self.require_http_auth:
+            return True  # remote UI is explicitly enabled and token-gated
+        host = (self.headers.get("Host", "") if self.headers else "") or ""
+        host = host.strip()
+        if not host:
+            return True
+        hostname = urlparse(f"//{host}").hostname or ""
+        return hostname.lower() in {"127.0.0.1", "localhost", "::1", "[::1]"}
+
     def _http_authenticated(self, parsed: Any) -> bool:
         token = parse_qs(parsed.query).get("token", [""])[0]
         auth = self.headers.get("Authorization", "")
@@ -3208,6 +3283,9 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         discard the status line and headers too, not just the body."""
         parsed = urlparse(self.path)
         path = parsed.path
+        if not self._host_allowed():
+            self.send_error(421, "Misdirected Request")
+            return
         if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return

@@ -978,3 +978,143 @@ def test_add_group_member_command(tmp_path):
         assert friend_pk in members
     finally:
         node.db.close()
+
+
+class _FakeRelaySocket:
+    """Minimal stand-in for a websockets server connection.
+
+    ``frames`` holds callables so a frame can be built from what the server
+    has already sent (the registration challenge nonce, for example).
+    """
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    def __aiter__(self):
+        async def gen():
+            for frame in self.frames:
+                yield json.dumps(frame(self))
+        return gen()
+
+    def replies(self):
+        return [m for m in self.sent if m.get("type") == "error"]
+
+
+def _signed_register(crypto, public_key, secret_key, ws, **extra):
+    nonce = ws.sent[0]["nonce"]
+    challenge = {"type": "register_challenge", "nonce": nonce, "pubkey": public_key}
+    from chat import b64e, canonical_json
+    return {
+        "type": "register", "pubkey": public_key, "challenge": nonce,
+        "signature": b64e(crypto.sign(secret_key, canonical_json(challenge))),
+        **extra,
+    }
+
+
+def test_relay_requires_a_signed_registration_challenge(tmp_path, monkeypatch):
+    pytest.importorskip("pqcrypto")
+    monkeypatch.setenv("QUANTUM_CHAT_RELAY_DB", str(tmp_path / "relay.db"))
+    import chat as chat_module
+
+    server = chat_module.SignalingServer()
+    crypto = server.crypto
+    pk, sk = crypto.new_identity()
+    public_key = pk.hex()
+
+    unsigned = _FakeRelaySocket([lambda _ws: {"type": "register", "pubkey": public_key}])
+    asyncio.run(server.handle(unsigned))
+    assert unsigned.replies()[0]["text"] == "Invalid registration signature"
+    assert public_key not in server.clients
+
+    signed = _FakeRelaySocket([lambda ws: _signed_register(crypto, public_key, sk, ws)])
+    asyncio.run(server.handle(signed))
+    assert not signed.replies()
+
+
+def test_relay_rejects_an_alias_owned_by_another_identity(tmp_path, monkeypatch):
+    pytest.importorskip("pqcrypto")
+    monkeypatch.setenv("QUANTUM_CHAT_RELAY_DB", str(tmp_path / "relay2.db"))
+    import chat as chat_module
+
+    server = chat_module.SignalingServer()
+    crypto = server.crypto
+    pk, sk = crypto.new_identity()
+    attacker = pk.hex()
+    server.aliases["abcd"] = "victimpubkey"
+
+    ws = _FakeRelaySocket([lambda w: _signed_register(crypto, attacker, sk, w, relay_alias="abcd")])
+    asyncio.run(server.handle(ws))
+    assert ws.replies()[0]["text"] == "Relay alias already in use"
+    assert server.aliases["abcd"] == "victimpubkey"
+    assert attacker not in server.clients
+
+    # A non-hex alias must be rejected outright rather than partially matched.
+    ws2 = _FakeRelaySocket([lambda w: _signed_register(crypto, attacker, sk, w, relay_alias="ab!!")])
+    asyncio.run(server.handle(ws2))
+    assert ws2.replies()[0]["text"] == "Invalid relay alias"
+
+
+def test_validate_direct_url_only_accepts_plain_websocket_endpoints():
+    from chat import validate_direct_url
+
+    assert validate_direct_url("ws://10.0.0.5:8768") == "ws://10.0.0.5:8768"
+    assert validate_direct_url("wss://peer.example.com/") == "wss://peer.example.com/"
+    for hostile in [
+        "http://peer.example.com",
+        "file:///etc/passwd",
+        "ws://user:pass@peer.example.com",
+        "ws://peer.example.com/admin/delete",
+        "ws://peer.example.com?token=x",
+        "ws://",
+        "",
+        None,
+        "ws://peer.example.com:99999",
+    ]:
+        assert validate_direct_url(hostile) is None
+
+
+def test_http_rejects_a_rebound_host_header_on_a_local_only_node():
+    handler = object.__new__(ChatHTTPHandler)
+    handler.path = "/"
+    handler.require_http_auth = False
+    handler.headers = {"Host": "attacker.example.com:8000"}
+    called = []
+    handler.send_error = lambda code, msg="": called.append((code, msg))
+    handler._send = lambda *_a, **_k: called.append(("sent", "ok"))
+    ChatHTTPHandler.do_GET(handler)
+    assert called and called[0][0] == 421
+
+    handler.headers = {"Host": "127.0.0.1:8000"}
+    assert ChatHTTPHandler._host_allowed(handler) is True
+    handler.headers = {"Host": "localhost:8000"}
+    assert ChatHTTPHandler._host_allowed(handler) is True
+
+
+def test_relay_payloads_from_blocked_peers_are_rejected(tmp_path):
+    pytest.importorskip("cryptography")
+    pytest.importorskip("pqcrypto")
+    import chat as chat_module
+
+    node = chat_module.QuantumNode(str(tmp_path / "blocked.db"), "ws://127.0.0.1:65535",
+                                   direct_url=None, enable_direct=False)
+    try:
+        pk, sk = node.crypto.new_identity()
+        peer = pk.hex()
+        node.db.add_friend(peer, "Peer")
+        node.db.block_friend(peer, True)
+        envelope = {
+            "kind": "reaction",
+            "payload": {"from": peer, "to": node.public_key, "msg_id": "m1",
+                        "emoji": "👍", "action": "add"},
+        }
+        envelope["signature"] = chat_module.b64e(node.crypto.sign(
+            sk, chat_module.canonical_json({"kind": "reaction", "payload": envelope["payload"]})))
+        with pytest.raises(ValueError):
+            asyncio.run(node.handle_relay_payload(peer, envelope))
+        assert node.db.get_reactions(["m1"]) == {}
+    finally:
+        node.db.close()
