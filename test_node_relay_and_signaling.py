@@ -403,7 +403,7 @@ def test_relay_drains_the_offline_queue_on_registration(relay, tmp_path):
         envelope = json.dumps({"type": "relay", "from": "peer", "payload": {"kind": "chat"}, "offline": True})
         relay.relay_db.execute(
             "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
-            (node.public_key, envelope, 0),
+            (node.public_key, envelope, chat_module.utc_ts()),
         )
         relay.relay_db.commit()
         socket = run_relay_socket(relay, lambda nonce: [register_frame(node, nonce)])
@@ -413,6 +413,52 @@ def test_relay_drains_the_offline_queue_on_registration(relay, tmp_path):
         ).fetchone()[0] == 0
     finally:
         node.db.close()
+
+
+def test_relay_purges_expired_offline_queue_rows_on_registration(relay, tmp_path):
+    node = make_node(tmp_path, "expired-queue")
+    try:
+        envelope = json.dumps({"type": "relay", "from": "peer", "payload": {"kind": "chat"}, "offline": True})
+        relay.relay_db.execute(
+            "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
+            (node.public_key, envelope, chat_module.utc_ts() - chat_module.OFFLINE_QUEUE_TTL - 10),
+        )
+        relay.relay_db.commit()
+        socket = run_relay_socket(relay, lambda nonce: [register_frame(node, nonce)])
+        # An envelope older than the TTL is purged, not delivered: replaying
+        # week-old chat into a freshly connecting client helps nobody.
+        assert not any(f.get("type") == "relay" and f.get("offline") for f in socket.frames())
+        assert relay.relay_db.execute(
+            "SELECT COUNT(*) FROM offline_queue WHERE target=?", (node.public_key,)
+        ).fetchone()[0] == 0
+    finally:
+        node.db.close()
+
+
+def test_relay_rejects_re_registration_on_the_same_socket(relay, tmp_path):
+    node = make_node(tmp_path, "re-registrant")
+    other = make_node(tmp_path, "other-identity")
+    try:
+        def frames(nonce):
+            return [
+                register_frame(node, nonce),
+                register_frame(node, nonce),  # duplicate, same identity
+                register_frame(other, nonce),  # hostile: different identity
+            ]
+        socket = run_relay_socket(relay, frames)
+        errors = socket.frames_of_type("error")
+        assert any("Already registered" in e.get("text", "") for e in errors)
+        assert any("another identity" in e.get("text", "") for e in errors)
+        # The peers broadcast (emitted by the *successful* first registration)
+        # must never advertise the second identity: a leaked re-registration
+        # would have added it as a phantom online peer.
+        peers_frames = socket.frames_of_type("peers")
+        assert peers_frames, "expected a peers broadcast after registration"
+        assert other.public_key not in peers_frames[-1]["peers"]
+        assert node.public_key in peers_frames[-1]["peers"]
+    finally:
+        node.db.close()
+        other.db.close()
 
 
 def test_relay_resolves_targets_by_alias_and_fans_out_to_other_devices(relay, tmp_path):
@@ -1115,7 +1161,10 @@ def test_direct_peer_rejects_a_forged_signature_and_a_rate_flood(pair):
     socket = FakeSocket([json.dumps({"type": "direct", **hello, "signature": b64e(b"\x00" * 64)})])
     socket.remote_address = ("203.0.113.9", 1234)
     asyncio.run(bob.handle_direct_peer(socket))
-    assert any("signature" in f.get("text", "") for f in socket.frames())
+    # Rejections answer with a generic error frame so an unauthenticated
+    # prober cannot distinguish "bad signature" from "not a friend".
+    assert any(f.get("type") == "error" and f.get("text") == "Frame rejected"
+               for f in socket.frames())
     assert bob.db.metrics()["direct_rejected"] == 1
 
     # Rate limiting is enforced per *frame* now that direct connections are

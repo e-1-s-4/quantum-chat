@@ -1,6 +1,36 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v3.4.1 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v3.5.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v3.5.0:
+- Security: inbound group invites no longer make the recipient the group owner
+  (which allowed invite recipients to rotate keys and split group key state),
+  and replayed older-epoch invites can no longer roll the group key backwards
+- Security: direct-peer and relay error frames are deliberately generic, so an
+  unauthenticated prober cannot map the address book or read internal errors;
+  non-ASCII UI/HTTP tokens crash constant-time comparison no more
+- Reliability: simultaneous session handshakes (glare) now converge on one
+  session key via a deterministic tie-break instead of wedging both peers
+- Reliability: outbox queueing also covers mid-send relay failures; a failed
+  initial UI push discards its socket; a cleanly-closed relay connection backs
+  off before redialing; rejected chat/chunk frames no longer burn their replay
+  counter; abandoned chunk transfers are reaped (startup + per-manifest)
+- Reliability: relay re-registration on one socket is rejected (no phantom
+  identities), offline-queue caps count persisted rows with a TTL purge,
+  fan-out falls through to the offline queue when all device sends fail, and
+  queued envelopes are claimed before delivery so multi-device registration
+  cannot double-deliver
+- Correctness: 1:1 message search stays inside the conversation, read receipts
+  keep the reader's timestamp across reloads, the replay window is bounded on
+  both sides, oversized inbound messages are re-validated, Range headers follow
+  RFC 9110 (malformed → ignored, unsatisfiable → 416), HEAD advertises real
+  Content-Lengths, HTTP workers are joined before database close, and a failed
+  port bind no longer leaks an open database
+- Browser UI: typing indicators survive selection switches, "mark read"
+  persists locally, history scroll position survives re-renders, voice
+  recordings own their state, Escape dismisses the incoming-call modal,
+  conversations are keyboard-operable, CJK IME composition no longer sends
+  early, and stale search results can't paint over fresh ones
 
 New in v3.4.1:
 - Fixed: the incoming-call ringtone kept playing for its full timeout after a
@@ -94,7 +124,7 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.4.1"
+VERSION = "3.5.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -143,6 +173,18 @@ REPLAY_WINDOW = 2048              # accepted out-of-order span for message count
 SESSION_BOUND_KINDS = {"chat", "file", "file_manifest", "file_chunk", "group_invite"}
 FILE_CHUNK_CONCURRENCY = 8        # chunks sent in flight at once per file transfer;
                                    # well under REPLAY_WINDOW so out-of-order arrival is safe
+# Direct-peer inbound frame limits per source host (per 60s window). The tight
+# default applies until a frame proves friendship; authenticated connections
+# are upgraded so bulk file-chunk transfers don't throttle into dial-per-chunk.
+DIRECT_RATE_LIMIT = 30
+DIRECT_AUTHED_RATE_LIMIT = 600
+# Chunk shards from a transfer that stopped mid-flight are reaped after this
+# much silence (no new shard for the file_id) — see cleanup_stale_chunk_transfers.
+STALE_CHUNK_TTL = 6 * 3600
+# Relay offline-queue envelopes expire after this long; created_at was stored
+# but never enforced, so rows for targets that never reconnect lived forever.
+OFFLINE_QUEUE_TTL = 7 * 24 * 3600
+MAX_OFFLINE_QUEUE_PER_TARGET = 500
 DEFAULT_MAX_STORAGE_MB = 4096      # default disk quota for received/sent file bytes
 MESSAGE_PAGE_SIZE = 200            # messages sent on initial state sync / per page
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1    # passphrase KDF work factor
@@ -227,37 +269,50 @@ def files_dir_for_db(db_path: str) -> Path:
     return Path(FILES_DIR) if db_path == DB_FILE else Path(f"{Path(db_path)}.files")
 
 
+class UnsatisfiableRange(ValueError):
+    """A syntactically valid Range header that cannot be served (RFC 9110 §14.2).
+
+    Kept distinct from plain parse failures so the HTTP layer can tell a
+    416 (unsatisfiable) apart from an ignorable malformed header."""
+
+
 def parse_http_range(value: str, size: int) -> tuple[int, int] | None:
     """Parse one RFC 7233 byte range and return inclusive offsets.
 
     Multiple ranges are intentionally unsupported because media elements only
     need a single range and multipart responses would add substantial surface
     area to the local file server.
+
+    Returns None when the header is absent or syntactically invalid — per
+    RFC 9110 §14.2 an invalid Range header MUST be ignored (serve 200 with
+    the full body). Raises UnsatisfiableRange only for a well-formed range
+    that does not overlap the representation (the 416 case).
     """
     value = (value or "").strip()
     if not value:
         return None
     if size < 0 or not value.startswith("bytes=") or "," in value:
-        raise ValueError("Invalid byte range")
+        return None
     spec = value[6:].strip()
     if "-" not in spec:
-        raise ValueError("Invalid byte range")
+        return None
     start_text, end_text = spec.split("-", 1)
     try:
         if not start_text:
             suffix = int(end_text)
-            if suffix <= 0 or size == 0:
-                raise ValueError("Unsatisfiable byte range")
             start = max(0, size - suffix)
             end = size - 1
         else:
             start = int(start_text)
             end = int(end_text) if end_text else size - 1
-            if start < 0 or start >= size or end < start:
-                raise ValueError("Unsatisfiable byte range")
-            end = min(end, size - 1)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Invalid byte range") from exc
+    except (TypeError, ValueError):
+        # Non-integer offsets are a syntax error: ignore the header.
+        return None
+    if not start_text and (suffix <= 0 or size == 0):
+        raise UnsatisfiableRange("Unsatisfiable byte range")
+    if start < 0 or start >= size or end < start:
+        raise UnsatisfiableRange("Unsatisfiable byte range")
+    end = min(end, size - 1)
     return start, end
 
 
@@ -294,7 +349,7 @@ def unpad_plaintext(data: bytes) -> bytes:
     if len(data) < 4:
         raise ValueError("Padded plaintext too short")
     n = int.from_bytes(data[:4], "big")
-    if n < 0 or n > len(data) - 4:
+    if n > len(data) - 4:
         raise ValueError("Invalid padding length")
     return data[4:4 + n]
 
@@ -347,20 +402,20 @@ class PQModule:
         except ImportError:
             try:
                 from pqcrypto.sign import dilithium3 as sign_mod  # type: ignore
-            except ModuleNotFoundError:
+            except ImportError:
                 try:
                     from pqcrypto.dilithium import Dilithium3 as sign_mod  # type: ignore
-                except ModuleNotFoundError as exc:
+                except ImportError as exc:
                     raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         try:
             from pqcrypto.kem import ml_kem_512 as kem_mod  # type: ignore
         except ImportError:
             try:
                 from pqcrypto.kem import kyber512 as kem_mod  # type: ignore
-            except ModuleNotFoundError:
+            except ImportError:
                 try:
                     from pqcrypto.kyber import Kyber512 as kem_mod  # type: ignore
-                except ModuleNotFoundError as exc:
+                except ImportError as exc:
                     raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         self.sign_mod = sign_mod
         self.kem_mod = kem_mod
@@ -623,14 +678,26 @@ class LocalKeyStore:
                 raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required for this wrapped key file")
             try:
                 if text.startswith("QCWRAP2:"):
+                    from cryptography.exceptions import InvalidTag  # type: ignore
                     _, salt_b64, blob_b64 = text.split(":", 2)
-                    key = self._unwrap_key(b64d(blob_b64), b64d(salt_b64))
+                    try:
+                        key = self._unwrap_key(b64d(blob_b64), b64d(salt_b64))
+                    except InvalidTag as exc:
+                        # AES-GCM authentication failure on a well-formed
+                        # wrapper means the passphrase is wrong, not that the
+                        # file is corrupt — say so instead of the misleading
+                        # generic "invalid key file" message.
+                        raise RuntimeError(
+                            f"Wrong QUANTUM_CHAT_PASSPHRASE for {self.path}"
+                        ) from exc
                 else:
                     key = b64d(text)
                     if self.mode == "passphrase" and self.passphrase:
                         # One-way compatibility migration: protect the raw key file
                         # without rewriting any existing database ciphertext.
                         self._write_wrapped(key)
+            except RuntimeError:
+                raise
             except Exception as exc:
                 raise RuntimeError(f"Invalid local key file: {self.path}") from exc
             if len(key) != 32:
@@ -1102,7 +1169,12 @@ class Database:
         """Record a received counter with a replay window.
 
         Older out-of-order messages are accepted if they have not been seen and
-        are within REPLAY_WINDOW of the highest observed counter.
+        are within REPLAY_WINDOW of the highest observed counter. The window
+        is bounded on both sides: a counter leaping more than REPLAY_WINDOW
+        ahead of the highest seen value is rejected, so an authenticated peer
+        (or a hostile relay replaying one frame) cannot poison the session by
+        pushing recv_counter far into the future and silently dropping every
+        subsequent legitimate message.
         """
         with self.lock:
             row = self.conn.execute(
@@ -1113,6 +1185,8 @@ class Database:
             highest = int(row["recv_counter"])
             if counter <= max(0, highest - REPLAY_WINDOW):
                 raise ValueError("Message counter is outside the replay window")
+            if counter > highest + REPLAY_WINDOW:
+                raise ValueError("Message counter is implausibly far ahead; refusing to advance replay window")
             try:
                 self.conn.execute(
                     "INSERT INTO recv_counters (peer_pubkey, session_id, counter, seen_at) VALUES (?, ?, ?, ?)",
@@ -1319,18 +1393,34 @@ class Database:
         return [self._hydrate_message_row(r) for r in reversed(rows)]
 
     def messages_before(self, before_id: int, limit: int = MESSAGE_PAGE_SIZE) -> list[dict[str, Any]]:
-        """Fetch an older page of messages for 'load more history' in the UI."""
+        """Fetch an older page of messages for 'load more history' in the UI.
+
+        The cursor is the reference row's (timestamp, id) pair — matching the
+        ORDER BY exactly — so no row can be skipped or served twice across
+        pages even when timestamps tie or the clock steps backwards."""
         with self.lock:
+            cur = self.conn.execute(
+                "SELECT timestamp FROM messages WHERE id=?", (before_id,)
+            ).fetchone()
+            if cur is None:
+                return []
             rows = self.conn.execute(
-                "SELECT * FROM messages WHERE id < ? ORDER BY timestamp DESC, id DESC LIMIT ?",
-                (before_id, limit)
+                "SELECT * FROM messages WHERE (timestamp < ?) OR (timestamp = ? AND id < ?) "
+                "ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (cur["timestamp"], cur["timestamp"], before_id, limit)
             ).fetchall()
         return [self._hydrate_message_row(r) for r in reversed(rows)]
 
     def has_messages_before(self, before_id: int) -> bool:
         with self.lock:
+            cur = self.conn.execute(
+                "SELECT timestamp FROM messages WHERE id=?", (before_id,)
+            ).fetchone()
+            if cur is None:
+                return False
             return self.conn.execute(
-                "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (before_id,)
+                "SELECT 1 FROM messages WHERE (timestamp < ?) OR (timestamp = ? AND id < ?) LIMIT 1",
+                (cur["timestamp"], cur["timestamp"], before_id)
             ).fetchone() is not None
 
     def search_messages(self, query: str, target: str | None = None,
@@ -1356,8 +1446,12 @@ class Database:
                     (target, scan_limit)
                 ).fetchall()
             elif target:
+                # 1:1 scope only: without the group_id filter, any group
+                # message authored by this peer would leak into the friend's
+                # conversation search results.
                 rows = self.conn.execute(
-                    "SELECT * FROM messages WHERE sender_pubkey=? OR recipient_pubkey=? "
+                    "SELECT * FROM messages WHERE group_id IS NULL "
+                    "AND (sender_pubkey=? OR recipient_pubkey=?) "
                     "ORDER BY timestamp DESC, id DESC LIMIT ?",
                     (target, target, scan_limit)
                 ).fetchall()
@@ -1425,12 +1519,20 @@ class Database:
 
     # ── Read Receipts ─────────────────────────────────────────────────────────
 
-    def save_read_receipt(self, msg_id: str, reader_pubkey: str) -> bool:
+    def save_read_receipt(self, msg_id: str, reader_pubkey: str,
+                          read_at: int | None = None) -> bool:
+        """Record that `reader_pubkey` read `msg_id`.
+
+        `read_at` should be the timestamp carried by the peer's signed
+        receipt — when *they* read the message — not our local processing
+        time; storing processing time here would silently replace the
+        accurate value stamped by mark_remote_read once history is
+        rehydrated for the UI."""
         with self.lock:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO read_receipts (msg_id, reader_pubkey, read_at) "
                 "VALUES (?, ?, ?)",
-                (msg_id, reader_pubkey, utc_ts())
+                (msg_id, reader_pubkey, int(read_at) if read_at else utc_ts())
             )
             self.conn.commit()
             return cur.rowcount > 0
@@ -1505,10 +1607,11 @@ class Database:
         if not kind and isinstance(payload.get("payload"), dict):
             kind = payload["payload"].get("kind")
         if kind in SESSION_BOUND_KINDS:
-            row = self.conn.execute(
-                "SELECT session_id FROM sessions WHERE peer_pubkey=?", (target_pubkey,)
-            ).fetchone()
-            session_id = row["session_id"] if row else None
+            with self.lock:
+                row = self.conn.execute(
+                    "SELECT session_id FROM sessions WHERE peer_pubkey=?", (target_pubkey,)
+                ).fetchone()
+                session_id = row["session_id"] if row else None
         with self.lock:
             self.conn.execute(
                 "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at, session_id) "
@@ -1562,6 +1665,21 @@ class Database:
             self.conn.execute("DELETE FROM file_chunks WHERE file_id=?", (file_id,))
             self.conn.commit()
             return rows
+
+    def stale_chunk_files(self, max_age: int) -> list[str]:
+        """Return file_ids whose newest chunk shard is older than max_age.
+
+        Chunks are only scratch space for reassembly; when no new shard has
+        arrived for this long the transfer died mid-flight (sender error,
+        app restart, validation failure on a late chunk) and its encrypted
+        shards would otherwise sit on disk forever, silently consuming the
+        storage quota."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT file_id FROM file_chunks GROUP BY file_id HAVING MAX(received_at) <= ?",
+                (utc_ts() - max_age,)
+            ).fetchall()
+        return [r["file_id"] for r in rows]
 
     def metric_inc(self, name: str, amount: int = 1) -> None:
         with self.lock:
@@ -1625,7 +1743,6 @@ class QuantumNode:
         self.online_peers: set[str] = set()
         self.pending_offers: dict[str, PendingOffer] = {}
         self.sessions: dict[str, bytes] = {}
-        self.group_members: dict[str, set[str]] = {}
         self.ui_token = secrets.token_urlsafe(32)
         self.expected_public_key_bytes = self.crypto.sign_public_key_bytes
         self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
@@ -1653,6 +1770,9 @@ class QuantumNode:
         self.active_calls: dict[str, dict[str, Any]] = {}
         self.ice_servers = self._load_ice_servers()
         self._load_state()
+        # A previous run may have died with chunk shards mid-transfer; reap
+        # them now so quota accounting starts clean.
+        self.cleanup_stale_chunk_transfers()
 
     @staticmethod
     def _load_ice_servers() -> list[dict[str, Any]]:
@@ -1681,10 +1801,6 @@ class QuantumNode:
             session = self.db.get_session(friend["pubkey"])
             if session:
                 self.sessions[friend["pubkey"]] = session["key"]
-        for group in self.db.groups_for(self.public_key):
-            self.group_members[group["group_id"]] = set(
-                self.db.group_members(group["group_id"])
-            )
 
     async def broadcast_ui(self, event: dict[str, Any]) -> None:
         payload = json.dumps(event)
@@ -1708,7 +1824,11 @@ class QuantumNode:
         read_receipts = self.db.get_read_receipts(msg_ids)
         for m in msgs:
             m["reactions"] = reactions.get(m["msg_id"], [])
-            m["read_at"] = read_receipts.get(m["msg_id"])
+            # messages.read_at is stamped by mark_remote_read with the
+            # reader's own receipt timestamp; prefer it over the local
+            # receipts table, which may only know when we processed the
+            # receipt (e.g. after a reload of older history).
+            m["read_at"] = m.get("read_at") or read_receipts.get(m["msg_id"])
         return msgs
 
     def _public_file(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1774,7 +1894,19 @@ class QuantumNode:
                 self.db.queue_outbox(peer_pubkey, envelope)
                 return
             raise RuntimeError("Not connected to signaling server")
-        await self.signaling_ws.send(json.dumps(envelope))
+        try:
+            await self.signaling_ws.send(json.dumps(envelope))
+        except Exception as exc:
+            # The socket died mid-send (relay restart/deploy is the common
+            # case). Honor queue_on_failure here too — callers passing it
+            # expect best-effort delivery, not an exception racing their
+            # cleanup; connect_signaling_loop clears signaling_ws when its
+            # receive loop exits so the next send queues or raises cleanly.
+            if queue_on_failure:
+                LOG.debug("Relay send to %s failed after connect; queueing: %s", short_key(peer_pubkey), exc)
+                self.db.queue_outbox(peer_pubkey, envelope)
+                return
+            raise
         self.db.metric_inc("relay_sent")
 
     async def send_direct(self, peer_pubkey: str, payload: dict[str, Any]) -> None:
@@ -1801,7 +1933,8 @@ class QuantumNode:
             if ack.get("type") != "direct_ack":
                 raise RuntimeError("Direct peer did not acknowledge payload")
 
-    def _direct_rate_ok(self, remote: str, limit: int = 30, window: int = 60) -> bool:
+    def _direct_rate_ok(self, remote: str, limit: int = DIRECT_RATE_LIMIT,
+                        window: int = 60) -> bool:
         now = utc_ts()
         events = [t for t in self._direct_rate.get(remote, []) if now - t < window]
         # Only record the attempt when it is admitted: appending rejected
@@ -1837,11 +1970,19 @@ class QuantumNode:
         self._direct_rate_gc()
         remote = getattr(ws, "remote_address", None)
         remote_host = str(remote[0]) if remote else "unknown"
+        # A connection that has proven friendship (valid signature from a
+        # known peer) earns the generous limit; unauthenticated frames stay
+        # on the tight one. Without the upgrade, the tight limit would
+        # throttle the transport's own primary workload: a >15 MB file
+        # transfer at 8 chunks in flight trips 30 frames/min in seconds,
+        # turning the keep-alive pool back into dial-per-chunk.
+        conn_authed = False
         try:
             async for raw in ws:
                 # Per-frame rate limiting keeps a single keep-alive
                 # connection from carrying an unbounded frame stream.
-                if not self._direct_rate_ok(remote_host):
+                limit = DIRECT_AUTHED_RATE_LIMIT if conn_authed else DIRECT_RATE_LIMIT
+                if not self._direct_rate_ok(remote_host, limit=limit):
                     await ws.close(code=1008, reason="Rate limit exceeded")
                     return
                 try:
@@ -1863,6 +2004,7 @@ class QuantumNode:
                         raise ValueError("Direct peer frame is too old or from the future")
                     if not self.db.is_friend(peer):
                         raise ValueError("Direct peer is not a trusted friend")
+                    conn_authed = True
                     await self.handle_relay_payload(peer, msg.get("payload"))
                     await ws.send(json.dumps({"type": "direct_ack"}))
                     self.db.metric_inc("direct_received")
@@ -1871,7 +2013,10 @@ class QuantumNode:
                     LOG.warning("Rejected direct peer frame from %s: %s: %s", remote_host, type(exc).__name__, exc)
                     LOG.debug("Direct peer frame traceback", exc_info=True)
                     try:
-                        await ws.send(json.dumps({"type": "error", "text": str(exc)}))
+                        # Deliberately generic: distinguishable error text
+                        # (bad signature vs not-a-friend vs replay) would let
+                        # an unauthenticated prober map our address book.
+                        await ws.send(json.dumps({"type": "error", "text": "Frame rejected"}))
                     except Exception as send_exc:
                         LOG.debug("Could not report the error to direct peer %s: %s", remote_host, send_exc)
         except Exception as exc:
@@ -2073,10 +2218,34 @@ class QuantumNode:
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Session offer routing metadata mismatch")
-        if utc_ts() - int(payload.get("created_at", 0)) > PENDING_OFFER_TTL:
+        if abs(utc_ts() - int(payload.get("created_at", 0))) > PENDING_OFFER_TTL:
             raise ValueError("Session offer expired")
         if payload.get("protocol") != "quantum-chat-v4":
             raise ValueError("Unsupported session protocol")
+        # Handshake glare: both peers picked the same moment to initiate
+        # (e.g. both sides' sessions expired and both ran a group-key
+        # handshake). Processing both offers unconditionally used to leave
+        # each side holding a different session key — every message failed
+        # AEAD until someone happened to rekey, and nothing auto-healed
+        # because both sessions looked fresh. Tie-break deterministically:
+        # the lexicographically smaller pubkey is the only initiator whose
+        # offer may complete. The winner ignores the loser's offer (its own
+        # pending offer stays armed for the peer's accept); the loser drops
+        # its own offer and answers the winner's, so both sides converge on
+        # exactly one session id and therefore one key.
+        pending_own = self.pending_offers.get(peer_pubkey)
+        if pending_own is not None:
+            if self.public_key < peer_pubkey:
+                LOG.info(
+                    "Session-offer glare with %s: keeping our offer (tie-break winner)",
+                    short_key(peer_pubkey),
+                )
+                return
+            LOG.info(
+                "Session-offer glare with %s: yielding to their offer (tie-break loser)",
+                short_key(peer_pubkey),
+            )
+            self.pending_offers.pop(peer_pubkey, None)
         ciphertext, secret = self.crypto.kem_encapsulate(b64d(payload["kem_pk"]))
         transcript = {
             "offer": payload,
@@ -2250,6 +2419,15 @@ class QuantumNode:
         text = unpad_plaintext(self.crypto.decrypt(
             msg_key, data["packet"], canonical_json(payload)
         )).decode("utf-8")
+        # Re-validate what the sender's own send path enforces: an
+        # authenticated peer must not be able to park arbitrarily large
+        # plaintext in our database just because it decrypts cleanly.
+        if not text or len(text.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Chat message is empty or too large")
+        # Consume the replay counter only after every validation above
+        # succeeded — burning it first made a corrupted/oversized message
+        # unrepairable (the identical retransmission would trip duplicate
+        # detection instead of being processed).
         self.db.mark_recv_counter(peer_pubkey, counter)
         inserted = self.db.save_message(
             payload["msg_id"], peer_pubkey, text, "in",
@@ -2322,12 +2500,17 @@ class QuantumNode:
             # get_event_loop() is deprecated in 3.12+ when no loop is running;
             # we're inside an async coroutine so the running loop is the right one.
             loop = asyncio.get_running_loop()
-            handle = loop.call_later(
-                TYPING_INACTIVITY_TTL,
-                lambda: asyncio.ensure_future(
-                    self.broadcast_ui({"type": "typing", "peer": peer_pubkey, "active": False})
+
+            def clear_typing(peer: str = peer_pubkey) -> None:
+                # Pop the fired handle so the dict only ever holds live
+                # timers; leaving it in meant every peer that typed once
+                # kept a dead TimerHandle (and a dict entry) forever.
+                self._typing_timers.pop(peer, None)
+                asyncio.ensure_future(
+                    self.broadcast_ui({"type": "typing", "peer": peer, "active": False})
                 )
-            )
+
+            handle = loop.call_later(TYPING_INACTIVITY_TTL, clear_typing)
             self._typing_timers[peer_pubkey] = handle
 
     # ── Read Receipts ─────────────────────────────────────────────────────────
@@ -2358,7 +2541,7 @@ class QuantumNode:
         # process the receipt (which can lag by seconds under load or
         # when the receipt was queued offline).
         read_at = int(payload.get("read_at") or utc_ts())
-        if self.db.save_read_receipt(msg_id, peer_pubkey):
+        if self.db.save_read_receipt(msg_id, peer_pubkey, read_at=read_at):
             # update_message_status sets status+delivered but not read_at,
             # so we also need mark_remote_read to stamp the outgoing
             # message's read_at column — without this, the UI's "✓✓ read"
@@ -2746,14 +2929,26 @@ class QuantumNode:
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
-        sent = 0
-        for peer in members - {self.public_key}:
-            if self.db.is_friend(peer):
+        recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
+        if not recipients:
+            raise ValueError("No group members with active friend records available")
+
+        async def deliver(peer: str) -> bool:
+            try:
                 await self.send_file(peer, filename, encoded, group_id=group_id,
                                      content_type=content_type)
-                sent += 1
-        if not sent:
-            raise ValueError("No group members with active friend records available")
+                return True
+            except Exception as exc:
+                # One member without a fresh session (require_fresh_session
+                # deliberately raises to start a rekey) must not prevent the
+                # file from reaching every later member — mirror the
+                # per-recipient isolation send_group_chat uses.
+                LOG.warning("Group file fan-out to %s failed: %s", short_key(peer), exc)
+                return False
+
+        results = await asyncio.gather(*(deliver(peer) for peer in recipients))
+        if not any(results):
+            raise ValueError("Group file could not be delivered to any member")
 
     # ── File transfer ─────────────────────────────────────────────────────────
 
@@ -2848,6 +3043,9 @@ class QuantumNode:
         # (_store_complete_file); calling the validators here and discarding
         # the results validated nothing.
         self._check_storage_quota(size)
+        # Opportunistic janitor: reap chunk shards from transfers that died
+        # mid-flight so they stop consuming quota (also run once at startup).
+        self.cleanup_stale_chunk_transfers()
         self.db.metric_inc("file_manifests_received")
 
     async def handle_file_chunk(self, peer_pubkey: str, data: dict[str, Any]) -> None:
@@ -2859,7 +3057,6 @@ class QuantumNode:
         counter = int(meta.get("counter", 0))
         msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, self.public_key, counter, "file-chunk")
         chunk = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
-        self.db.mark_recv_counter(peer_pubkey, counter)
         if hashlib.sha256(chunk).hexdigest() != meta.get("chunk_sha256"):
             raise ValueError("File chunk checksum mismatch")
         total_chunks = int(meta.get("total_chunks", 1))
@@ -2875,6 +3072,11 @@ class QuantumNode:
                          min(MAX_CHUNK_BYTES, declared_size - chunk_index * MAX_CHUNK_BYTES))
         if len(chunk) != expected_size:
             raise ValueError("File chunk size mismatch")
+        # Consume the replay counter only after every validation above
+        # succeeded — burning it first made a corrupted chunk unrepairable:
+        # the sender's retransmission of that exact chunk would trip
+        # duplicate detection instead of being stored.
+        self.db.mark_recv_counter(peer_pubkey, counter)
         self._check_storage_quota(len(chunk))
         self.files_dir.mkdir(parents=True, exist_ok=True)
         chunk_dir = self.files_dir / f"{file_id}.chunks"
@@ -2928,6 +3130,34 @@ class QuantumNode:
         if freed:
             self._track_storage(-freed)
 
+    def cleanup_stale_chunk_transfers(self, max_age: int = STALE_CHUNK_TTL) -> int:
+        """Reap chunk shards from transfers that never completed.
+
+        _cleanup_file_chunks only ran on successful reassembly, so a transfer
+        abandoned mid-flight (sender error, app restart, rejected late chunk)
+        left its encrypted shards — and their quota usage — behind forever.
+        A file_id whose newest shard is older than max_age is dead by
+        definition: an active transfer delivers chunks back-to-back."""
+        reclaimed = 0
+        try:
+            stale_ids = self.db.stale_chunk_files(max_age)
+        except Exception as exc:
+            LOG.debug("Stale-chunk sweep could not list candidates: %s", exc)
+            return 0
+        for file_id in stale_ids:
+            try:
+                chunks = self.db.file_chunks(file_id)
+            except Exception as exc:
+                LOG.debug("Stale-chunk sweep skipping %s: %s", file_id, exc)
+                continue
+            before = self._storage_bytes_used()
+            self._cleanup_file_chunks(file_id, chunks)
+            reclaimed += max(0, before - self._storage_bytes_used())
+        if reclaimed:
+            LOG.info("Reaped %d abandoned chunk transfer(s), reclaimed %d bytes",
+                     len(stale_ids), reclaimed)
+        return reclaimed
+
     async def _store_complete_file(self, peer_pubkey: str, meta: dict[str, Any], raw: bytes, file_id: str) -> None:
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError("File exceeds configured limit")
@@ -2966,6 +3196,8 @@ class QuantumNode:
         if not group_key:
             raise ValueError("Missing group epoch key")
         text = unpad_plaintext(self.crypto.decrypt(group_key["key"], payload["packet"], canonical_json(meta))).decode("utf-8")
+        if not text or len(text.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Group message is empty or too large")
         inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
                                         delivered=True, status="delivered")
         if inserted:
@@ -3038,7 +3270,13 @@ class QuantumNode:
                     or self.public_key not in data.get("members", [])):
                 raise ValueError("Group invite metadata mismatch")
             group_id = validate_file_id(data["group_id"])
-            self.db.create_group(group_id, data.get("name") or f"Group {group_id[:8]}", self.public_key)
+            # The INVITER owns the group. Recording the recipient as owner
+            # (the old behavior) let whoever received an invite locally
+            # rotate the group key and fan a divergent epoch out to every
+            # other member, splitting the group's key state. INSERT OR
+            # IGNORE keeps this idempotent for re-delivered invites to a
+            # group we already belong to (our own ownership, if any, wins).
+            self.db.create_group(group_id, data.get("name") or f"Group {group_id[:8]}", peer_pubkey)
             members = data.get("members", [])
             # The local create-group path caps membership; the inbound invite
             # path must enforce the same cap or a hostile "friend" can inflate
@@ -3046,15 +3284,38 @@ class QuantumNode:
             if not isinstance(members, list) or len(members) > MAX_GROUP_MEMBERS:
                 raise ValueError("Group invite has too many members")
             for member in members:
-                self.db.add_group_member(group_id, self.validate_peer_key(member))
+                member = self.validate_peer_key(member)
+                self.db.add_group_member(group_id, member,
+                                         role="owner" if member == peer_pubkey else "member")
             if payload.get("packet"):
                 session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
                 group_key = self.crypto.decrypt(
                     self.crypto.derive_message_key(session_key, peer_pubkey, self.public_key, int(data.get("counter", 0)), "group-key"),
                     payload["packet"], canonical_json(data)
                 )
+                epoch = int(data.get("epoch", 1))
+                current = self.db.get_group_key(group_id)
+                redundant = False
+                if current is not None and epoch <= int(current["epoch"]):
+                    # Epoch monotonicity: a replayed older invite (a hostile
+                    # relay can store and replay signed frames) used to roll
+                    # the local epoch backwards, letting removed members read
+                    # new traffic again from their old epoch key. Same-epoch
+                    # redelivery IS the documented idempotent path
+                    # (_deliver_group_keys_to), so accept it only when the
+                    # key material matches what we already hold.
+                    if epoch == int(current["epoch"]) and group_key == current["key"]:
+                        redundant = True
+                        LOG.debug("Ignoring redundant group-key delivery for %s epoch %d",
+                                  group_id[:8], epoch)
+                    else:
+                        raise ValueError("Group invite epoch is older than or conflicts with the known epoch")
+                # Consume the replay counter only after every validation
+                # above succeeded, so a rejected invite can be re-sent
+                # without tripping duplicate detection.
                 self.db.mark_recv_counter(peer_pubkey, int(data.get("counter", 0)))
-                self.db.save_group_key(group_id, int(data.get("epoch", 1)), group_key, peer_pubkey)
+                if not redundant:
+                    self.db.save_group_key(group_id, epoch, group_key, peer_pubkey)
             await self.broadcast_ui(self.state_payload())
         else:
             # An unrecognized kind is logged and ignored rather than raising:
@@ -3071,7 +3332,10 @@ class QuantumNode:
         request = getattr(ws, "request", None)
         path = getattr(request, "path", None) or getattr(ws, "path", "/") or "/"
         token = parse_qs(urlparse(path).query).get("token", [""])[0]
-        if not secrets.compare_digest(token, self.ui_token):
+        # compare_digest requires ASCII-only str operands; a percent-decoded
+        # query token can contain any UTF-8, and the resulting TypeError used
+        # to escape as an unhandled exception instead of a clean rejection.
+        if not secrets.compare_digest(token.encode(), self.ui_token.encode()):
             return False
         origin = None
         headers = getattr(request, "headers", None) or getattr(ws, "request_headers", None)
@@ -3090,8 +3354,16 @@ class QuantumNode:
             await ws.close(code=1008, reason="Unauthorized UI socket")
             return
         self.ui_clients.add(ws)
-        await ws.send(json.dumps(self.state_payload()))
         try:
+            # The handshake push belongs inside the guarded region: if the
+            # client vanishes between the WebSocket handshake and this first
+            # send, the finally below must still discard it — leaving the
+            # dead socket registered made every later broadcast pay for it.
+            try:
+                await ws.send(json.dumps(self.state_payload()))
+            except Exception as exc:
+                LOG.debug("Initial UI state push failed; dropping client: %s", exc)
+                return
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -3242,10 +3514,21 @@ class QuantumNode:
         elif typ == "typing":
             await self.send_typing(msg["pubkey"], bool(msg.get("active", True)))
         elif typ == "read_receipt":
-            await self.send_read_receipt(msg["pubkey"], str(msg["msg_id"]))
+            msg_id = str(msg["msg_id"])
+            await self.send_read_receipt(msg["pubkey"], msg_id)
+            # Persist the read locally too: without this the "mark read"
+            # action cleared the sidebar badge but never stamped the
+            # incoming message's read_at, so the button reappeared after
+            # every reload (mark_message_read was dead code until now).
+            self.db.mark_message_read(msg_id)
             self.db.clear_unread(msg["pubkey"])
+            await self.broadcast_ui({
+                "type": "read_receipt", "msg_id": msg_id,
+                "peer": self.public_key, "read_at": utc_ts(),
+                "local": True,
+            })
             await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
-            await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"]})
+            await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"], "msg_id": msg_id})
         elif typ == "reaction":
             await self.send_reaction(
                 msg["pubkey"], str(msg["msg_id"]),
@@ -3276,9 +3559,17 @@ class QuantumNode:
             results = self._with_message_metadata(
                 self.db.search_messages(query, target=str(target) if target else None)
             )
-            await ws.send(json.dumps({
+            reply: dict[str, Any] = {
                 "type": "search_results", "query": query, "results": results
-            }))
+            }
+            # Echo the client's sequence token so a stale reply (user edited
+            # the query or switched conversations meanwhile) is discarded.
+            if msg.get("seq") is not None:
+                try:
+                    reply["seq"] = int(msg["seq"])
+                except (TypeError, ValueError):
+                    pass
+            await ws.send(json.dumps(reply))
         elif typ == "call_offer":
             await self.send_call_offer(msg["pubkey"], msg["sdp"], str(msg.get("media", "video")))
         elif typ == "call_answer":
@@ -3347,6 +3638,17 @@ class QuantumNode:
                     # to the outbox during the backoff window instead of
                     # raising ConnectionClosed into a dead socket.
                     self.signaling_ws = None
+                    # A relay that accept-then-closes in a loop (overload,
+                    # crash-looping deploy) used to produce a hot reconnect
+                    # spin: the exception path backs off, this one didn't.
+                    # Apply the same backoff (with jitter) after a clean
+                    # close before dialing again.
+                    if not getattr(self, "_shutting_down", False):
+                        import random as _random
+                        wait = delay + _random.uniform(0, 0.3 * delay)
+                        LOG.debug("Signaling closed cleanly; reconnecting in %.1fs", wait)
+                        await asyncio.sleep(wait)
+                        delay = min(delay * 2, MAX_RECONNECT_DELAY)
             except asyncio.CancelledError:
                 # Cooperative cancellation during shutdown — don't reconnect.
                 self.signaling_ws = None
@@ -3418,7 +3720,6 @@ class SignalingServer:
         self.clients: dict[str, set[Any]] = {}
         self.aliases: dict[str, str] = {}
         self.peer_meta: dict[str, dict[str, Any]] = {}
-        self.offline: dict[str, list[dict[str, Any]]] = {}
         self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), check_same_thread=False)
         self.relay_db.execute("CREATE TABLE IF NOT EXISTS offline_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
         self.relay_db.execute("CREATE INDEX IF NOT EXISTS idx_offline_queue_target ON offline_queue(target, id)")
@@ -3446,6 +3747,59 @@ class SignalingServer:
         self.pubkey_rate[pubkey] = events
         return len(events) <= limit
 
+    def _offline_queue_count(self, target: str) -> int:
+        row = self.relay_db.execute(
+            "SELECT COUNT(*) FROM offline_queue WHERE target=?", (target,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _purge_expired_offline_queue(self) -> None:
+        """Delete offline-queue rows older than the TTL.
+
+        created_at was stored but never enforced: rows for a target that
+        never reconnects lived forever. Purging on every drain keeps the
+        query cheap and bounds total disk use."""
+        cutoff = utc_ts() - OFFLINE_QUEUE_TTL
+        cur = self.relay_db.execute("DELETE FROM offline_queue WHERE created_at <= ?", (cutoff,))
+        if cur.rowcount:
+            LOG.info("Purged %d expired offline-queue envelope(s)", cur.rowcount)
+            self.relay_db.commit()
+
+    async def _drain_offline_queue(self, ws: Any, pubkey: str) -> None:
+        """Deliver persisted offline envelopes to a freshly registered socket.
+
+        Rows are claimed (deleted + committed) BEFORE they are sent: the
+        await between select and delete used to let a second device
+        registering concurrently re-select the same not-yet-deleted rows and
+        deliver every queued envelope twice. If a send fails after the claim,
+        the envelope is put back with its original creation time so ordering
+        — and the sender's queue position — is preserved."""
+        self._purge_expired_offline_queue()
+        rows = self.relay_db.execute(
+            "SELECT id, envelope, created_at FROM offline_queue WHERE target=? ORDER BY id LIMIT 500",
+            (pubkey,)
+        ).fetchall()
+        if not rows:
+            return
+        claimed = [qid for qid, _, _ in rows]
+        self.relay_db.executemany(
+            "DELETE FROM offline_queue WHERE id=?", [(qid,) for qid in claimed]
+        )
+        self.relay_db.commit()
+        for qid, envelope, created_at in rows:
+            try:
+                await ws.send(envelope)
+            except Exception as exc:
+                LOG.debug("Re-queueing offline envelope %s after failed delivery: %s", qid, exc)
+                try:
+                    self.relay_db.execute(
+                        "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
+                        (pubkey, envelope, int(created_at))
+                    )
+                    self.relay_db.commit()
+                except Exception as requeue_exc:
+                    LOG.warning("Could not re-queue offline envelope %s: %s", qid, requeue_exc)
+
     async def broadcast_peers(self) -> None:
         payload = json.dumps({"type": "peers", "peers": self.peer_meta})
         for sockets in list(self.clients.values()):
@@ -3470,6 +3824,22 @@ class SignalingServer:
                         candidate = validate_public_key(
                             msg["pubkey"], self.crypto.sign_public_key_bytes
                         )
+                        if pubkey is not None:
+                            # One identity per socket. Re-registering with a
+                            # *different* pubkey on the same connection used to
+                            # leave the socket in the old pubkey's client set
+                            # forever (the finally block only knows the last
+                            # key): a phantom online identity that silently
+                            # ate relay envelopes addressed to it.
+                            if candidate == pubkey:
+                                await ws.send(json.dumps({
+                                    "type": "error", "text": "Already registered on this connection"
+                                }))
+                            else:
+                                await ws.send(json.dumps({
+                                    "type": "error", "text": "Socket already registered to another identity"
+                                }))
+                            continue
                         sig = msg.get("signature")
                         # Registration is always challenge-signed. An unsigned
                         # registration cannot prove it holds the identity's
@@ -3514,13 +3884,7 @@ class SignalingServer:
                         self.clients.setdefault(pubkey, set()).add(ws)
                         self.aliases[relay_alias] = pubkey
                         self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
-                        for queued in self.offline.pop(pubkey, []):
-                            await ws.send(json.dumps(queued))
-                        rows = self.relay_db.execute("SELECT id, envelope FROM offline_queue WHERE target=? ORDER BY id LIMIT 500", (pubkey,)).fetchall()
-                        for qid, envelope in rows:
-                            await ws.send(envelope)
-                            self.relay_db.execute("DELETE FROM offline_queue WHERE id=?", (qid,))
-                        self.relay_db.commit()
+                        await self._drain_offline_queue(ws, pubkey)
                         await self.broadcast_peers()
                     elif msg.get("type") == "relay":
                         if not pubkey:
@@ -3552,38 +3916,51 @@ class SignalingServer:
                         # only want *other* devices to receive it).
                         target_sockets = [t for t in self.clients.get(target, ()) if t is not ws]
                         ephemeral = bool(msg.get("ephemeral"))
+                        delivered = False
                         if target_sockets:
                             envelope = json.dumps({"type": "relay", "from": pubkey, "payload": payload})
                             for target_ws in target_sockets:
                                 try:
                                     await target_ws.send(envelope)
+                                    delivered = True
                                 except Exception:
                                     LOG.debug("Dropped relay fan-out to a stale device socket for %s", short_key(target))
-                        elif ephemeral:
-                            # Ephemeral traffic (typing indicators, ICE
-                            # candidates, device-sync pings) is a best-effort
-                            # convenience signal, not durable state — persisting
-                            # it to the offline queue would let it pile up
-                            # forever for identities that never bring a second
-                            # device online, or spam a relay/direct message the
-                            # instant a peer reconnects long after it's stale.
-                            await ws.send(json.dumps({"type": "queued", "to": target, "ephemeral": True}))
-                        else:
-                            queue = self.offline.setdefault(target, [])
-                            if len(queue) >= 500:
+                        if not delivered:
+                            if ephemeral:
+                                # Ephemeral traffic (typing indicators, ICE
+                                # candidates, device-sync pings) is a best-effort
+                                # convenience signal, not durable state — persisting
+                                # it to the offline queue would let it pile up
+                                # forever for identities that never bring a second
+                                # device online, or spam a relay/direct message the
+                                # instant a peer reconnects long after it's stale.
+                                await ws.send(json.dumps({"type": "queued", "to": target, "ephemeral": True}))
+                            elif self._offline_queue_count(target) >= MAX_OFFLINE_QUEUE_PER_TARGET:
                                 await ws.send(json.dumps({"type": "error", "text": "Peer offline queue is full"}))
                             else:
                                 queued = {"type": "relay", "from": pubkey, "payload": payload, "offline": True}
-                                queue.append(queued)
+                                # The count cap above reads the DATABASE, not a
+                                # process-local dict: an in-memory cap resets on
+                                # every relay restart, so a periodically-restarted
+                                # relay used to accept another 500 rows per
+                                # lifetime for a target that never connects.
                                 self.relay_db.execute(
                                     "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
                                     (target, json.dumps(queued), utc_ts())
                                 )
                                 self.relay_db.commit()
                                 await ws.send(json.dumps({"type": "queued", "to": target}))
-                except Exception as exc:
+                except ValueError as exc:
+                    # Validation failures carry messages meant for the sender.
                     LOG.warning("Rejected signaling frame: %s", exc)
                     await ws.send(json.dumps({"type": "error", "text": str(exc)}))
+                except Exception as exc:
+                    # Anything else is an internal bug: echo a generic error
+                    # instead of str(exc), which has leaked internal details
+                    # (paths, SQL fragments) to arbitrary relay clients.
+                    LOG.warning("Rejected signaling frame with internal error: %s", exc)
+                    LOG.debug("Signaling frame rejection traceback", exc_info=True)
+                    await ws.send(json.dumps({"type": "error", "text": "Invalid frame"}))
         finally:
             self.rate.pop(ws, None)
             if pubkey and pubkey in self.clients:
@@ -3606,6 +3983,43 @@ class SignalingServer:
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # ThreadingMixIn only tracks NON-daemon workers, so its built-in
+        # server_close() join is a no-op here. An in-flight request (say, a
+        # large attachment download started just before Ctrl+C) must be
+        # given a chance to finish before run_node closes the database the
+        # handler reads from — otherwise the worker hits a closed sqlite
+        # connection mid-response. Track every worker explicitly instead.
+        self._worker_threads: list[threading.Thread] = []
+        self._workers_lock = threading.Lock()
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        thread = threading.Thread(
+            target=self.process_request_thread, args=(request, client_address),
+            name=f"qc-http-{getattr(request, 'fileno', lambda: '?')()}"
+        )
+        thread.daemon = self.daemon_threads
+        with self._workers_lock:
+            # Reap finished threads so the tracker can't grow unboundedly
+            # over a long-lived server.
+            self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+            self._worker_threads.append(thread)
+        thread.start()
+
+    def join_workers(self, timeout: float = 5.0) -> list[str]:
+        """Bounded wait for in-flight handler threads.
+
+        Returns the names of workers still running after the timeout (they
+        are daemons, so process exit reaps them; we just stop waiting)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._workers_lock:
+                alive = [t for t in self._worker_threads if t.is_alive()]
+            if not alive or time.monotonic() >= deadline:
+                return [t.name for t in alive]
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 class ChatHTTPHandler(BaseHTTPRequestHandler):
@@ -3635,6 +4049,16 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(421, "Misdirected Request")
             return
 
+        if path == "/version":
+            # Lightweight version probe — useful for monitoring/CI without
+            # pulling the full /health payload (which includes identity).
+            # Deliberately exempt from the remote-UI token gate: it reveals
+            # nothing about the identity, and the README documents it as the
+            # unauthenticated monitoring endpoint.
+            body = json.dumps({"version": VERSION, "app": APP_NAME}).encode()
+            self._send(200, body, "application/json")
+            return
+
         if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return
@@ -3651,13 +4075,6 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             body = json.dumps(self.node.health() if self.node else {"status": "no node"}).encode()
-            self._send(200, body, "application/json")
-            return
-
-        if path == "/version":
-            # Lightweight version probe — useful for monitoring/CI without
-            # pulling the full /health payload (which includes identity).
-            body = json.dumps({"version": VERSION, "app": APP_NAME}).encode()
             self._send(200, body, "application/json")
             return
 
@@ -3686,10 +4103,15 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
 
     def _http_authenticated(self, parsed: Any) -> bool:
         token = parse_qs(parsed.query).get("token", [""])[0]
-        auth = self.headers.get("Authorization", "")
+        auth = self.headers.get("Authorization", "") or ""
         expected = self.node.ui_token if self.node else ""
         bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-        return bool(expected and (secrets.compare_digest(token, expected) or secrets.compare_digest(bearer, expected)))
+        # compare_digest raises TypeError on non-ASCII str operands; a crafted
+        # query/header token can contain any UTF-8 and used to crash the
+        # handler thread with no status line. Comparing bytes is constant-time
+        # for equal-length inputs and never raises.
+        return bool(expected and (secrets.compare_digest(token.encode(), expected.encode())
+                                  or secrets.compare_digest(bearer.encode(), expected.encode())))
 
     def do_OPTIONS(self) -> None:
         """Respond to CORS preflight requests with the security headers we
@@ -3713,17 +4135,38 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         if not self._host_allowed():
             self.send_error(421, "Misdirected Request")
             return
+        if path == "/version":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            # HEAD advertises the length GET would return (RFC 9110 §9.3.2).
+            self.send_header("Content-Length",
+                             str(len(json.dumps({"version": VERSION, "app": APP_NAME}).encode())))
+            self._security_headers()
+            self.end_headers()
+            return
         if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return
         if path == "/":
+            # Mirror do_GET's substitutions so HEAD advertises exactly the
+            # length a GET would return.
+            rendered_len = len((
+                HTML
+                .replace("__UI_WS_PORT__", str(self.ui_ws_port))
+                .replace("__UI_TOKEN__", self.node.ui_token if self.node else "")
+                .replace("__VERSION__", VERSION)
+            ).encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(rendered_len))
             self._security_headers()
             self.end_headers()
-        elif path == "/health" or path == "/version":
+        elif path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            body_len = len(json.dumps(self.node.health() if self.node
+                                      else {"status": "no node"}).encode())
+            self.send_header("Content-Length", str(body_len))
             self._security_headers()
             self.end_headers()
         elif path.startswith("/files/"):
@@ -3774,19 +4217,25 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                 return
         try:
             byte_range = parse_http_range(self.headers.get("Range", ""), len(data) or total_size)
-        except ValueError:
+        except UnsatisfiableRange:
+            # Well-formed but not servable: RFC 9110 §15.5.17 says answer 416.
             self.send_response(416)
             self.send_header("Content-Range", f"bytes */{total_size}")
             self.send_header("Accept-Ranges", "bytes")
             self._security_headers(download=True)
             self.end_headers()
             return
+        # A syntactically invalid Range header (parse_http_range returned
+        # None) is IGNORED per RFC 9110 §14.2 — serve 200 with the whole
+        # body rather than a 416 some downloaders handle badly.
 
         start, end = byte_range if byte_range else (0, max(0, (len(data) or total_size) - 1))
         body = data[start:end + 1] if data else b""
+        # For HEAD, advertise the length GET would return, not zero.
+        advertised_length = (end - start + 1) if not data else len(body)
         self.send_response(206 if byte_range else 200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(advertised_length))
         self.send_header("Accept-Ranges", "bytes")
         if byte_range:
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(data) or total_size}")
@@ -5468,7 +5917,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
         <textarea id="text" rows="1" placeholder="Type an encrypted message…"
           aria-label="Message text" oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
         <div class="composer-actions">
-          <label class="icon-btn" id="attachBtn" title="Attach file" aria-label="Attach file" role="button" tabindex="0">
+          <label class="icon-btn" id="attachBtn" title="Attach file" aria-label="Attach file" role="button" tabindex="0"
+            onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();$('fileInput').click()}">
             📎
             <input id="fileInput" type="file" hidden onchange="sendFile()" aria-label="Choose a file to send">
           </label>
@@ -5620,16 +6070,12 @@ function clearGroupUnread(group_id) {
 }
 let typingTimer = null;
 let myTypingActive = false;
+let myTypingPeer = null;   // which friend our typing indicator is currently announced for
 let myTypingTimeout = null;
 let notificationsGranted = false;
 let unreadTitle = 0;
 let titleTimer = null;
 let mediaRecorder = null;
-let recordedChunks = [];
-let recordStart = 0;
-let recordTimer = null;
-let recordingTarget = null;
-let discardRecording = false;
 let uploadInProgress = false;
 let pendingUploadName = '';
 let loadingMore = false;
@@ -5721,7 +6167,9 @@ const fileMessage = raw => {
     _isFile: true, _file: f,
   };
 };
-const avatarLetter = name => (name||'?').trim()[0].toUpperCase();
+// A whitespace-only nickname trims to '' and [0] is undefined — guard the
+// toUpperCase so one bad row can't throw inside renderSidebar.
+const avatarLetter = name => (((name||'?').trim()[0]) || '?').toUpperCase();
 const avatarColor = key => {
   let h = 0;
   for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
@@ -5779,6 +6227,13 @@ function handle(d) {
     state.groups = state.groups || [];
     state.messages = dedupeMessages(state.messages || []);
     state.files = (state.files||[]).map(normalizeFile);
+    // Drop unread badges for groups that no longer exist so the
+    // localStorage blob can't grow without bound across deletions.
+    const liveGroups = new Set(state.groups.map(g => g.group_id));
+    Object.keys(groupUnread).forEach(gid => {
+      if(!liveGroups.has(gid)) { delete groupUnread[gid]; }
+    });
+    saveGroupUnread();
     reconcileSelection();
     render();
   } else if(d.type === 'friends') {
@@ -5830,10 +6285,16 @@ function handle(d) {
     $('statFiles').textContent = state.files.length;
     renderFiles();
     renderStorageQuota();
-    if(file.direction === 'out' && (!pendingUploadName || pendingUploadName === file.filename)) finishUpload();
+    // Only clear the busy latch for an actual upload in flight: any outgoing
+    // file event (device-sync replays included) used to unlock the composer
+    // while the real upload was still running.
+    if(uploadInProgress && file.direction === 'out' && (!pendingUploadName || pendingUploadName === file.filename)) finishUpload();
     renderMessages();
-    if(selectedTarget) scrollBottom(false);
     const isSelected = selectedTarget && matchTarget(fileMessage(file));
+    // Scroll only when this file belongs to the open conversation AND the
+    // user is already reading near the bottom — a transfer in any other
+    // conversation used to yank the timeline down mid-read.
+    if(isSelected && isNearBottom()) scrollBottom(false);
     if(isSelected && file.direction === 'in' && !file.group_id) send({type:'clear_unread', pubkey:file.sender_pubkey});
     if(!isSelected && file.direction === 'in') {
       const friend = state.friends.find(f => f.pubkey === file.sender_pubkey);
@@ -5883,7 +6344,7 @@ function handle(d) {
     renderSidebar();
     toast('Message deleted from local history', 'success');
   } else if(d.type === 'search_results') {
-    renderSearchResults(d.query, d.results || []);
+    renderSearchResults(d.query, d.results || [], d.seq);
   } else if(d.type === 'call_incoming') {
     handleCallIncoming(d);
   } else if(d.type === 'call_answered') {
@@ -5924,6 +6385,8 @@ function reconcileSelection() {
     ? state.friends.some(f => f.pubkey === selectedTarget.id)
     : state.groups.some(g => g.group_id === selectedTarget.id);
   if(!exists) {
+    stopTyping();
+    closeGroupManage();
     selectedTarget = null;
     setMobileChat(false);
   }
@@ -5957,7 +6420,13 @@ function renderSidebar() {
       const unread = f.unread || 0;
       const div = document.createElement('div');
       div.className = 'friend-item' + (isSelected ? ' active' : '');
-      div.onclick = () => selectFriend(f.pubkey);
+      // Keyboard-operable: a mouse-only onclick used to leave the entire
+      // conversation list unreachable for keyboard and switch users.
+      div.setAttribute('role', 'button');
+      div.tabIndex = 0;
+      const open = () => selectFriend(f.pubkey);
+      div.onclick = open;
+      div.onkeydown = e => { if(e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
       const bgColor = avatarColor(f.pubkey);
       div.innerHTML = `
         <div class="friend-avatar">
@@ -5994,7 +6463,11 @@ function renderSidebar() {
       const unread = groupUnread[g.group_id] || 0;
       const div = document.createElement('div');
       div.className = 'friend-item' + (isSelected ? ' active' : '');
-      div.onclick = () => selectGroup(g.group_id);
+      div.setAttribute('role', 'button');
+      div.tabIndex = 0;
+      const open = () => selectGroup(g.group_id);
+      div.onclick = open;
+      div.onkeydown = e => { if(e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
       div.innerHTML = `
         <div class="friend-avatar">
           <div class="avatar-circle" style="background:#1a3a8f">👥</div>
@@ -6050,6 +6523,19 @@ function renderAttachment(m) {
 
 function renderMessages() {
   const el = $('messages');
+  // innerHTML replacement resets scrollTop to 0; without save/restore any
+  // re-render (incoming message, reaction, delivery tick) yanked a user
+  // reading scrolled-up history back to the top of the conversation.
+  const sameConversation = selectedTarget && el.dataset.target === selectedTarget.id;
+  const prevHeight = el.scrollHeight;
+  const prevTop = el.scrollTop;
+  if(selectedTarget) el.dataset.target = selectedTarget.id;
+  const restoreScroll = () => {
+    if(sameConversation && el.scrollHeight !== prevHeight)
+      el.scrollTop = Math.max(0, prevTop + (el.scrollHeight - prevHeight));
+    else if(sameConversation)
+      el.scrollTop = prevTop;
+  };
   if(!selectedTarget) {
     el.innerHTML = '<div class="empty-state"><div class="emo" aria-hidden="true">&#9883;</div><h3>Quantum Chat</h3><p>Select a conversation to view your encrypted history.</p></div>';
     return;
@@ -6064,6 +6550,7 @@ function renderMessages() {
     : '';
   if(!msgs.length) {
     el.innerHTML = loadMoreHtml + '<div class="empty-state"><div class="emo">🔒</div><h3>No messages yet</h3><p>Send the first encrypted message!</p></div>';
+    restoreScroll();
     return;
   }
 
@@ -6088,6 +6575,13 @@ function renderMessages() {
 
     const statusIcon = isOut ? msgStatus(m) : '';
 
+    // Reactions ride the pairwise session with the message's author, so the
+    // transport target is the author — except your OWN group messages, where
+    // the author is you and no reaction route exists (the old UI rendered a
+    // hover bar whose buttons silently did nothing).
+    const reactionPeer = m.recipient_pubkey || m.sender_pubkey;
+    const canReact = !!reactionPeer && reactionPeer !== state.public_key;
+
     // Reactions HTML
     const reactMap = {};
     (m.reactions||[]).forEach(r => {
@@ -6096,14 +6590,16 @@ function renderMessages() {
       if(r.peer_pubkey === state.public_key) reactMap[r.emoji].mine = true;
     });
     const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
-      `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(m.recipient_pubkey||m.sender_pubkey)}','${emoji}')">${emoji} ${info.count}</span>`
+      canReact
+        ? `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')">${emoji} ${info.count}</span>`
+        : `<span class="reaction-chip ${info.mine?'mine':''}">${emoji} ${info.count}</span>`
     ).join('');
 
     const bodyHtml = m._isFile ? renderAttachment(m) : `<span>${linkify(esc(m.body))}</span>`;
 
     // Reaction bar
-    const reactionBar = m._isFile ? '' : `<div class="reaction-bar">
-      ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(isOut?m.recipient_pubkey:m.sender_pubkey)}','${e}')">${e}</button>`).join('')}
+    const reactionBar = (m._isFile || !canReact) ? '' : `<div class="reaction-bar">
+      ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('')}
     </div>`;
 
     html += `
@@ -6128,6 +6624,7 @@ function renderMessages() {
   });
 
   el.innerHTML = html;
+  restoreScroll();
 }
 
 function msgStatus(m) {
@@ -6295,6 +6792,14 @@ function toggleGroupManage() {
   if($('groupManagePanel').classList.contains('open')) renderGroupManage();
 }
 
+function closeGroupManage() {
+  // Leaving the panel expanded across a selection change used to strand a
+  // blank padded strip above the conversation: renderGroupManage blanks its
+  // body when no group is selected but nothing ever removed .open.
+  const panel = $('groupManagePanel');
+  if(panel.classList.contains('open')) panel.classList.remove('open');
+}
+
 function renderGroupManage() {
   const g = state.groups.find(x=>x.group_id===selectedTarget?.id);
   const el = $('groupManageBody');
@@ -6340,6 +6845,8 @@ function rotateGroupKey(group_id) {
 
 // ─── Selection ────────────────────────────────────────────────────────────────
 function selectFriend(pubkey) {
+  stopTyping();
+  closeGroupManage();
   selectedTarget = {type:'friend', id:pubkey};
   delete typing[pubkey];
   renderTyping();
@@ -6355,6 +6862,8 @@ function selectFriend(pubkey) {
 }
 
 function selectGroup(group_id) {
+  stopTyping();
+  closeGroupManage();
   selectedTarget = {type:'group', id:group_id};
   clearGroupUnread(group_id);
   renderSidebar();
@@ -6385,6 +6894,8 @@ function setMode(m) {
   mode = m;
   $('tabFriends').className = 'mode-tab' + (m==='friends'?' active':'');
   $('tabGroups').className  = 'mode-tab' + (m==='groups' ?' active':'');
+  stopTyping();
+  closeGroupManage();
   selectedTarget = null;
   setMobileChat(false);
   renderSidebar();
@@ -6509,15 +7020,21 @@ function debounceSearch() {
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = setTimeout(runSearch, 300);
 }
+// Monotonic token so a slow reply from an earlier query (or an earlier
+// conversation) can never paint stale results over the current one.
+let searchSeq = 0;
 function runSearch() {
   const query = $('searchInput').value.trim();
   if(!query || !selectedTarget) { $('searchResults').innerHTML = ''; return; }
-  const payload = {type:'search_messages', query};
+  const payload = {type:'search_messages', query, seq: ++searchSeq};
   if(selectedTarget.type === 'group') payload.group_id = selectedTarget.id;
   else payload.pubkey = selectedTarget.id;
   send(payload);
 }
-function renderSearchResults(query, results) {
+function renderSearchResults(query, results, seq) {
+  if(seq !== undefined && seq !== searchSeq) return; // stale reply
+  const currentQuery = $('searchInput').value.trim();
+  if(query !== currentQuery) return;
   const el = $('searchResults');
   if(!results.length) {
     el.innerHTML = `<div class="search-empty">No messages match "${esc(query)}"</div>`;
@@ -6887,46 +7404,49 @@ async function toggleVoiceRecording() {
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
-    recordedChunks = [];
-    recordingTarget = target;
-    discardRecording = false;
     const preferred = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'];
     const mimeType = preferred.find(t => MediaRecorder.isTypeSupported?.(t));
     const recorder = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
+    // Every recording owns its chunks, timer, target, and discard flag in
+    // this closure. The old shared globals meant a new recording started
+    // before the previous one's async stop event fired would have its
+    // chunks wiped, its timer cleared, and its UI reset by the OLD onstop.
+    const session = { recorder, chunks: [], target, discard: false, timer: null };
     mediaRecorder = recorder;
-    recorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
+    recorder.ondataavailable = e => { if(e.data.size > 0) session.chunks.push(e.data); };
     recorder.onerror = () => {
-      discardRecording = true;
+      session.discard = true;
       stream.getTracks().forEach(t => t.stop());
       toast('Voice recording failed', 'error');
     };
-    // Close over THIS recording's recorder/timer. Reading the globals inside
-    // onstop used to mislabel the blob and clear the wrong timer if a new
-    // recording started before the old one's stop event fired.
     recorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
-      clearInterval(recordTimer);
-      $('recIndicator').innerHTML = '';
-      $('micBtn').classList.remove('recording');
-      const chunks = recordedChunks;
-      recordedChunks = [];
-      const blob = new Blob(chunks, {type: recorder.mimeType || 'audio/webm'});
+      clearInterval(session.timer);
+      // Only the CURRENT recording may tear down the shared UI; a stale
+      // stop event from an earlier session leaves the newer one alone.
+      if(mediaRecorder === recorder) {
+        $('recIndicator').innerHTML = '';
+        $('micBtn').classList.remove('recording');
+        mediaRecorder = null;
+      }
+      const blob = new Blob(session.chunks, {type: recorder.mimeType || 'audio/webm'});
       const kind = recorder.mimeType || 'audio/webm';
       const ext = kind.includes('ogg') ? 'ogg' : kind.includes('mp4') ? 'm4a' : 'webm';
-      if(!discardRecording && blob.size > 0) {
-        sendFileBlob(blob, `voice-message-${Date.now()}.${ext}`, recordingTarget);
-      } else if(!discardRecording) {
+      // stopVoiceRecording flags the recorder; onerror flags the session —
+      // honor either path.
+      const discarded = session.discard || recorder.discardRequested;
+      if(!discarded && blob.size > 0) {
+        sendFileBlob(blob, `voice-message-${Date.now()}.${ext}`, session.target);
+      } else if(!discarded) {
         toast('No audio was captured', 'warning');
-      }
-      if(mediaRecorder === recorder) {
-        mediaRecorder = null;
-        recordingTarget = null;
       }
     };
     recorder.start(1000);
-    recordStart = Date.now();
+    const recordStart = Date.now();
     $('micBtn').classList.add('recording');
-    recordTimer = setInterval(() => {
+    session.timer = setInterval(() => {
+      // A cancelled/stale timer must not touch the current session's UI.
+      if(mediaRecorder !== recorder) { clearInterval(session.timer); return; }
       const secs = Math.floor((Date.now()-recordStart)/1000);
       $('recIndicator').innerHTML = `<div class="rec-indicator"><span class="dot"></span>Recording ${String(Math.floor(secs/60)).padStart(1,'0')}:${String(secs%60).padStart(2,'0')}
         <button class="rec-cancel" onclick="stopVoiceRecording(true)">Cancel</button></div>`;
@@ -6943,7 +7463,7 @@ async function toggleVoiceRecording() {
 
 function stopVoiceRecording(discard=false) {
   if(!mediaRecorder || mediaRecorder.state !== 'recording') return;
-  discardRecording = discard;
+  mediaRecorder.discardRequested = discard;
   mediaRecorder.stop();
 }
 // ─── Identity backup / restore ──────────────────────────────────────────────
@@ -7023,19 +7543,32 @@ function toggleReaction(msg_id, peer_pubkey, emoji) {
 // ─── Typing ───────────────────────────────────────────────────────────────────
 function startTyping() {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
+  const peer = selectedTarget.id;
+  if(myTypingActive && myTypingPeer && myTypingPeer !== peer) {
+    // Selection changed mid-typing: explicitly stop the old indicator,
+    // otherwise the new friend never sees "typing…" (myTypingActive was
+    // already true) and the old friend's indicator lingers server-side.
+    send({type:'typing', pubkey:myTypingPeer, active:false});
+    myTypingActive = false;
+  }
   if(!myTypingActive) {
     myTypingActive = true;
-    send({type:'typing', pubkey:selectedTarget.id, active:true});
+    myTypingPeer = peer;
+    send({type:'typing', pubkey:peer, active:true});
   }
   clearTimeout(myTypingTimeout);
   myTypingTimeout = setTimeout(stopTyping, 3000);
 }
 
 function stopTyping() {
-  if(myTypingActive && selectedTarget?.type==='friend') {
-    myTypingActive = false;
-    send({type:'typing', pubkey:selectedTarget.id, active:false});
+  // Resolve the peer from who typing was STARTED for — not from the current
+  // selection, which may already have switched (or become null), leaving
+  // myTypingActive stuck true and suppressing every later typing burst.
+  if(myTypingActive && myTypingPeer) {
+    send({type:'typing', pubkey:myTypingPeer, active:false});
   }
+  myTypingActive = false;
+  myTypingPeer = null;
   clearTimeout(myTypingTimeout);
 }
 
@@ -7050,6 +7583,9 @@ function onTextInput() {
 }
 
 function onTextKey(e) {
+  // Never send mid-composition: during CJK IME confirmation Enter emits a
+  // keydown that used to prematurely submit instead of committing the text.
+  if(e.isComposing || e.keyCode === 229) return;
   if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
 
@@ -7068,8 +7604,14 @@ function updateSendBtn() {
 // ─── Scroll ───────────────────────────────────────────────────────────────────
 function scrollBottom(instant) {
   const el = $('messages');
-  if(instant) el.scrollTop = el.scrollHeight;
-  else setTimeout(() => el.scrollTop = el.scrollHeight, 50);
+  if(instant) {
+    // CSS sets scroll-behavior:smooth, which would animate (and visibly
+    // glide through) every programmatic jump — conversation switches and
+    // history restores must land immediately.
+    el.scrollTo({top: el.scrollHeight, behavior: 'instant'});
+  } else {
+    setTimeout(() => el.scrollTo({top: el.scrollHeight, behavior: 'instant'}), 50);
+  }
 }
 
 function isNearBottom() {
@@ -7142,6 +7684,10 @@ document.addEventListener('click', event => {
 });
 document.addEventListener('keydown', event => {
   if(event.key !== 'Escape') return;
+  // The incoming-call modal is the one dialog Escape MUST dismiss — it's a
+  // full-screen interruption and it used to be the only one the handler
+  // ignored (declineCall below is the same operation as its Decline button).
+  if($('incomingCallModal').classList.contains('open')) { declineCall(); return; }
   if($('backupModal').classList.contains('open')) closeBackupModal();
   else if($('searchModal').classList.contains('open')) closeSearchModal();
   else if($('groupManagePanel').classList.contains('open')) toggleGroupManage();
@@ -7222,6 +7768,11 @@ async def _cleanup_runtime_tasks(tasks: list[Any]) -> None:
 async def run_node(args: argparse.Namespace) -> None:
     if (not _is_local_host(args.http_host) or not _is_local_host(args.ui_ws_host)) and not args.allow_remote_ui:
         raise SystemExit("Refusing to expose the UI on a non-local interface without --allow-remote-ui")
+    if args.enable_direct and not _is_local_host(args.direct_host) and not args.allow_remote_ui:
+        # The direct-peer listener authenticates every frame, but it is still
+        # pre-auth attack surface (crypto, parsing, rate limiting) that the
+        # UI listeners require an explicit acknowledgment to expose.
+        raise SystemExit("Refusing to expose the direct-peer listener on a non-local interface without --allow-remote-ui")
     if args.ice_servers:
         try:
             json.loads(args.ice_servers)  # validate before handing it to the node
@@ -7232,14 +7783,27 @@ async def run_node(args: argparse.Namespace) -> None:
     if args.enable_direct:
         advertised_host = args.direct_advertise_host or args.direct_host
         direct_url = f"ws://{advertised_host}:{args.direct_port}"
+    if args.max_storage_mb < 0:
+        raise SystemExit("--max-storage-mb must be >= 0 (0 disables the quota)")
     node = QuantumNode(args.db, args.signaling_url, direct_url=direct_url, enable_direct=args.enable_direct,
                       max_storage_bytes=args.max_storage_mb * 1024 * 1024)
-    node.allow_remote_ui = args.allow_remote_ui
-    ui_url = f"http://{args.http_host}:{args.http_port}"
-    if args.allow_remote_ui:
-        ui_url = f"{ui_url}?token={quote(node.ui_token)}"
-    httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
-                       require_http_auth=args.allow_remote_ui)
+    httpd = None
+    try:
+        node.allow_remote_ui = args.allow_remote_ui
+        ui_url = f"http://{args.http_host}:{args.http_port}"
+        if args.allow_remote_ui:
+            ui_url = f"{ui_url}?token={quote(node.ui_token)}"
+        httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
+                           require_http_auth=args.allow_remote_ui)
+    except BaseException:
+        # A failed bind (port already in use is the classic case) used to
+        # propagate before the cleanup below ever ran, leaving the node's
+        # database open with un-checkpointed WAL files.
+        try:
+            node.db.close()
+        except Exception as exc:
+            LOG.debug("Could not close database after startup failure: %s", exc)
+        raise
     LOG.info("%s v%s — identity: %s", APP_NAME, VERSION, node.public_key)
     print(f"{APP_NAME} v{VERSION}")
     print(f"Identity:  {node.public_key}")
@@ -7329,6 +7893,13 @@ async def run_node(args: argparse.Namespace) -> None:
             httpd.server_close()
         except Exception as exc:
             LOG.warning("HTTP server socket did not close cleanly: %s", exc)
+        # Give in-flight handler threads a bounded chance to finish BEFORE
+        # the database closes underneath them; stragglers (stuck sockets)
+        # are daemons and get reaped at process exit.
+        try:
+            await asyncio.to_thread(httpd.join_workers, 5.0)
+        except Exception as exc:
+            LOG.warning("Timed out waiting for HTTP handlers to finish: %s", exc)
         try:
             await node.close_direct_pool()
         except Exception as exc:

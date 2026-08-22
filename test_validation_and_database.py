@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import chat as chat_module
 from chat import (
     ChatHTTPHandler,
     Database,
@@ -34,10 +35,19 @@ def test_attachment_helpers_preserve_mime_ranges_and_node_isolation(tmp_path):
     assert parse_http_range("bytes=2-5", 10) == (2, 5)
     assert parse_http_range("bytes=7-", 10) == (7, 9)
     assert parse_http_range("bytes=-3", 10) == (7, 9)
-    with pytest.raises(ValueError):
+    # Well-formed but unsatisfiable ranges raise the dedicated 416 error.
+    with pytest.raises(chat_module.UnsatisfiableRange):
         parse_http_range("bytes=20-30", 10)
-    with pytest.raises(ValueError):
-        parse_http_range("bytes=0-1,4-5", 10)
+    # Syntactically invalid Range headers are ignored (RFC 9110 §14.2):
+    # the parser returns None so the server serves 200 with the full body.
+    assert parse_http_range("bytes=0-1,4-5", 10) is None
+    assert parse_http_range("bytes=abc", 10) is None
+    assert parse_http_range("units=0-5", 10) is None
+    assert parse_http_range("bytes=5", 10) is None
+    with pytest.raises(chat_module.UnsatisfiableRange):
+        parse_http_range("bytes=1-", 0)
+    with pytest.raises(chat_module.UnsatisfiableRange):
+        parse_http_range("bytes=-3", 0)
 
     alice_dir = files_dir_for_db(str(tmp_path / "alice.db"))
     bob_dir = files_dir_for_db(str(tmp_path / "bob.db"))

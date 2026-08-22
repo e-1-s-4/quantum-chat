@@ -435,7 +435,12 @@ def test_direct_frame_freshness_bound(pair):
     socket = FakeSocket([json.dumps({"type": "direct", **old_hello, "signature": sig})])
     socket.remote_address = ("203.0.113.10", 1234)
     asyncio.run(bob.handle_direct_peer(socket))
-    assert any("too old" in f.get("text", "") for f in socket.frames())
+    # The rejection is reported, but deliberately generic: distinguishable
+    # error text (bad signature vs stale frame vs not-a-friend) would let an
+    # unauthenticated prober map the node's address book. Details live in the log.
+    frames = socket.frames()
+    assert len(frames) == 1 and frames[0].get("type") == "error"
+    assert frames[0].get("text") == "Frame rejected"
 
 
 class FakeSocket:
