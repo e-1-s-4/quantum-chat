@@ -1,0 +1,10 @@
+{
+  "name": "quantum-chat",
+  "version": "3.5.0",
+  "private": true,
+  "description": "Post-quantum encrypted P2P messenger",
+  "scripts": {
+    "build": "python3 -m py_compile chat.py",
+    "dev": "python3 chat.py --http-port 3000 --ui-ws-port 3001 --signaling-port 3002 --direct-port 3003 --http-host 0.0.0.0 --ui-ws-host 0.0.0.0 --direct-host 0.0.0.0 --allow-remote-ui --with-signaling --no-browser"
+  }
+}

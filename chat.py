@@ -111,6 +111,8 @@ import mimetypes
 import os
 import re
 import secrets
+import select
+import socket
 import sqlite3
 import threading
 import time
@@ -2578,6 +2580,10 @@ class QuantumNode:
             "msg_id": msg_id, "peer": self.public_key,
             "emoji": emoji, "action": action,
         })
+        await self.sync_to_devices("reaction", {
+            "msg_id": msg_id, "peer": self.public_key,
+            "emoji": emoji, "action": action,
+        })
 
     async def handle_reaction(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         if self.db.is_blocked(peer_pubkey):
@@ -2641,7 +2647,7 @@ class QuantumNode:
                 delivered=bool(data.get("delivered", True)), status=str(data.get("status", "delivered")),
             )
             if inserted:
-                if direction == "in":
+                if direction == "in" and not data.get("group_id"):
                     self.db.increment_unread(str(data.get("sender_pubkey", "")))
                 await self.broadcast_ui({"type": "message", "message": {
                     "msg_id": data.get("msg_id"), "sender_pubkey": data.get("sender_pubkey"),
@@ -2650,6 +2656,20 @@ class QuantumNode:
                     "delivered": int(bool(data.get("delivered", True))),
                     "status": data.get("status", "delivered"), "reactions": [], "read_at": None,
                 }})
+        elif event == "reaction":
+            msg_id = str(data.get("msg_id", ""))
+            peer = str(data.get("peer", ""))
+            emoji = str(data.get("emoji", ""))
+            action = str(data.get("action", "add"))
+            if action == "add":
+                self.db.add_reaction(msg_id, peer, emoji, direction="out" if peer == self.public_key else "in")
+            else:
+                self.db.remove_reaction(msg_id, peer, emoji)
+            await self.broadcast_ui({
+                "type": "reaction",
+                "msg_id": msg_id, "peer": peer,
+                "emoji": emoji, "action": action,
+            })
         elif event == "read_local":
             peer = str(data.get("peer_pubkey", ""))
             if peer:
@@ -2923,6 +2943,11 @@ class QuantumNode:
             "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
             "delivered": int(actually_sent > 0), "status": "sent_to_group", "reactions": [], "read_at": None,
         }})
+        await self.sync_to_devices("chat_out", {
+            "msg_id": msg_id, "sender_pubkey": self.public_key,
+            "recipient_pubkey": None, "group_id": group_id,
+            "body": text, "delivered": actually_sent > 0, "status": "sent_to_group",
+        })
 
     async def send_group_file(self, group_id: str, filename: str, encoded: str,
                               content_type: str | None = None) -> None:
@@ -3211,6 +3236,11 @@ class QuantumNode:
                 "direction": "in", "timestamp": utc_ts(), "delivered": 1,
                 "status": "delivered", "reactions": [], "read_at": None,
             }})
+            await self.sync_to_devices("chat_in", {
+                "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
+                "recipient_pubkey": self.public_key, "group_id": group_id,
+                "body": text, "delivered": True, "status": "delivered",
+            })
 
     # ── Relay dispatch ────────────────────────────────────────────────────────
 
@@ -4049,6 +4079,14 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(421, "Misdirected Request")
             return
 
+        headers = getattr(self, "headers", None) or {}
+        if str(headers.get("Upgrade", "")).lower() == "websocket":
+            if self.require_http_auth and not self._http_authenticated(parsed):
+                self.send_error(401, "Unauthorized")
+                return
+            self._bridge_websocket()
+            return
+
         if path == "/version":
             # Lightweight version probe — useful for monitoring/CI without
             # pulling the full /health payload (which includes identity).
@@ -4083,6 +4121,68 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+    def _bridge_websocket(self) -> None:
+        """Transparently bridge an inbound WebSocket upgrade to the internal
+        UI WebSocket server (127.0.0.1:ui_ws_port). This enables the browser
+        UI to connect over the same port/host as the HTTP interface, which is
+        essential in reverse-proxy, container, and single-port environments."""
+        backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            backend.settimeout(5.0)
+            backend.connect(("127.0.0.1", self.ui_ws_port))
+            backend.settimeout(None)
+        except Exception as exc:
+            LOG.debug("WebSocket bridge failed to connect to backend: %s", exc)
+            self.send_error(502, "Bad Gateway")
+            backend.close()
+            return
+
+        try:
+            req_line = f"{self.command} {self.path} {self.request_version}\r\n"
+            backend.sendall(req_line.encode("iso-8859-1"))
+            for header, value in self.headers.items():
+                backend.sendall(f"{header}: {value}\r\n".encode("iso-8859-1"))
+            backend.sendall(b"\r\n")
+
+            buffered = getattr(self.rfile, "peek", lambda: b"")()
+            if buffered:
+                backend.sendall(buffered)
+                self.rfile.read(len(buffered))
+
+            client_sock = self.connection
+            client_sock.setblocking(False)
+            backend.setblocking(False)
+
+            sockets = [client_sock, backend]
+            while sockets:
+                rlist, _, xlist = select.select(sockets, [], sockets, 60.0)
+                if xlist:
+                    break
+                for s in rlist:
+                    other = backend if s is client_sock else client_sock
+                    try:
+                        data = s.recv(65536)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except Exception:
+                        data = b""
+                    if not data:
+                        sockets.clear()
+                        break
+                    try:
+                        other.sendall(data)
+                    except Exception:
+                        sockets.clear()
+                        break
+        except Exception as exc:
+            LOG.debug("WebSocket bridge connection terminated: %s", exc)
+        finally:
+            try:
+                backend.close()
+            except Exception:
+                pass
+            self.close_connection = True
 
     def _host_allowed(self) -> bool:
         """Reject requests whose Host header is not a loopback name on a
@@ -4352,7 +4452,7 @@ HTML = r"""<!doctype html>
   
   --text1: #f8f9fa;
   --text2: #adb5bd;
-  --text3: #6c757d;
+  --text3: #94a3b8;
   
   --out-bg: linear-gradient(135deg, var(--accent2), var(--accent));
   --out-border: transparent;
@@ -5764,7 +5864,43 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .header-menu-items { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 190px; padding: 6px; border: 1px solid var(--border2); border-radius: 8px; background: #17232d; box-shadow: 0 14px 34px rgba(0,0,0,.4); }
 .header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 5px; padding: 9px 10px; }
 .mobile-back { display: none; }
+.mobile-info-btn { display: none; }
+.panel-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 140;
+}
+.panel-overlay.open { display: block; }
+.panel-close-btn { display: none; }
 .connection-hint { display: none; }
+@media (max-width: 1080px) {
+  .mobile-info-btn { display: inline-flex !important; }
+  #panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 320px;
+    max-width: 85vw;
+    z-index: 150;
+    transform: translateX(100%);
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: -10px 0 30px rgba(0,0,0,0.5);
+    background: #0e151d;
+    overflow-y: auto;
+    display: flex !important;
+  }
+  #panel.drawer-open {
+    transform: translateX(0);
+  }
+  .panel-close-btn {
+    display: inline-flex !important;
+  }
+}
 @media (max-width: 720px) {
   body { overflow: hidden; }
   #app { position: relative; }
@@ -5788,7 +5924,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   .section-label { padding-left: 16px; padding-right: 16px; }
   .chat-header { padding: 12px 14px; gap: 10px; min-height: 64px; }
   .mobile-back { display: inline-flex; flex: 0 0 auto; }
-  .chat-header-actions .btn:not(.mobile-primary) { display: none; }
+  .chat-header-actions .btn:not(.mobile-primary):not(.mobile-info-btn) { display: none; }
   .header-menu { display: block; }
   .chat-header-actions .header-menu > summary { display: inline-flex; }
   .chat-header-actions .header-menu-items .btn { display: flex; }
@@ -5797,7 +5933,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   .composer { padding: 10px 12px 12px; }
   .composer-inner { padding: 8px 10px; }
   #text { font-size: 16px; }
-  #panel { display: none; }
   .drop-overlay { border-radius: 8px; }
   #toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
 }
@@ -5931,8 +6066,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     </div>
   </main>
 
+  <div class="panel-overlay" id="panelOverlay" onclick="toggleInfoPanel(false)"></div>
+
   <!-- ── Right panel ─────────────────────── -->
   <aside id="panel">
+    <div style="padding:14px 20px 0;display:none" class="panel-close-btn">
+      <button class="btn btn-secondary btn-sm" style="width:100%" onclick="toggleInfoPanel(false)">✕ Close Info Panel</button>
+    </div>
     <div class="panel-section">
       <div class="panel-title">Overview</div>
       <div class="stat-row">
@@ -6178,17 +6318,33 @@ const avatarColor = key => {
 };
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
+let wsUseBridgedPort = false;
+let wsAttempts = 0;
+
 function wsConnect() {
   if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(wsRetryTimer);
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.hostname}:${UI_WS_PORT}/?token=${encodeURIComponent(UI_TOKEN)}`);
+  const useBridge = wsUseBridgedPort || (location.port && location.port !== String(UI_WS_PORT));
+  const portStr = useBridge ? (location.port ? `:${location.port}` : '') : `:${UI_WS_PORT}`;
+  const url = `${scheme}://${location.hostname}${portStr}/?token=${encodeURIComponent(UI_TOKEN)}`;
+  try {
+    ws = new WebSocket(url);
+  } catch(err) {
+    wsUseBridgedPort = true;
+    ws = new WebSocket(`${scheme}://${location.hostname}${location.port ? `:${location.port}` : ''}/?token=${encodeURIComponent(UI_TOKEN)}`);
+  }
   ws.onopen = () => {
     wsRetryDelay = 1000;
+    wsAttempts = 0;
     setConn(true);
   };
   ws.onclose = () => {
     ws = null;
+    wsAttempts++;
+    if(wsAttempts >= 2) {
+      wsUseBridgedPort = !wsUseBridgedPort;
+    }
     setConn(false, Math.ceil(wsRetryDelay / 1000));
     wsRetryTimer = setTimeout(wsConnect, wsRetryDelay);
     wsRetryDelay = Math.min(30000, Math.round(wsRetryDelay * 1.8));
@@ -6200,6 +6356,15 @@ function wsConnect() {
     try { handle(JSON.parse(e.data)); }
     catch(err) { console.error('Ignored invalid UI socket frame', err); }
   };
+}
+
+function toggleInfoPanel(force) {
+  const panel = $('panel');
+  const overlay = $('panelOverlay');
+  if(!panel) return;
+  const isOpen = force !== undefined ? force : !panel.classList.contains('drawer-open');
+  panel.classList.toggle('drawer-open', isOpen);
+  if(overlay) overlay.classList.toggle('open', isOpen);
 }
 
 function setConn(connected, retrySeconds=0) {
@@ -6748,6 +6913,7 @@ function renderChatHeader() {
         <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">Search</button>
         ${secure?`<button class="btn btn-secondary btn-sm mobile-primary" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">Call</button>
         <button class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">Video</button>`:''}
+        <button class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Info & Security details" aria-label="Toggle Info & Security Details">ℹ️</button>
         <details class="header-menu">
           <summary class="btn btn-secondary btn-sm" title="Conversation actions" aria-label="Conversation actions">&#8943;</summary>
           <div class="header-menu-items">
@@ -6774,6 +6940,7 @@ function renderChatHeader() {
       </div>
       <div class="chat-header-actions">
         <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation">Search</button>
+        <button class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Info & Security details" aria-label="Toggle Info & Security Details">ℹ️</button>
         ${isOwner ? `<details class="header-menu">
           <summary class="btn btn-secondary btn-sm" title="Group actions" aria-label="Group actions">&#8943;</summary>
           <div class="header-menu-items">
