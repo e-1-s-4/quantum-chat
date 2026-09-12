@@ -7,7 +7,17 @@ Quantum Chat ships a refined dark-glass web UI, a local UI WebSocket API, an opt
 > **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has **not** been independently audited. Treat it as hardened experimental application code, not a certified secure messenger. Remote production deployments still need an external security review, TLS termination, operational monitoring, and a clear key-backup plan.
 
 ---
+<img width="2880" height="1800" alt="02-conversation" src="https://github.com/user-attachments/assets/4e38abfe-6fa2-44d3-94be-d526ddb45835" />
+<img width="2880" height="1800" alt="01-overview" src="https://github.com/user-attachments/assets/f4aba407-d41e-401d-b68e-b90f6099db54" />
+<img width="780" height="1688" alt="09-mobile" src="https://github.com/user-attachments/assets/5167777b-8b64-4a81-9154-4e69108331f6" />
+<img width="2880" height="1800" alt="08-bob-view" src="https://github.com/user-attachments/assets/112c6e52-1361-43ba-9ccc-f2533907560b" />
+<img width="2880" height="1800" alt="07-composer-focus" src="https://github.com/user-attachments/assets/75ab36a3-ac9b-414d-a1ec-7df354e328b1" />
+<img width="2880" height="1800" alt="06-search" src="https://github.com/user-attachments/assets/b3bee637-9d49-4d65-a7bb-3ea6d8447a1d" />
+<img width="2880" height="1800" alt="05-edit-context" src="https://github.com/user-attachments/assets/8297b3a7-a4f5-4436-add4-9e672d4e6680" />
+<img width="2880" height="1800" alt="04-reply-context" src="https://github.com/user-attachments/assets/2e904ec0-f223-4425-994c-ef4d734a5ca7" />
+<img width="2880" height="1800" alt="03-hover-toolbar" src="https://github.com/user-attachments/assets/057d2d8b-d90c-4b3d-a0fc-9b973d67fb95" />
 
+---
 ## Table of contents
 
 - [What's new in v4.0.0](#whats-new-in-v400)
