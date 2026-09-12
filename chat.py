@@ -5817,48 +5817,6 @@ body {
   box-shadow: 0 0 12px var(--accent-soft);
 }
 
-.reaction-bar {
-  display: flex;
-  opacity: 0;
-  visibility: hidden;
-  transform: translateY(8px) scale(0.95);
-  position: absolute;
-  bottom: calc(100% + 6px);
-  background: rgba(16, 23, 37, 0.92);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border: 1px solid var(--glass-border-hover);
-  border-radius: 13px;
-  padding: 5px;
-  gap: 2px;
-  z-index: 11;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-  transition: opacity 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
-              transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
-              visibility 0.18s;
-  transition-delay: 1.5s;
-}
-.msg-group.out .reaction-bar { right: 0; }
-.msg-group.in .reaction-bar { left: 0; }
-.msg-bubble:hover .reaction-bar {
-  opacity: 1;
-  visibility: visible;
-  transform: translateY(0) scale(1);
-  transition-delay: 0s;
-}
-.reaction-bar:hover,
-.reaction-bar:focus-within {
-  opacity: 1;
-  visibility: visible;
-  transform: translateY(0) scale(1);
-  transition-delay: 0s;
-}
-@media (hover: none), (max-width: 768px) {
-  .reaction-bar {
-    opacity: 1; visibility: visible; transform: none;
-    position: static; margin-top: 6px; box-shadow: none;
-  }
-}
 .reaction-btn {
   width: 34px; height: 34px;
   border-radius: 9px;
@@ -7573,9 +7531,6 @@ function messageRowHtml(m, opts) {
   }
 
   const sameGroup = m.sender_pubkey === lastSender;
-  const reactionBar = (m._isFile || !canReact) ? '' : `<div class="reaction-bar">
-    ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('')}
-  </div>`;
 
   const metaActions = (m._isFile || tombstone) ? '' : `<div class="msg-actions">
     ${canReply ? `<button class="msg-action-btn" title="Reply to this message" onclick="startReply('${esc(m.msg_id)}')">↩ Reply</button>` : ''}
@@ -7590,7 +7545,6 @@ function messageRowHtml(m, opts) {
       ${showSender ? `<div class="msg-sender" title="${esc(m.sender_pubkey)}" style="color:${senderColor(m.sender_pubkey)}">${esc(displayName(m.sender_pubkey))}</div>` : ''}
       <div class="msg-bubble${tombstone?' tombstone':''}">
         ${toolsHtml}
-        ${reactionBar}
         ${replyQuoteHtml(m)}
         ${bodyHtml}
       </div>
