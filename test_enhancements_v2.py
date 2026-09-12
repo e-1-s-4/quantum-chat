@@ -4,24 +4,16 @@ group unread isolation, and accessibility improvements."""
 from __future__ import annotations
 
 import asyncio
-import json
-import socket
-import tempfile
-import threading
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlparse
 
 import pytest
 
 import chat
 from chat import (
     ChatHTTPHandler,
-    Database,
     QuantumNode,
     canonical_json,
-    utc_ts,
 )
 
 
@@ -153,11 +145,45 @@ def test_device_sync_group_chat_no_friend_unread_bump(tmp_path: Path) -> None:
     assert friend["unread"] == 1
 
 
+def _relative_luminance(hex_color: str) -> float:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+    def linearize(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+
+
+def _contrast_ratio(fg: str, bg: str) -> float:
+    l1, l2 = sorted((_relative_luminance(fg), _relative_luminance(bg)), reverse=True)
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
 def test_ui_contrast_variables() -> None:
-    """Verify UI text contrast variables adhere to WCAG AA."""
-    assert "--text3: #94a3b8;" in chat.HTML
-    assert "--text1: #f8f9fa;" in chat.HTML
-    assert "--text2: #adb5bd;" in chat.HTML
+    """Verify UI text contrast variables adhere to WCAG AA.
+
+    The v4 glass theme computes ratios against the solid fallback surfaces
+    (what the page degrades to without backdrop-filter) rather than asserting
+    exact hex literals, so the palette can evolve while the guarantee holds.
+    """
+    import re
+
+    def css_var(name: str) -> str:
+        match = re.search(rf"--{name}:\s*(#[0-9a-fA-F]{{6}})", chat.HTML)
+        assert match, f"--{name} must be defined as a 6-digit hex color"
+        return match.group(1)
+
+    # Darkest backgrounds text can sit on: the page background and the
+    # solid-fallback glass surface (no-support branch).
+    surfaces = ["#070b13", "#0f1521", "#1a2437"]
+    for name in ("text1", "text2", "text3"):
+        fg = css_var(name)
+        for bg in surfaces:
+            ratio = _contrast_ratio(fg, bg)
+            assert ratio >= 4.5, (
+                f"--{name} ({fg}) on {bg} is {ratio:.2f}:1 — below WCAG AA (4.5:1)"
+            )
 
 
 def test_websocket_bridge_in_http_handler() -> None:

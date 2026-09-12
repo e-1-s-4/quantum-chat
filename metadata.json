@@ -1,6 +1,6 @@
 {
   "name": "Quantum Chat",
-  "description": "A polished, reliable, privacy-focused post-quantum end-to-end encrypted peer-to-peer messenger with SQLite persistence, WebRTC signaling, and direct encrypted transports.",
+  "description": "A polished, reliable, privacy-focused post-quantum end-to-end encrypted peer-to-peer messenger with replies, message editing, delete-for-everyone, SQLite persistence, WebRTC signaling, and direct encrypted transports.",
   "requestFramePermissions": [
     "camera",
     "microphone"

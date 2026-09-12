@@ -1,6 +1,34 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v3.5.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v4.0.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+
+New in v4.0.0:
+- Features: message replies with quoted previews (1:1 and group), synced across
+  peers and devices; edit-any-of-your-own-messages, sealed under the same
+  per-counter message-key scheme as chat (relay never sees the replacement
+  text) with monotonic edited_at so a replayed or late-arriving older edit can
+  never roll a newer correction back; delete-for-everyone with authorship-
+  checked signed frames and a tombstone that keeps reply chains intact while
+  erasing the plaintext body from the database
+- Performance: the AES-GCM cipher object for at-rest encryption is now cached
+  instead of re-deriving the key schedule per row, which speeds up history
+  hydration, search scans, and every other encrypted column access; the
+  browser UI gained an incremental append path for live messages and targeted
+  status/reaction patches instead of full-list re-renders
+- Browser UI: refined dark-glass redesign (layered blur panels, gradient
+  accents, glow states, redesigned bubbles and hover action toolbars with
+  Reply/Edit/Copy/Delete, animated message entry, polished modals, toasts and
+  empty states); reply context bar above the composer with click-to-jump
+  quotes; edit-in-place composer mode; "(edited)" labels; tombstone
+  placeholders; keyboard shortcuts (Up to edit last own message, Ctrl/Cmd+F
+  for search, Esc to cancel reply/edit)
+- Security: reply targets, edit targets, and delete targets arriving over the
+  network are UUID-shape validated; edit/delete-for-everyone are owner-only
+  with signature + routing + authorship checks; deleted-for-everyone bodies
+  are truly erased rather than hidden
+- Protocol: new frame kinds message_edit / group_message_edit / message_delete,
+  additive schema (reply_to, edited_at, deleted_at) with automatic migration
+  from v3.5 databases (SCHEMA_VERSION 5 -> 6)
 
 New in v3.5.0:
 - Security: inbound group invites no longer make the recipient the group owner
@@ -126,7 +154,7 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "Quantum Chat"
-VERSION = "3.5.0"
+VERSION = "4.0.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -167,12 +195,17 @@ INLINE_CONTENT_TYPES = {
     "text/plain",
     "application/pdf",
 }
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 REPLAY_WINDOW = 2048              # accepted out-of-order span for message counters
 # Relay payload kinds whose ciphertext is sealed under a pairwise session key.
 # Queued outbox items of these kinds are retired rather than sent if the
 # session rekeyed while the peer was unreachable — see Database.queue_outbox.
-SESSION_BOUND_KINDS = {"chat", "file", "file_manifest", "file_chunk", "group_invite"}
+SESSION_BOUND_KINDS = {"chat", "file", "file_manifest", "file_chunk", "group_invite", "message_edit"}
+# Editing is sealed under the same per-counter message-key scheme as chat.
+MESSAGE_EDIT_MAX_LEN = MAX_TEXT_BYTES
+# Reply references must be valid message ids (UUID-shaped, bounded) so a
+# hostile peer cannot park an oversized "reply_to" blob in our database.
+MAX_REPLY_TO_CHARS = 64
 FILE_CHUNK_CONCURRENCY = 8        # chunks sent in flight at once per file transfer;
                                    # well under REPLAY_WINDOW so out-of-order arrival is safe
 # Direct-peer inbound frame limits per source host (per 60s window). The tight
@@ -225,6 +258,20 @@ def validate_emoji(emoji: str) -> str:
     if emoji not in ALLOWED_REACTIONS:
         raise ValueError(f"Reaction must be one of: {', '.join(sorted(ALLOWED_REACTIONS))}")
     return emoji
+
+
+def validate_msg_id(msg_id: Any, field: str = "Message id") -> str:
+    """Validate a client- or peer-supplied message id reference.
+
+    Reply targets, edit targets, and delete targets arrive over the network,
+    so they get the same treatment as file ids: UUID-shaped and bounded, or
+    rejected. This keeps a hostile peer from parking arbitrary strings in
+    reply_to / tombstone lookups or inflating logs with multi-kilobyte ids.
+    """
+    value = str(msg_id or "").strip()
+    if not value or len(value) > MAX_REPLY_TO_CHARS or not UUID_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a canonical UUID")
+    return str(uuid.UUID(value))
 
 
 def validate_direct_url(value: Any) -> str | None:
@@ -320,6 +367,17 @@ def parse_http_range(value: str, size: int) -> tuple[int, int] | None:
 
 def utc_ts() -> int:
     return int(time.time())
+
+
+def utc_ts_ms() -> int:
+    """Millisecond-resolution timestamp for edit/delete ordering.
+
+    edited_at/deleted_at are monotonic guards against replayed or reordered
+    frames, and two legitimate edits can easily land inside the same second —
+    second resolution made the second of them fail with "could not be edited
+    locally". Message timestamps stay second-grained (utc_ts) for display;
+    only the ordering fields need the finer clock."""
+    return time.time_ns() // 1_000_000
 
 
 def b64e(data: bytes) -> str:
@@ -818,7 +876,10 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'sent',
                     body_nonce BLOB,
                     key_version INTEGER NOT NULL DEFAULT 0,
-                    read_at INTEGER
+                    read_at INTEGER,
+                    reply_to TEXT,
+                    edited_at INTEGER,
+                    deleted_at INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS files (
                     file_id TEXT PRIMARY KEY,
@@ -914,7 +975,8 @@ class Database:
             "groups": [("owner_pubkey", "TEXT"), ("epoch", "INTEGER NOT NULL DEFAULT 1")],
             "group_members": [("role", "TEXT NOT NULL DEFAULT 'member'")],
             "messages": [("status", "TEXT NOT NULL DEFAULT 'sent'"), ("body_nonce", "BLOB"),
-                         ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("read_at", "INTEGER")],
+                         ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("read_at", "INTEGER"),
+                         ("reply_to", "TEXT"), ("edited_at", "INTEGER"), ("deleted_at", "INTEGER")],
             "files": [("file_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0"),
                       ("mime_type", "TEXT")],
             "file_chunks": [("chunk_nonce", "BLOB")],
@@ -933,10 +995,20 @@ class Database:
     # ── AEAD helpers ──────────────────────────────────────────────────────────
 
     def _aead(self):
+        # Constructing AESGCM re-runs the key schedule on every call; hydrating
+        # a page of history or scanning search results used to pay that cost
+        # once per row. The master key is fixed for the life of the Database
+        # object (set once in __init__, only None for unencrypted test runs),
+        # so the cipher object is cached. It is created lazily on first use so
+        # a Database built without a master key still works for plaintext rows.
         if not self.master_key:
             return None
-        AESGCM, _, _ = require_cryptography()
-        return AESGCM(self.master_key)
+        aead = getattr(self, "_aead_cache", None)
+        if aead is None:
+            AESGCM, _, _ = require_cryptography()
+            aead = AESGCM(self.master_key)
+            self._aead_cache = aead
+        return aead
 
     def encrypt_blob(self, plaintext: bytes, aad: bytes = b"") -> tuple[bytes, bytes | None, int]:
         aead = self._aead()
@@ -1311,7 +1383,9 @@ class Database:
 
     def save_message(self, msg_id: str, sender: str, body: str, direction: str,
                      recipient: str | None = None, group_id: str | None = None,
-                     delivered: bool = False, status: str = "sent") -> bool:
+                     delivered: bool = False, status: str = "sent",
+                     reply_to: str | None = None,
+                     edited_at: int | None = None) -> bool:
         plaintext = body.encode("utf-8")
         aad = f"message:{msg_id}:{sender}:{recipient or ''}:{group_id or ''}".encode()
         blob, nonce, version = self.encrypt_blob(plaintext, aad)
@@ -1319,12 +1393,76 @@ class Database:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO messages "
                 "(msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, "
-                "timestamp, delivered, status, body_nonce, key_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "timestamp, delivered, status, body_nonce, key_version, reply_to, edited_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (msg_id, sender, recipient, group_id,
                  blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
-                 direction, utc_ts(), int(delivered), status, nonce, version),
+                 direction, utc_ts(), int(delivered), status, nonce, version,
+                 reply_to, edited_at),
             )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def get_message(self, msg_id: str) -> dict[str, Any] | None:
+        """Fetch and hydrate one message row by id (or None).
+
+        Used by the edit/delete-for-everyone paths to prove local ownership
+        before rewriting history, and by reply-target validation.
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM messages WHERE msg_id=?", (str(msg_id or ""),)
+            ).fetchone()
+        return self._hydrate_message_row(row) if row is not None else None
+
+    def edit_message(self, msg_id: str, new_body: str, edited_at: int) -> bool:
+        """Rewrite one message's encrypted body and stamp edited_at.
+
+        Returns True when the row exists and the edit is newer than the stored
+        one. Monotonic edited_at makes edit application idempotent and keeps a
+        replayed or late-arriving older edit from rolling a newer correction
+        back (clock skew between peers only ever drops edits within the skew
+        window, never corrupts state).
+        """
+        if not new_body or len(new_body.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Edited message is empty or too large")
+        plaintext = new_body.encode("utf-8")
+        row = self.get_message(msg_id)
+        if row is None or row.get("deleted_at"):
+            return False
+        if row.get("edited_at") and int(row["edited_at"]) >= int(edited_at):
+            return False
+        aad = (f"message:{msg_id}:{row['sender_pubkey']}:"
+               f"{row.get('recipient_pubkey') or ''}:{row.get('group_id') or ''}").encode()
+        blob, nonce, version = self.encrypt_blob(plaintext, aad)
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE messages SET body=?, body_nonce=?, key_version=?, edited_at=? WHERE msg_id=?",
+                (blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
+                 nonce, version, int(edited_at), msg_id)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def tombstone_message(self, msg_id: str) -> bool:
+        """Erase the body of one message and mark it deleted-for-everyone.
+
+        The row is kept (not dropped) so reply chains that quote it still
+        resolve and render a placeholder instead of dangling. The plaintext
+        body is replaced with the empty string, so the deleted content is
+        genuinely gone from the database rather than merely hidden. The
+        body's AEAD nonce must be cleared together with the body: a stale
+        nonce over an empty "ciphertext" fails AES-GCM authentication and
+        would make every later hydration of the row raise InvalidTag.
+        """
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE messages SET body='', body_nonce=NULL, deleted_at=?, edited_at=NULL "
+                "WHERE msg_id=? AND deleted_at IS NULL",
+                (utc_ts(), str(msg_id or ""))
+            )
+            if cur.rowcount:
+                self.conn.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
             self.conn.commit()
             return cur.rowcount > 0
 
@@ -1381,6 +1519,12 @@ class Database:
         d = dict(r)
         raw = d["body"]
         raw_b = raw.encode("utf-8", "surrogateescape") if isinstance(raw, str) else raw
+        # An empty body is never legitimately encrypted (send paths reject
+        # empty text), so an empty row with a stray nonce — e.g. a tombstone
+        # written before the nonce-clearing fix — hydrates as empty instead
+        # of failing AES-GCM authentication on b''.
+        if not raw_b and d.get("body_nonce"):
+            d["body_nonce"] = None
         aad = (f"message:{d['msg_id']}:{d['sender_pubkey']}:"
                f"{d.get('recipient_pubkey') or ''}:{d.get('group_id') or ''}").encode()
         d["body"] = self.decrypt_blob(raw_b, d.get("body_nonce"), aad).decode("utf-8")
@@ -2347,11 +2491,30 @@ class QuantumNode:
     # ── Chat ──────────────────────────────────────────────────────────────────
 
     async def send_chat(self, peer_pubkey: str, text: str,
-                        group_id: str | None = None) -> None:
+                        group_id: str | None = None,
+                        reply_to: str | None = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Message is empty or too large")
+        # A reply reference must point at a message this node actually holds in
+        # the same conversation — otherwise a UI bug (or a scripted client)
+        # could fabricate cross-conversation quotes.
+        reply_to = str(reply_to).strip() if reply_to else None
+        if reply_to:
+            reply_to = validate_msg_id(reply_to, "Reply target")
+            target_row = self.db.get_message(reply_to)
+            if target_row is None:
+                raise ValueError("Reply target message is not in local history")
+            if group_id:
+                if target_row.get("group_id") != group_id:
+                    raise ValueError("Reply target belongs to a different conversation")
+            else:
+                if target_row.get("group_id"):
+                    raise ValueError("Reply target belongs to a different conversation")
+                if peer_pubkey not in (target_row.get("sender_pubkey"),
+                                       target_row.get("recipient_pubkey")):
+                    raise ValueError("Reply target belongs to a different conversation")
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         msg_id = str(uuid.uuid4())
         counter = self.db.next_send_counter(peer_pubkey)
@@ -2360,6 +2523,7 @@ class QuantumNode:
             "from": self.public_key,
             "to": peer_pubkey,
             "group_id": group_id,
+            "reply_to": reply_to,
             "counter": counter,
             "sent_at": utc_ts(),
         }
@@ -2378,7 +2542,7 @@ class QuantumNode:
         self.db.save_message(
             msg_id, self.public_key, text, "out",
             recipient=peer_pubkey, group_id=group_id,
-            delivered=False, status="sent_to_relay"
+            delivered=False, status="sent_to_relay", reply_to=reply_to
         )
         try:
             await self.send_relay(
@@ -2401,12 +2565,14 @@ class QuantumNode:
                 "body": text, "direction": "out",
                 "timestamp": utc_ts(), "delivered": 0,
                 "status": "sent_to_relay", "reactions": [], "read_at": None,
+                "reply_to": reply_to, "edited_at": None, "deleted_at": None,
             }
         })
         await self.sync_to_devices("chat_out", {
             "msg_id": msg_id, "sender_pubkey": self.public_key,
             "recipient_pubkey": peer_pubkey, "group_id": group_id,
             "body": text, "delivered": False, "status": "sent_to_relay",
+            "reply_to": reply_to,
         })
 
     async def handle_chat(self, peer_pubkey: str, data: dict[str, Any]) -> None:
@@ -2431,10 +2597,18 @@ class QuantumNode:
         # unrepairable (the identical retransmission would trip duplicate
         # detection instead of being processed).
         self.db.mark_recv_counter(peer_pubkey, counter)
+        # Reply references are attacker-controlled input on the receive side:
+        # shape-check them, but do NOT require the quoted row to exist locally
+        # (history windows differ between peers) — the UI renders a graceful
+        # placeholder when the original is not loaded.
+        reply_to = payload.get("reply_to")
+        reply_to = str(reply_to).strip() if reply_to else None
+        if reply_to is not None:
+            reply_to = validate_msg_id(reply_to, "Reply target")
         inserted = self.db.save_message(
             payload["msg_id"], peer_pubkey, text, "in",
             recipient=self.public_key, group_id=payload.get("group_id"),
-            delivered=True, status="delivered"
+            delivered=True, status="delivered", reply_to=reply_to
         )
         if inserted:
             self.db.increment_unread(peer_pubkey)
@@ -2452,12 +2626,14 @@ class QuantumNode:
                     "body": text, "direction": "in",
                     "timestamp": utc_ts(), "delivered": 1,
                     "status": "delivered", "reactions": [], "read_at": None,
+                    "reply_to": reply_to, "edited_at": None, "deleted_at": None,
                 }
             })
             await self.sync_to_devices("chat_in", {
                 "msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": self.public_key, "group_id": payload.get("group_id"),
                 "body": text, "delivered": True, "status": "delivered",
+                "reply_to": reply_to,
             })
 
     # ── Typing Indicators ─────────────────────────────────────────────────────
@@ -2608,6 +2784,229 @@ class QuantumNode:
             "emoji": emoji, "action": action,
         })
 
+    # ── Message editing & delete-for-everyone ──────────────────────────────────
+
+    def _own_message_row(self, msg_id: str) -> dict[str, Any]:
+        """Fetch a message and prove the local identity authored it.
+
+        Both edit and delete-for-everyone rewrite what other participants see
+        for a message, so they are owner-only operations: the row must exist,
+        be an outgoing message, and carry our own sender key.
+        """
+        msg_id = validate_msg_id(msg_id)
+        row = self.db.get_message(msg_id)
+        if row is None:
+            raise ValueError("Message is not in local history")
+        if row.get("direction") != "out" or row.get("sender_pubkey") != self.public_key:
+            raise ValueError("Only your own messages can be edited or deleted for everyone")
+        return row
+
+    async def send_message_edit(self, msg_id: str, text: str) -> None:
+        """Rewrite one of our own sent messages everywhere it is held.
+
+        1:1 messages travel as a `message_edit` frame sealed under the pairwise
+        session's per-counter message key (same construction as `chat`, so the
+        relay never sees the replacement text). Group messages travel as a
+        signed `group_message_edit` frame sealed under the current group epoch
+        key. The local copy is rewritten only after the frame is built, and
+        edited_at is monotonic on the receiving side, so a replayed or
+        late-arriving older edit can never roll a newer correction back.
+        """
+        row = self._own_message_row(msg_id)
+        text = (text or "").strip()
+        if not text or len(text.encode()) > MESSAGE_EDIT_MAX_LEN:
+            raise ValueError("Edited message is empty or too large")
+        group_id = row.get("group_id")
+        edited_at = utc_ts_ms()
+
+        if group_id:
+            members = set(self.db.group_members(group_id))
+            if self.public_key not in members:
+                raise ValueError("You are no longer a member of this group")
+            group_key = self.db.get_group_key(group_id)
+            if not group_key:
+                raise ValueError("Group key material is missing; rotate the group key first")
+            meta = {"msg_id": msg_id, "from": self.public_key, "group_id": group_id,
+                    "epoch": int(group_key["epoch"]), "edited_at": edited_at}
+            packet = self.crypto.encrypt(group_key["key"], pad_plaintext(text.encode()), canonical_json(meta))
+            envelope = self.signed_payload("group_message_edit", {"meta": meta, "packet": packet})
+            for peer in members - {self.public_key}:
+                if self.db.is_friend(peer):
+                    await self.send_relay(peer, envelope, queue_on_failure=True)
+        else:
+            peer_pubkey = row.get("recipient_pubkey") or ""
+            peer_pubkey = self.validate_peer_key(peer_pubkey)
+            session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
+            counter = self.db.next_send_counter(peer_pubkey)
+            payload = {
+                "msg_id": msg_id,
+                "from": self.public_key,
+                "to": peer_pubkey,
+                "counter": counter,
+                "edited_at": edited_at,
+            }
+            msg_key = self.crypto.derive_message_key(
+                session_key, self.public_key, peer_pubkey, counter, "edit"
+            )
+            packet = self.crypto.encrypt(msg_key, pad_plaintext(text.encode()), canonical_json(payload))
+            await self.send_relay(
+                peer_pubkey,
+                {"kind": "message_edit", "payload": payload, "packet": packet},
+                queue_on_failure=True
+            )
+
+        if not self.db.edit_message(msg_id, text, edited_at):
+            raise ValueError("Message could not be edited locally")
+        await self.broadcast_ui({
+            "type": "message_edited", "msg_id": msg_id, "body": text, "edited_at": edited_at,
+        })
+        await self.sync_to_devices("message_edited", {
+            "msg_id": msg_id, "body": text, "edited_at": edited_at,
+        })
+
+    async def handle_message_edit(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        """Apply a peer's edit to the copy we hold (1:1 sessions)."""
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
+        payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Edit routing metadata mismatch")
+        msg_id = validate_msg_id(payload.get("msg_id", ""), "Edit target")
+        counter = int(payload.get("counter", 0))
+        msg_key = self.crypto.derive_message_key(
+            session_key, peer_pubkey, self.public_key, counter, "edit"
+        )
+        text = unpad_plaintext(self.crypto.decrypt(
+            msg_key, data["packet"], canonical_json(payload)
+        )).decode("utf-8")
+        if not text or len(text.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Edited message is empty or too large")
+        # Only the message's author may rewrite it — a peer must not be able
+        # to edit OUR copy of a message someone else sent.
+        row = self.db.get_message(msg_id)
+        if row is None or row.get("sender_pubkey") != peer_pubkey:
+            raise ValueError("Edit target was not authored by the sender")
+        # Consume the replay counter only after every validation above
+        # succeeded, mirroring handle_chat's re-transmittable failure mode.
+        self.db.mark_recv_counter(peer_pubkey, counter)
+        edited_at = int(payload.get("edited_at") or utc_ts_ms())
+        if self.db.edit_message(msg_id, text, edited_at):
+            await self.broadcast_ui({
+                "type": "message_edited", "msg_id": msg_id, "body": text, "edited_at": edited_at,
+            })
+            await self.sync_to_devices("message_edited", {
+                "msg_id": msg_id, "body": text, "edited_at": edited_at,
+            })
+
+    async def handle_group_message_edit(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        """Apply a group member's edit to the copy we hold (group epoch key)."""
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid group message edit signature")
+        payload = data.get("payload", {})
+        meta = payload.get("meta", {})
+        if meta.get("from") != peer_pubkey:
+            raise ValueError("Group edit sender mismatch")
+        msg_id = validate_msg_id(meta.get("msg_id", ""), "Edit target")
+        group_id = str(meta.get("group_id", ""))
+        if self.public_key not in self.db.group_members(group_id):
+            raise ValueError("Group edit for unknown group")
+        group_key = self.db.get_group_key(group_id, int(meta.get("epoch", 0)))
+        if not group_key:
+            raise ValueError("Missing group epoch key")
+        text = unpad_plaintext(self.crypto.decrypt(
+            group_key["key"], payload["packet"], canonical_json(meta)
+        )).decode("utf-8")
+        if not text or len(text.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Edited group message is empty or too large")
+        row = self.db.get_message(msg_id)
+        if row is None or row.get("sender_pubkey") != peer_pubkey:
+            raise ValueError("Edit target was not authored by the sender")
+        edited_at = int(meta.get("edited_at") or utc_ts_ms())
+        if self.db.edit_message(msg_id, text, edited_at):
+            await self.broadcast_ui({
+                "type": "message_edited", "msg_id": msg_id, "body": text, "edited_at": edited_at,
+            })
+            await self.sync_to_devices("message_edited", {
+                "msg_id": msg_id, "body": text, "edited_at": edited_at,
+            })
+
+    async def send_message_delete_everywhere(self, msg_id: str) -> None:
+        """Delete one of our own sent messages from every participant.
+
+        The frame is signed but carries no message content (just the id), so
+        it needs no per-message encryption; recipients verify the signature
+        AND that they hold the message as authored by us before tombstoning
+        their copy. The local copy is tombstoned first: even if every send
+        below fails offline, "deleted here" must remain true here.
+        """
+        row = self._own_message_row(msg_id)
+        msg_id = validate_msg_id(msg_id)
+        group_id = row.get("group_id")
+        deleted_at = utc_ts()
+
+        if group_id:
+            members = set(self.db.group_members(group_id))
+            if self.public_key not in members:
+                raise ValueError("You are no longer a member of this group")
+            targets = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
+        else:
+            peer_pubkey = row.get("recipient_pubkey") or ""
+            peer_pubkey = self.validate_peer_key(peer_pubkey)
+            targets = [peer_pubkey]
+
+        if not self.db.tombstone_message(msg_id):
+            raise ValueError("Message is not available to delete")
+
+        # Each recipient gets its own signed frame stamped `to` them: group
+        # fan-out signs per member (a multicast member cannot replay a frame
+        # addressed to someone else because the relay stamps `from` from the
+        # authenticated connection), and 1:1 sends stamp the sole recipient.
+        for peer in targets:
+            try:
+                per_peer = self.signed_payload("message_delete", {
+                    "from": self.public_key, "to": peer,
+                    "msg_id": msg_id, "deleted_at": deleted_at,
+                })
+                await self.send_relay(peer, per_peer, queue_on_failure=True)
+            except Exception as exc:
+                LOG.warning("Delete-for-everywhere fan-out to %s failed: %s", short_key(peer), exc)
+
+        await self.broadcast_ui({
+            "type": "message_tombstoned", "msg_id": msg_id, "deleted_at": deleted_at,
+        })
+        await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id})
+
+    async def handle_message_delete(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        """Tombstone our copy of a message its author deleted everywhere."""
+        if self.db.is_blocked(peer_pubkey):
+            raise ValueError("Message deletion notice from a blocked peer")
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid message deletion signature")
+        payload = data.get("payload", {})
+        if payload.get("from") != peer_pubkey:
+            raise ValueError("Message deletion sender mismatch")
+        msg_id = validate_msg_id(payload.get("msg_id", ""), "Delete target")
+        row = self.db.get_message(msg_id)
+        if row is None:
+            # Unknown id: a duplicate delivery or a message outside our
+            # history window. Nothing to tombstone, and rejecting would only
+            # force a pointless retry — accept and move on.
+            LOG.debug("Delete notice for unknown message %s", msg_id)
+            return
+        # Routing: the frame must be addressed to us (per-recipient fan-out
+        # stamps each copy), and only the message's stored author may delete
+        # it for everyone — a peer must not be able to erase someone else's
+        # words from our history.
+        if payload.get("to") != self.public_key:
+            raise ValueError("Message deletion routing mismatch")
+        if row.get("sender_pubkey") != peer_pubkey:
+            raise ValueError("Only the message author may delete it for everyone")
+        if self.db.tombstone_message(msg_id):
+            await self.broadcast_ui({
+                "type": "message_tombstoned", "msg_id": msg_id,
+                "deleted_at": int(payload.get("deleted_at") or utc_ts()),
+            })
+            await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id})
+
     # ── Multi-device sync ────────────────────────────────────────────────────
 
     async def sync_to_devices(self, event: str, data: dict[str, Any]) -> None:
@@ -2645,6 +3044,7 @@ class QuantumNode:
                 str(data.get("body", "")), direction,
                 recipient=data.get("recipient_pubkey"), group_id=data.get("group_id"),
                 delivered=bool(data.get("delivered", True)), status=str(data.get("status", "delivered")),
+                reply_to=data.get("reply_to"),
             )
             if inserted:
                 if direction == "in" and not data.get("group_id"):
@@ -2655,7 +3055,22 @@ class QuantumNode:
                     "body": data.get("body"), "direction": direction, "timestamp": utc_ts(),
                     "delivered": int(bool(data.get("delivered", True))),
                     "status": data.get("status", "delivered"), "reactions": [], "read_at": None,
+                    "reply_to": data.get("reply_to"), "edited_at": None, "deleted_at": None,
                 }})
+        elif event == "message_edited":
+            # A sibling device edited one of our own messages: apply the same
+            # monotonic edited_at guard so two devices racing to edit converge.
+            msg_id = str(data.get("msg_id", ""))
+            body = str(data.get("body", ""))
+            edited_at = int(data.get("edited_at") or utc_ts_ms())
+            if body and self.db.edit_message(msg_id, body, edited_at):
+                await self.broadcast_ui({
+                    "type": "message_edited", "msg_id": msg_id, "body": body, "edited_at": edited_at,
+                })
+        elif event == "message_tombstoned":
+            msg_id = str(data.get("msg_id", ""))
+            if self.db.tombstone_message(msg_id):
+                await self.broadcast_ui({"type": "message_tombstoned", "msg_id": msg_id})
         elif event == "reaction":
             msg_id = str(data.get("msg_id", ""))
             peer = str(data.get("peer", ""))
@@ -2896,13 +3311,21 @@ class QuantumNode:
 
     # ── Group messaging ───────────────────────────────────────────────────────
 
-    async def send_group_chat(self, group_id: str, text: str) -> None:
+    async def send_group_chat(self, group_id: str, text: str,
+                              reply_to: str | None = None) -> None:
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Message is empty or too large")
+        # Reply targets must live in the same group as the reply itself.
+        reply_to = str(reply_to).strip() if reply_to else None
+        if reply_to:
+            reply_to = validate_msg_id(reply_to, "Reply target")
+            target_row = self.db.get_message(reply_to)
+            if target_row is None or target_row.get("group_id") != group_id:
+                raise ValueError("Reply target message is not in this group's history")
         group_key = self.db.get_group_key(group_id)
         if not group_key:
             key = secrets.token_bytes(32)
@@ -2911,7 +3334,7 @@ class QuantumNode:
         epoch = int(group_key["epoch"])
         msg_id = str(uuid.uuid4())
         meta = {"msg_id": msg_id, "from": self.public_key, "group_id": group_id,
-                "epoch": epoch, "sent_at": utc_ts()}
+                "epoch": epoch, "sent_at": utc_ts(), "reply_to": reply_to}
         packet = self.crypto.encrypt(group_key["key"], pad_plaintext(text.encode()), canonical_json(meta))
         envelope = self.signed_payload("group_chat", {"meta": meta, "packet": packet})
         # Save the outgoing group message BEFORE fan-out so the row exists by
@@ -2922,7 +3345,8 @@ class QuantumNode:
             if self.db.is_friend(peer):
                 delivered += 1  # optimistically count intended recipients
         self.db.save_message(msg_id, self.public_key, text, "out", group_id=group_id,
-                             delivered=delivered > 0, status="sent_to_group")
+                             delivered=delivered > 0, status="sent_to_group",
+                             reply_to=reply_to)
 
         async def deliver(peer: str) -> bool:
             try:
@@ -2942,11 +3366,13 @@ class QuantumNode:
             "msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": None,
             "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
             "delivered": int(actually_sent > 0), "status": "sent_to_group", "reactions": [], "read_at": None,
+            "reply_to": reply_to, "edited_at": None, "deleted_at": None,
         }})
         await self.sync_to_devices("chat_out", {
             "msg_id": msg_id, "sender_pubkey": self.public_key,
             "recipient_pubkey": None, "group_id": group_id,
             "body": text, "delivered": actually_sent > 0, "status": "sent_to_group",
+            "reply_to": reply_to,
         })
 
     async def send_group_file(self, group_id: str, filename: str, encoded: str,
@@ -3223,8 +3649,14 @@ class QuantumNode:
         text = unpad_plaintext(self.crypto.decrypt(group_key["key"], payload["packet"], canonical_json(meta))).decode("utf-8")
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Group message is empty or too large")
+        # Same receive-side reply policy as 1:1 chat: shape-check the reference,
+        # but tolerate quoted messages that predate our local history window.
+        reply_to = meta.get("reply_to")
+        reply_to = str(reply_to).strip() if reply_to else None
+        if reply_to is not None:
+            reply_to = validate_msg_id(reply_to, "Reply target")
         inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
-                                        delivered=True, status="delivered")
+                                        delivered=True, status="delivered", reply_to=reply_to)
         if inserted:
             # Group traffic deliberately does NOT bump the sender's 1:1 unread
             # counter: that badge belongs to the private conversation with
@@ -3235,11 +3667,13 @@ class QuantumNode:
                 "recipient_pubkey": None, "group_id": group_id, "body": text,
                 "direction": "in", "timestamp": utc_ts(), "delivered": 1,
                 "status": "delivered", "reactions": [], "read_at": None,
+                "reply_to": reply_to, "edited_at": None, "deleted_at": None,
             }})
             await self.sync_to_devices("chat_in", {
                 "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": self.public_key, "group_id": group_id,
                 "body": text, "delivered": True, "status": "delivered",
+                "reply_to": reply_to,
             })
 
     # ── Relay dispatch ────────────────────────────────────────────────────────
@@ -3269,6 +3703,12 @@ class QuantumNode:
             await self.handle_read_receipt(peer_pubkey, payload)
         elif kind == "reaction":
             await self.handle_reaction(peer_pubkey, payload)
+        elif kind == "message_edit":
+            await self.handle_message_edit(peer_pubkey, payload)
+        elif kind == "group_message_edit":
+            await self.handle_group_message_edit(peer_pubkey, payload)
+        elif kind == "message_delete":
+            await self.handle_message_delete(peer_pubkey, payload)
         elif kind == "device_sync":
             await self._handle_device_sync(peer_pubkey, payload)
         elif kind == "call_offer":
@@ -3461,10 +3901,17 @@ class QuantumNode:
         elif typ == "connect":
             await self.connect_peer(msg["pubkey"])
         elif typ == "send_message":
+            reply_to = msg.get("reply_to")
             if msg.get("group_id"):
-                await self.send_group_chat(str(msg["group_id"]), str(msg.get("text", "")))
+                await self.send_group_chat(str(msg["group_id"]), str(msg.get("text", "")),
+                                           reply_to=reply_to)
             else:
-                await self.send_chat(msg["pubkey"], str(msg.get("text", "")))
+                await self.send_chat(msg["pubkey"], str(msg.get("text", "")),
+                                     reply_to=reply_to)
+        elif typ == "edit_message":
+            await self.send_message_edit(str(msg.get("msg_id", "")), str(msg.get("text", "")))
+        elif typ == "delete_message_everywhere":
+            await self.send_message_delete_everywhere(str(msg.get("msg_id", "")))
         elif typ == "send_file":
             filename = safe_filename(msg.get("filename"))
             data = str(msg.get("data", ""))
@@ -4145,7 +4592,25 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                 backend.sendall(f"{header}: {value}\r\n".encode("iso-8859-1"))
             backend.sendall(b"\r\n")
 
-            buffered = getattr(self.rfile, "peek", lambda: b"")()
+            # Recover any bytes the rfile already buffered behind the request
+            # headers (an eager WS client can pipeline its first frame in the
+            # same TCP segment as the handshake). A bare peek() blocks forever
+            # when the buffer is empty: peek issues a raw read, and a
+            # WebSocket client sends nothing more until it sees our 101 — so
+            # the old call deadlocked the bridge for the entire opening
+            # handshake (the browser only survived by failing over to the
+            # direct UI port). Bounding the wait makes buffered bytes return
+            # instantly while an empty buffer gives up after 50ms; bytes that
+            # arrive later sit in the kernel socket buffer, which the
+            # select() pump below forwards on its own.
+            buffered = b""
+            try:
+                self.connection.settimeout(0.05)
+                buffered = getattr(self.rfile, "peek", lambda *_: b"")(1)
+            except OSError:
+                buffered = b""
+            finally:
+                self.connection.settimeout(None)
             if buffered:
                 backend.sendall(buffered)
                 self.rfile.read(len(buffered))
@@ -4429,49 +4894,73 @@ HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>⚛ Quantum Chat</title>
 <style>
+/* ═══════════════════════════════════════════════════════════════════════════
+   Quantum Chat v4 — refined dark glass
+   Layered frosted panels, soft ambient gradients, quiet glow accents.
+   Readability first: text sits on solid-enough surfaces; glass decorates
+   chrome, never the words themselves.
+   ═══════════════════════════════════════════════════════════════════════════ */
 :root {
-  --bg: #030508;
-  --glass-bg: rgba(12, 18, 30, 0.65);
-  --glass-border: rgba(255, 255, 255, 0.07);
-  --glass-border-hover: rgba(255, 255, 255, 0.15);
-  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-  
-  --s1: var(--glass-bg);
-  --s2: rgba(18, 25, 40, 0.5);
-  --s3: rgba(25, 35, 55, 0.6);
-  --s4: rgba(35, 50, 75, 0.7);
+  --bg: #070b13;
+  --bg-deep: #04070d;
+
+  /* Glass surfaces */
+  --glass-bg: rgba(15, 21, 33, 0.78);
+  --glass-bg-strong: rgba(11, 16, 26, 0.92);
+  --glass-panel: rgba(18, 25, 39, 0.62);
+  --glass-blur: 26px;
+  --glass-border: rgba(148, 178, 226, 0.10);
+  --glass-border-hover: rgba(148, 178, 226, 0.22);
+  --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  /* Legacy surface aliases (kept: many rules still reference them) */
+  --s1: rgba(15, 21, 33, 0.78);
+  --s2: rgba(20, 28, 44, 0.72);
+  --s3: rgba(26, 36, 55, 0.78);
+  --s4: rgba(36, 50, 76, 0.85);
   --border: var(--glass-border);
   --border2: var(--glass-border-hover);
-  
-  --accent: #00d2ff;
-  --accent-glow: rgba(0, 210, 255, 0.4);
-  --accent2: #3a86ff;
-  --accent2-glow: rgba(58, 134, 255, 0.4);
-  --danger: #ff3366;
-  --warn: #ffcc00;
-  
-  --text1: #f8f9fa;
-  --text2: #adb5bd;
-  --text3: #94a3b8;
-  
-  --out-bg: linear-gradient(135deg, var(--accent2), var(--accent));
-  --out-border: transparent;
-  --in-bg: var(--s3);
-  
-  --rad: 16px;
+
+  /* Accents */
+  --accent: #45d8ff;
+  --accent-glow: rgba(69, 216, 255, 0.35);
+  --accent-soft: rgba(69, 216, 255, 0.14);
+  --accent2: #4f7cff;
+  --accent2-glow: rgba(79, 124, 255, 0.35);
+  --accent2-soft: rgba(79, 124, 255, 0.16);
+  --danger: #ff5d7d;
+  --danger-soft: rgba(255, 93, 125, 0.12);
+  --warn: #ffc857;
+  --ok: #3ddc97;
+
+  --text1: #edf3fa;
+  --text2: #a9b6c6;
+  --text3: #8494a6;
+
+  /* Message bubbles */
+  --out-bg: linear-gradient(160deg, rgba(79, 124, 255, 0.34), rgba(69, 195, 255, 0.24));
+  --out-border: rgba(130, 175, 255, 0.38);
+  --in-bg: rgba(28, 38, 58, 0.66);
+
+  --rad: 14px;
+  --rad-lg: 20px;
   --font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+html { color-scheme: dark; }
+
 body {
   font-family: var(--font);
   background-color: var(--bg);
-  background-image: 
-    radial-gradient(circle at 15% 50%, rgba(58, 134, 255, 0.15), transparent 40%),
-    radial-gradient(circle at 85% 30%, rgba(0, 210, 255, 0.15), transparent 40%),
-    radial-gradient(circle at 50% 100%, rgba(255, 51, 102, 0.05), transparent 40%);
+  /* Ambient aurora: three quiet gradients fixed behind the glass layers */
+  background-image:
+    radial-gradient(1100px 700px at 8% -10%, rgba(79, 124, 255, 0.16), transparent 55%),
+    radial-gradient(900px 600px at 108% 18%, rgba(69, 216, 255, 0.10), transparent 55%),
+    radial-gradient(1000px 800px at 50% 118%, rgba(120, 87, 255, 0.10), transparent 60%);
   background-attachment: fixed;
   color: var(--text1);
   height: 100vh;
@@ -4479,21 +4968,34 @@ body {
   font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* ── Layout ── */
+/* Solid-surface fallback when backdrop-filter is unavailable: the glass
+   surfaces above are translucent and need the blur to stay legible. */
+@supports not ((backdrop-filter: blur(2px)) or (-webkit-backdrop-filter: blur(2px))) {
+  :root {
+    --glass-bg: #0f1521;
+    --glass-bg-strong: #0b101a;
+    --glass-panel: #131a28;
+    --s1: #0f1521; --s2: #141c2c; --s3: #1a2437; --s4: #24324c;
+    --in-bg: #1a2437;
+  }
+}
+
+/* ── Layout ────────────────────────────────────────────────────────────── */
 #app { display: flex; height: 100vh; }
 
 #sidebar {
-  width: 320px;
-  min-width: 320px;
+  width: 330px;
+  min-width: 330px;
   display: flex;
   flex-direction: column;
   background: var(--glass-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-right: 1px solid var(--border);
-  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  border-right: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow), var(--glass-inset);
   z-index: 10;
 }
 
@@ -4506,47 +5008,47 @@ body {
 }
 
 #panel {
-  width: 290px;
-  min-width: 290px;
+  width: 300px;
+  min-width: 300px;
   background: var(--glass-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-left: 1px solid var(--border);
-  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  border-left: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow), var(--glass-inset);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
   z-index: 10;
 }
 
-/* ── Sidebar ── */
+/* ── Sidebar head ──────────────────────────────────────────────────────── */
 .sidebar-head {
-  padding: 20px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(0,0,0,0.1);
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--glass-border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent);
 }
 
 .app-logo {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .app-logo .icon {
-  font-size: 26px;
+  font-size: 27px;
   line-height: 1;
-  background: linear-gradient(135deg, var(--accent2), var(--accent));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 0 8px var(--accent-glow));
+  filter: drop-shadow(0 0 10px var(--accent-glow));
 }
 
 .app-logo h1 {
   font-size: 18px;
-  font-weight: 700;
+  font-weight: 750;
   letter-spacing: -0.02em;
-  color: var(--text1);
+  background: linear-gradient(100deg, #ffffff 30%, #a9d8ff 75%, var(--accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 .app-logo .ver {
@@ -4554,66 +5056,71 @@ body {
   color: var(--text3);
   font-family: var(--mono);
   margin-top: 2px;
+  letter-spacing: 0.04em;
 }
 
 .conn-badge {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
-  font-weight: 500;
-  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 550;
+  padding: 5px 12px;
   border-radius: 999px;
   background: var(--s3);
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   color: var(--text2);
   transition: all 0.3s ease;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
 }
-
-.conn-badge.connected { 
-  border-color: rgba(58, 134, 255, 0.4); 
-  color: #fff;
-  background: rgba(58, 134, 255, 0.1);
+.conn-badge.connected {
+  border-color: rgba(69, 216, 255, 0.45);
+  color: #dff6ff;
+  background: var(--accent-soft);
+  box-shadow: 0 0 18px rgba(69, 216, 255, 0.12);
 }
-.conn-badge.connected .dot { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
 .conn-badge .dot {
   width: 8px; height: 8px;
   border-radius: 50%;
   background: var(--text3);
   transition: all 0.3s;
 }
-.conn-badge.connected .dot { animation: pulse 2s infinite; }
+.conn-badge.connected .dot {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  animation: pulse 2s infinite;
+}
 @keyframes pulse {
-  0%,100% { opacity: 1; transform: scale(1); box-shadow: 0 0 10px var(--accent); }
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 10px var(--accent); }
   50% { opacity: 0.5; transform: scale(0.8); box-shadow: 0 0 2px var(--accent); }
 }
 
-/* Identity card */
+/* ── Identity card ─────────────────────────────────────────────────────── */
 .id-card {
-  margin: 16px;
-  padding: 16px;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid var(--border);
+  margin: 14px 16px 12px;
+  padding: 14px;
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  border: 1px solid var(--glass-border);
   border-radius: var(--rad);
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
   position: relative;
   overflow: hidden;
+  box-shadow: var(--glass-inset);
 }
 .id-card::before {
   content: '';
   position: absolute;
   top: 0; left: 0; right: 0; height: 2px;
-  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  background: linear-gradient(90deg, var(--accent2), var(--accent), transparent);
   opacity: 0;
   transition: opacity 0.3s;
 }
 .id-card:hover {
   transform: translateY(-2px);
-  background: rgba(255, 255, 255, 0.05);
-  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
-  border-color: var(--border2);
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35), var(--glass-inset);
+  border-color: var(--glass-border-hover);
 }
 .id-card:hover::before { opacity: 1; }
 
@@ -4626,14 +5133,16 @@ body {
 .id-avatar {
   width: 42px; height: 42px;
   border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent2), var(--accent));
-  box-shadow: 0 4px 12px var(--accent-glow);
+  background:
+    radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.45), transparent 42%),
+    linear-gradient(135deg, var(--accent2), var(--accent));
+  box-shadow: 0 4px 14px var(--accent2-glow), 0 0 0 1px rgba(255, 255, 255, 0.12) inset;
   display: flex; align-items: center; justify-content: center;
   font-size: 20px;
   flex-shrink: 0;
   color: white;
 }
-.id-name { font-weight: 600; font-size: 15px; }
+.id-name { font-weight: 650; font-size: 15px; }
 .id-fp {
   font-family: var(--mono);
   font-size: 11px;
@@ -4646,408 +5155,613 @@ body {
   color: var(--text2);
   word-break: break-all;
   padding: 10px;
-  background: rgba(0,0,0,0.3);
+  background: rgba(0, 0, 0, 0.35);
   border-radius: 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   display: none;
   margin-top: 12px;
   line-height: 1.6;
 }
-.id-key.visible { 
-  display: block; 
-  max-height: 120px; 
-  overflow-y: auto; 
-  animation: fadeIn 0.3s; 
+.id-key.visible {
+  display: block;
+  max-height: 120px;
+  overflow-y: auto;
+  animation: fadeIn 0.3s;
 }
 .id-actions { display: flex; gap: 8px; margin-top: 12px; }
 
-/* Search */
+/* ── Search ────────────────────────────────────────────────────────────── */
 .search-wrap {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 10px 16px 12px;
+  border-bottom: 1px solid var(--glass-border);
 }
 .search-input {
   width: 100%;
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
+  padding: 9px 14px;
   border-radius: 12px;
-  padding: 10px 14px 10px 36px;
+  border: 1px solid var(--glass-border);
+  background: rgba(0, 0, 0, 0.28);
   color: var(--text1);
-  font-size: 14px;
-  font-family: var(--font);
+  font-size: 13.5px;
   outline: none;
-  transition: all 0.2s;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236c757d' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: 12px center;
+  transition: all 0.25s;
 }
-.search-input:focus { 
-  border-color: var(--accent); 
-  background: rgba(0,0,0,0.4);
-  box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.1);
+.search-input:focus {
+  border-color: var(--accent);
+  background: rgba(0, 0, 0, 0.42);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .search-input::placeholder { color: var(--text3); }
 
-/* Friend / group lists */
-.list-section { flex: 1; overflow-y: auto; padding: 12px 0; }
+/* ── Mode tabs ─────────────────────────────────────────────────────────── */
+.mode-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 12px 16px 8px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--glass-border);
+  padding: 4px;
+  box-shadow: var(--glass-inset);
+}
+.mode-tab {
+  flex: 1;
+  padding: 8px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text2);
+  border: none;
+  border-radius: 9px;
+  transition: all 0.2s;
+}
+.mode-tab:hover { color: var(--text1); background: rgba(255, 255, 255, 0.05); }
+.mode-tab.active {
+  background: linear-gradient(135deg, var(--accent2-soft), var(--accent-soft));
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ── Slide panels (add friend / group) ─────────────────────────────────── */
+.slide-panel {
+  background: rgba(0, 0, 0, 0.2);
+  border-bottom: 1px solid var(--glass-border);
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+.slide-panel.open { max-height: 420px; }
+.slide-panel-inner { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+
+/* ── Conversation list ─────────────────────────────────────────────────── */
+.list-section {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0 16px;
+}
+
 .section-label {
-  padding: 8px 20px 6px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.15em;
-  color: var(--text3);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: 12px 22px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text3);
 }
 .section-label button {
-  font-size: 20px;
-  color: var(--text3);
-  background: none;
-  border: none;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text2);
+  border: 1px solid var(--glass-border);
+  width: 26px; height: 26px;
+  border-radius: 8px;
   cursor: pointer;
-  padding: 0 4px;
+  font-size: 15px;
   line-height: 1;
+  display: flex; align-items: center; justify-content: center;
   transition: all 0.2s;
 }
-.section-label button:hover { 
-  color: var(--accent); 
-  transform: scale(1.1);
-  filter: drop-shadow(0 0 4px var(--accent-glow));
+.section-label button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 12px var(--accent-soft);
 }
 
 .friend-item {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 20px;
-  cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
-  position: relative;
-  margin: 2px 8px;
+  padding: 10px 14px;
+  margin: 2px 10px;
   border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
+  position: relative;
+  border: 1px solid transparent;
 }
-.friend-item:hover { background: rgba(255, 255, 255, 0.03); }
-.friend-item.active { 
-  background: rgba(255, 255, 255, 0.06); 
-  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+.friend-item:hover {
+  background: rgba(255, 255, 255, 0.045);
+}
+.friend-item.active {
+  background: linear-gradient(135deg, var(--accent2-soft), rgba(69, 216, 255, 0.07));
+  border-color: rgba(120, 165, 255, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04), 0 4px 18px rgba(0, 0, 0, 0.25);
 }
 .friend-item.active::before {
   content: '';
   position: absolute;
-  left: 0; top: 12px; bottom: 12px;
-  width: 4px;
-  background: linear-gradient(180deg, var(--accent2), var(--accent));
-  border-radius: 0 4px 4px 0;
-  box-shadow: 2px 0 8px var(--accent-glow);
+  left: 0; top: 22%; bottom: 22%;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, var(--accent), var(--accent2));
+  box-shadow: 0 0 10px var(--accent-glow);
 }
 
-.friend-avatar {
-  position: relative;
-  flex-shrink: 0;
-}
+.friend-avatar { position: relative; flex-shrink: 0; }
 .avatar-circle {
   width: 42px; height: 42px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #1e293b, #334155);
   display: flex; align-items: center; justify-content: center;
-  font-size: 16px;
-  font-weight: 600;
   color: #fff;
-  border: 1px solid var(--border);
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  font-weight: 650;
+  font-size: 16px;
+  position: relative;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+.avatar-circle::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.35), transparent 45%);
 }
 .online-dot {
   position: absolute;
-  bottom: 0px; right: -2px;
-  width: 14px; height: 14px;
+  bottom: 0; right: 0;
+  width: 11px; height: 11px;
   border-radius: 50%;
-  background: var(--bg);
-  display: flex; align-items: center; justify-content: center;
+  background: #3a4557;
+  border: 2px solid #0e1420;
+  transition: all 0.25s;
 }
-.online-dot::after {
-  content: '';
-  width: 10px; height: 10px;
-  border-radius: 50%;
-  background: var(--text3);
-  transition: all 0.3s;
-}
-.online-dot.online::after { 
-  background: #34d39a; 
-  box-shadow: 0 0 8px #34d39a;
+.online-dot.online {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(61, 220, 151, 0.55);
 }
 
 .friend-info { flex: 1; min-width: 0; }
 .friend-name {
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 2px;
 }
 .friend-preview {
-  font-size: 13px;
-  color: var(--text2);
+  font-size: 12px;
+  color: var(--text3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  margin-top: 2px;
 }
 .friend-meta {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 6px;
+  gap: 4px;
   flex-shrink: 0;
 }
+.time-tag { font-size: 10.5px; color: var(--text3); font-family: var(--mono); }
+.secure-tag { font-size: 11px; }
 .unread-badge {
-  background: linear-gradient(135deg, var(--danger), #ff5e62);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 3px 8px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
   border-radius: 999px;
-  min-width: 22px;
-  text-align: center;
-  box-shadow: 0 2px 8px rgba(255, 51, 102, 0.4);
-  animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-}
-@keyframes popIn {
-  0% { transform: scale(0.5); opacity: 0; }
-  100% { transform: scale(1); opacity: 1; }
-}
-
-.secure-tag {
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
+  color: #04121f;
   font-size: 11px;
-  color: var(--accent);
-  font-family: var(--mono);
+  font-weight: 800;
   display: flex;
   align-items: center;
-  gap: 4px;
-}
-.time-tag {
-  font-size: 11px;
-  color: var(--text3);
+  justify-content: center;
+  box-shadow: 0 0 12px var(--accent-glow);
 }
 
-/* ── Main chat area ── */
+/* ── Chat header ───────────────────────────────────────────────────────── */
 .chat-header {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 16px 24px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(10, 15, 25, 0.6);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  gap: 14px;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-panel);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
   min-height: 72px;
-  z-index: 5;
+  box-shadow: var(--glass-inset);
+  z-index: 6;
 }
 .chat-header-avatar {
   width: 44px; height: 44px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #1e293b, #334155);
   display: flex; align-items: center; justify-content: center;
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 17px;
+  font-weight: 650;
+  color: #fff;
   flex-shrink: 0;
-  border: 1px solid var(--border);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 4px 14px rgba(0, 0, 0, 0.35);
+  position: relative;
+}
+.chat-header-avatar::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.32), transparent 45%);
 }
 .chat-header-info { flex: 1; min-width: 0; }
-.chat-header-name { font-size: 17px; font-weight: 700; margin-bottom: 2px; }
-.chat-header-sub {
-  font-size: 13px;
-  color: var(--text2);
+.chat-header-name {
+  font-size: 16px;
+  font-weight: 650;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.chat-header-actions { display: flex; gap: 10px; }
+.chat-header-sub {
+  font-size: 11.5px;
+  color: var(--text3);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-header-actions { display: flex; gap: 8px; align-items: center; }
 
+/* ── Messages ──────────────────────────────────────────────────────────── */
 .messages-wrap {
   flex: 1;
   overflow-y: auto;
-  padding: 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  padding: 22px 26px 10px;
   scroll-behavior: smooth;
+  overscroll-behavior: contain;
 }
 
-/* Drop overlay */
-.drop-overlay {
-  display: none;
-  position: absolute;
-  inset: 0;
-  background: rgba(3, 5, 8, 0.85);
-  backdrop-filter: blur(10px);
-  border: 2px dashed var(--accent);
-  border-radius: var(--rad);
-  z-index: 20;
-  align-items: center;
-  justify-content: center;
-  flex-direction: column;
-  gap: 12px;
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--accent);
-  pointer-events: none;
-  animation: fadeIn 0.2s;
-}
-.drop-overlay.active { display: flex; }
-#main { position: relative; }
-
-/* Date divider */
 .date-divider {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin: 16px 0;
-  color: var(--text3);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
+  text-align: center;
+  margin: 18px 0 12px;
+  position: relative;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
+  color: var(--text3);
 }
-.date-divider::before, .date-divider::after {
+.date-divider::before {
   content: '';
-  flex: 1;
+  position: absolute;
+  left: 0; right: 0; top: 50%;
   height: 1px;
-  background: linear-gradient(90deg, transparent, var(--border), transparent);
+  background: linear-gradient(90deg, transparent, var(--glass-border-hover) 20%, var(--glass-border-hover) 80%, transparent);
+}
+.date-divider span {
+  position: relative;
+  background: linear-gradient(180deg, rgba(13, 19, 30, 0.92), rgba(13, 19, 30, 0.75));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 4px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-border);
 }
 
-/* Messages */
-.msg-group { display: flex; flex-direction: column; margin: 4px 0; }
-.msg-group.flash .msg-bubble { animation: msg-flash 1.6s ease-out; }
-@keyframes msg-flash {
-  0% { box-shadow: 0 0 0 3px var(--accent2); }
-  100% { box-shadow: none; }
+.msg-group {
+  display: flex;
+  flex-direction: column;
+  margin: 3px 0;
+  position: relative;
+  animation: msgIn 0.28s cubic-bezier(0.2, 0.8, 0.25, 1);
 }
 .msg-group.out { align-items: flex-end; }
 .msg-group.in { align-items: flex-start; }
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(9px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* Only animate messages that arrive live, not the whole re-rendered list:
+   JS stamps .live on freshly appended rows. */
+.msg-group { animation: none; }
+.msg-group.live { animation: msgIn 0.28s cubic-bezier(0.2, 0.8, 0.25, 1); }
+/* Consecutive messages from the same sender tighten up into a run. */
+.msg-group.same-sender { margin-top: 1px; }
+.msg-group.same-sender .msg-sender { display: none; }
 
 .msg-sender {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text2);
-  margin: 0 6px 2px;
-  max-width: 70%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  margin: 10px 6px 3px;
+  letter-spacing: 0.01em;
 }
 
 .msg-bubble {
-  max-width: 70%;
-  padding: 12px 16px;
-  border-radius: 20px;
+  max-width: 68%;
+  padding: 9px 14px 10px;
+  border-radius: 18px;
   position: relative;
-  word-break: break-word;
-  line-height: 1.6;
-  font-size: 15px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.15);
-  animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(12px) scale(0.98); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-.msg-group.out .msg-bubble {
-  background: var(--out-bg);
-  border: none;
-  border-bottom-right-radius: 6px;
-  color: #fff;
-  box-shadow: 0 4px 16px rgba(0, 210, 255, 0.2);
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  transition: box-shadow 0.2s;
 }
 .msg-group.in .msg-bubble {
-  background: var(--s3);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 6px;
+  background: var(--in-bg);
+  backdrop-filter: blur(14px) saturate(1.1);
+  -webkit-backdrop-filter: blur(14px) saturate(1.1);
+  border: 1px solid var(--glass-border);
+  border-top-left-radius: 7px;
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.28), var(--glass-inset);
 }
+.msg-group.out .msg-bubble {
+  background: var(--out-bg);
+  border: 1px solid var(--out-border);
+  border-top-right-radius: 7px;
+  box-shadow: 0 4px 18px rgba(79, 124, 255, 0.16), var(--glass-inset);
+}
+.msg-group.out .msg-bubble a { color: #eaf6ff; }
+.msg-bubble:hover {
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
+}
+
+/* Reply quote block inside a bubble */
+.reply-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-width: 420px;
+  padding: 5px 10px 6px;
+  margin: -1px 0 7px;
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.26);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s;
+  text-align: left;
+}
+.msg-group.out .reply-quote { border-left-color: rgba(255, 255, 255, 0.75); }
+.reply-quote:hover { background: rgba(0, 0, 0, 0.4); transform: translateX(2px); }
+.reply-quote .rq-sender {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.msg-group.out .reply-quote .rq-sender { color: #dff0ff; }
+.reply-quote .rq-body {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 380px;
+}
+.msg-group.out .reply-quote .rq-body { color: rgba(234, 242, 250, 0.75); }
+.reply-quote .rq-missing { font-size: 12px; color: var(--text3); font-style: italic; }
+
+/* Edited label */
+.edited-label {
+  display: inline-block;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.55);
+  margin-left: 7px;
+  font-style: italic;
+  vertical-align: baseline;
+  cursor: help;
+  user-select: none;
+}
+.msg-group.in .edited-label { color: var(--text3); }
+
+/* Tombstone (deleted for everyone) */
+.msg-bubble.tombstone {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border: 1px dashed rgba(255, 255, 255, 0.16) !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none !important;
+  color: var(--text3);
+  font-style: italic;
+  font-size: 13.5px;
+}
+.msg-bubble.tombstone .tombstone-icon { margin-right: 6px; opacity: 0.8; }
 
 .msg-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  font-size: 11px;
+  gap: 6px;
+  font-size: 10.5px;
   color: var(--text3);
-  padding: 0 6px;
+  margin: 4px 8px 0;
+  min-height: 16px;
 }
-.msg-group.out .msg-meta { flex-direction: row-reverse; }
+.msg-status { display: inline-flex; }
+.check { color: var(--text3); font-size: 11px; letter-spacing: -1.5px; }
+.check.delivered { color: var(--accent2); }
+.check.read { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
 
-.msg-status { display: flex; align-items: center; }
-.check { color: var(--text3); font-size: 14px; }
-.check.delivered { color: var(--text2); }
-.check.read { color: var(--accent); filter: drop-shadow(0 0 2px var(--accent-glow)); }
-
-.msg-image {
-  max-width: 320px;
-  max-height: 240px;
+/* ── Hover toolbar (reply / edit / copy / delete) ───────────────────────── */
+.msg-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  background: rgba(16, 23, 37, 0.92);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border: 1px solid var(--glass-border-hover);
   border-radius: 12px;
-  display: block;
+  padding: 3px;
+  z-index: 12;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(6px) scale(0.96);
+  transition: opacity 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+              transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+              visibility 0.18s;
+}
+.msg-group.out .msg-tools { right: 6px; }
+.msg-group.in .msg-tools { left: 6px; }
+.msg-bubble:hover .msg-tools,
+.msg-tools:hover,
+.msg-tools:focus-within {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0) scale(1);
+}
+.msg-tool-btn {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text2);
   cursor: pointer;
-  object-fit: cover;
-  border: 1px solid rgba(255,255,255,0.1);
-  transition: transform 0.2s;
+  font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
 }
-.msg-image:hover {
-  transform: scale(1.02);
+.msg-tool-btn:hover, .msg-tool-btn:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+.msg-tool-btn.danger:hover, .msg-tool-btn.danger:focus-visible {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.tools-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--glass-border);
+  margin: 0 3px;
+  flex-shrink: 0;
+}
+@media (hover: none), (max-width: 768px) {
+  .msg-tools {
+    opacity: 1; visibility: visible; transform: none;
+    position: static;
+    margin: 4px 0 2px;
+    box-shadow: none;
+    align-self: flex-start;
+  }
+  .msg-group.out .msg-tools { align-self: flex-end; }
 }
 
+/* Legacy meta-row actions kept for keyboard/touch reachability */
+.msg-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.2s;
+  margin-left: 6px;
+}
+.msg-group.in .msg-actions { margin-left: 0; margin-right: 6px; }
+.msg-bubble:hover ~ .msg-meta .msg-actions,
+.msg-meta:hover .msg-actions,
+.msg-meta:focus-within .msg-actions { opacity: 1; }
+@media (hover: none), (max-width: 768px) {
+  .msg-actions { opacity: 1; }
+}
+.msg-action-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text3); font-size: 11px; padding: 2px 6px;
+  border-radius: 5px; transition: all 0.15s;
+}
+.msg-action-btn:hover, .msg-action-btn:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--text1); }
+
+/* ── Attachments ───────────────────────────────────────────────────────── */
 .attachment-card {
-  width: min(340px, 68vw);
-  color: var(--text1);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(340px, 100%);
+  padding: 8px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.1);
 }
-.attachment-preview-link { display: block; color: inherit; text-decoration: none; }
-.attachment-preview-link .msg-image { width: 100%; max-width: none; }
+.msg-image {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 9px;
+  display: block;
+  cursor: zoom-in;
+  transition: filter 0.2s;
+}
+.msg-image:hover { filter: brightness(1.06); }
+.attachment-preview-link { display: block; }
 .attachment-head {
-  display: flex; align-items: center; gap: 10px; min-width: 0;
-  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 6px 4px;
 }
-.attachment-head:first-child { padding-top: 0; }
 .attachment-name {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; font-size: 13px; font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
 }
-.attachment-meta { color: var(--text3); font-size: 11px; font-family: var(--mono); }
+.attachment-meta { font-size: 11px; color: var(--text3); font-family: var(--mono); }
 .attachment-download {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 32px; height: 32px; border: 1px solid rgba(255,255,255,.14);
-  border-radius: 8px; color: inherit; text-decoration: none; flex: 0 0 auto;
+  margin-left: auto;
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 16px;
+  border: 1px solid var(--glass-border);
+  transition: all 0.2s;
+  flex-shrink: 0;
 }
-.attachment-download:hover { background: rgba(255,255,255,.1); }
-.attachment-audio { width: 100%; height: 38px; margin-top: 10px; display: block; }
-.attachment-video { width: 100%; max-height: 260px; display: block; border-radius: 8px; background: #000; }
-.msg-group.out .attachment-meta { color: rgba(255,255,255,.72); }
+.attachment-download:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: 0 0 12px var(--accent-soft);
+}
+.attachment-audio { width: 100%; height: 36px; }
+.attachment-video {
+  width: 100%;
+  max-height: 320px;
+  border-radius: 9px;
+  background: #000;
+}
+.file-msg-icon { font-size: 22px; flex-shrink: 0; }
 
-/* Inline file-message chip (non-image files shown in the chat timeline) */
 .file-msg-chip {
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 220px;
-  max-width: 280px;
+  max-width: 300px;
   padding: 10px 14px;
   border-radius: 12px;
-  background: rgba(0,0,0,0.25);
-  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(0, 0, 0, 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   color: var(--text1);
   text-decoration: none;
   transition: all 0.2s;
 }
 .file-msg-chip:hover {
-  background: rgba(0,0,0,0.4);
-  border-color: var(--border2);
+  background: rgba(0, 0, 0, 0.42);
+  border-color: var(--glass-border-hover);
   transform: translateY(-1px);
 }
-.msg-group.out .file-msg-chip { background: rgba(0,0,0,0.25); color: #fff; }
-.file-msg-icon { font-size: 22px; flex-shrink: 0; }
+.msg-group.out .file-msg-chip { background: rgba(0, 0, 0, 0.24); color: #fff; }
 .file-msg-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .file-msg-name {
   font-size: 13px; font-weight: 600;
@@ -5060,47 +5774,20 @@ body {
 .inline-link {
   color: var(--accent);
   text-decoration: none;
-  border-bottom: 1px solid rgba(0, 210, 255, 0.4);
+  border-bottom: 1px solid rgba(69, 216, 255, 0.4);
   word-break: break-all;
   transition: all 0.15s;
 }
-.inline-link:hover { border-bottom-color: var(--accent); text-shadow: 0 0 6px var(--accent-glow); }
-.msg-group.out .inline-link { color: #fff; border-bottom-color: rgba(255,255,255,0.5); }
+.inline-link:hover { border-bottom-color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
+.msg-group.out .inline-link { color: #eaf6ff; border-bottom-color: rgba(255, 255, 255, 0.5); }
 .msg-group.out .inline-link:hover { border-bottom-color: #fff; }
 
-/* Chat message hover actions (copy, delete) */
-.msg-actions {
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 0.2s;
-  margin-left: 6px;
-}
-.msg-group.in .msg-actions { margin-left: 0; margin-right: 6px; }
-.msg-bubble:hover ~ .msg-meta .msg-actions,
-.msg-meta:hover .msg-actions,
-.msg-meta:focus-within .msg-actions { opacity: 1; }
-/* Touch devices have no hover state at all, so hover-gated actions would
-   otherwise be permanently invisible and unreachable there — always show
-   them below the ~tablet breakpoint and on any device that reports no
-   hover capability. */
-@media (hover: none), (max-width: 768px) {
-  .msg-actions { opacity: 1; }
-}
-.msg-action-btn {
-  background: none; border: none; cursor: pointer;
-  color: var(--text3); font-size: 11px; padding: 2px 6px;
-  border-radius: 4px; transition: all 0.15s;
-}
-.msg-action-btn:hover, .msg-action-btn:focus-visible { background: rgba(255,255,255,0.08); color: var(--text1); }
-
-/* Reactions */
+/* ── Reactions ─────────────────────────────────────────────────────────── */
 .reactions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: -6px;
-  margin-bottom: 4px;
+  margin: 5px 8px 2px;
   z-index: 2;
   position: relative;
 }
@@ -5108,44 +5795,47 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 8px;
+  padding: 3px 9px;
   border-radius: 999px;
-  background: var(--s2);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
+  background: rgba(20, 28, 44, 0.85);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--glass-border);
   font-size: 13px;
   cursor: pointer;
   transition: all 0.2s;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
-.reaction-chip:hover { 
-  border-color: var(--accent); 
+.reaction-chip:hover {
+  border-color: var(--accent);
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
 }
-.reaction-chip.mine { 
-  border-color: var(--accent); 
-  background: rgba(0, 210, 255, 0.1); 
+.reaction-chip.mine {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 12px var(--accent-soft);
 }
 
 .reaction-bar {
   display: flex;
   opacity: 0;
   visibility: hidden;
-  transform: translateY(10px) scale(0.95);
+  transform: translateY(8px) scale(0.95);
   position: absolute;
-  bottom: calc(100% + 8px);
-  background: var(--s2);
-  backdrop-filter: blur(12px);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 6px;
-  gap: 4px;
-  z-index: 10;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-  transition: opacity 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
-              transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
-              visibility 0.2s;
+  bottom: calc(100% + 6px);
+  background: rgba(16, 23, 37, 0.92);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border: 1px solid var(--glass-border-hover);
+  border-radius: 13px;
+  padding: 5px;
+  gap: 2px;
+  z-index: 11;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  transition: opacity 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+              transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+              visibility 0.18s;
   transition-delay: 1.5s;
 }
 .msg-group.out .reaction-bar { right: 0; }
@@ -5163,9 +5853,6 @@ body {
   transform: translateY(0) scale(1);
   transition-delay: 0s;
 }
-/* Same touch-accessibility rationale as .msg-actions above: without a real
-   hover state, this bar would never appear on a touchscreen. It's shown
-   inline instead of as a hover flyout below the tablet breakpoint. */
 @media (hover: none), (max-width: 768px) {
   .reaction-bar {
     opacity: 1; visibility: visible; transform: none;
@@ -5173,21 +5860,21 @@ body {
   }
 }
 .reaction-btn {
-  width: 36px; height: 36px;
-  border-radius: 10px;
+  width: 34px; height: 34px;
+  border-radius: 9px;
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 18px;
+  font-size: 17px;
   display: flex; align-items: center; justify-content: center;
   transition: all 0.2s;
 }
-.reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255,255,255,0.1); transform: scale(1.1); }
+.reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255, 255, 255, 0.09); transform: scale(1.12); }
 
-/* Typing indicator */
+/* ── Typing indicator ──────────────────────────────────────────────────── */
 #typing-indicator {
-  padding: 0 24px 12px;
-  min-height: 32px;
+  padding: 0 26px 10px;
+  min-height: 30px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -5198,48 +5885,116 @@ body {
   display: flex;
   gap: 4px;
   align-items: center;
-  background: var(--s3);
-  padding: 8px 12px;
+  background: var(--in-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  padding: 7px 12px;
   border-radius: 16px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
+  border-bottom-left-radius: 5px;
 }
 .typing-dot {
   width: 6px; height: 6px;
   border-radius: 50%;
   background: var(--accent);
   animation: bounce 1.4s infinite ease-in-out;
-  box-shadow: 0 0 4px var(--accent-glow);
+  box-shadow: 0 0 5px var(--accent-glow);
 }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
 @keyframes bounce {
-  0%,80%,100% { transform: translateY(0); opacity: 0.4; }
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
   40% { transform: translateY(-4px); opacity: 1; }
 }
 
-/* Composer */
+/* ── Composer context bar (reply / edit) ───────────────────────────────── */
+.composer-context {
+  padding: 0 26px 8px;
+}
+.composer-context[hidden] { display: none; }
+.ctx-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 14px 14px 6px 6px;
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--glass-border);
+  border-bottom: 2px solid var(--accent);
+  animation: ctxIn 0.22s cubic-bezier(0.2, 0.8, 0.25, 1);
+}
+.ctx-bar.editing { border-bottom-color: var(--warn); }
+@keyframes ctxIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ctx-icon {
+  width: 30px; height: 30px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.ctx-bar.editing .ctx-icon { background: rgba(255, 200, 87, 0.14); color: var(--warn); }
+.ctx-body { flex: 1; min-width: 0; }
+.ctx-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.ctx-bar.editing .ctx-title { color: var(--warn); }
+.ctx-snippet {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+.ctx-cancel {
+  width: 28px; height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: transparent;
+  color: var(--text3);
+  cursor: pointer;
+  font-size: 13px;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.ctx-cancel:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+/* ── Composer ──────────────────────────────────────────────────────────── */
 .composer {
-  padding: 16px 24px 20px;
-  border-top: 1px solid var(--border);
-  background: rgba(10, 15, 25, 0.6);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  padding: 12px 26px 16px;
+  border-top: 1px solid var(--glass-border);
+  background: var(--glass-panel);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
   z-index: 5;
+  box-shadow: var(--glass-inset);
 }
 .composer-inner {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: flex-end;
-  background: rgba(0,0,0,0.3);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 10px 14px;
-  transition: all 0.3s;
-  box-shadow: inset 0 2px 8px rgba(0,0,0,0.2);
+  background: rgba(4, 8, 15, 0.55);
+  border: 1px solid var(--glass-border);
+  border-radius: 18px;
+  padding: 9px 12px;
+  transition: border-color 0.25s, box-shadow 0.25s;
+  box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.3);
 }
-.composer-inner:focus-within { 
-  border-color: var(--accent); 
-  box-shadow: 0 0 0 3px rgba(0, 210, 255, 0.15), inset 0 2px 8px rgba(0,0,0,0.2);
+.composer-inner:focus-within {
+  border-color: rgba(69, 216, 255, 0.55);
+  box-shadow: 0 0 0 3px var(--accent-soft), 0 0 24px rgba(69, 216, 255, 0.08),
+              inset 0 2px 10px rgba(0, 0, 0, 0.3);
 }
 #text {
   flex: 1;
@@ -5256,19 +6011,19 @@ body {
   padding-bottom: 4px;
 }
 #text::placeholder { color: var(--text3); }
-.composer-actions { display: flex; align-items: center; gap: 6px; }
+.composer-actions { display: flex; align-items: center; gap: 5px; }
 .icon-btn {
   width: 38px; height: 38px;
   display: flex; align-items: center; justify-content: center;
   background: none; border: none; cursor: pointer;
   color: var(--text2);
-  border-radius: 10px;
-  font-size: 20px;
+  border-radius: 11px;
+  font-size: 19px;
   transition: all 0.2s;
 }
-.icon-btn:hover { 
-  background: rgba(255,255,255,0.05); 
-  color: var(--accent); 
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--accent);
   transform: translateY(-1px);
 }
 .send-btn {
@@ -5276,25 +6031,29 @@ body {
   display: flex; align-items: center; justify-content: center;
   background: linear-gradient(135deg, var(--accent2), var(--accent));
   border: none; cursor: pointer;
-  color: #fff;
+  color: #04121f;
+  font-weight: 800;
   border-radius: 12px;
-  font-size: 18px;
+  font-size: 17px;
   transition: all 0.2s;
   flex-shrink: 0;
-  box-shadow: 0 4px 12px var(--accent-glow);
+  box-shadow: 0 4px 16px var(--accent-glow);
 }
-.send-btn:hover { 
+.send-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 6px 16px var(--accent-glow);
+  box-shadow: 0 6px 22px var(--accent-glow);
+  filter: brightness(1.08);
 }
-.send-btn:active { transform: scale(0.95); }
-.send-btn:disabled { 
-  opacity: 0.4; 
-  cursor: not-allowed; 
-  background: var(--s4); 
+.send-btn:active { transform: scale(0.94); }
+.send-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: var(--s4);
+  color: var(--text3);
   box-shadow: none;
   transform: none;
 }
+.send-btn.saving { background: linear-gradient(135deg, #f5b642, var(--warn)); color: #1c1206; box-shadow: 0 4px 16px rgba(255, 200, 87, 0.3); }
 
 .char-hint {
   font-size: 11px;
@@ -5303,29 +6062,30 @@ body {
   margin-top: 6px;
   font-family: var(--mono);
 }
+.char-hint.danger { color: var(--danger); font-weight: 700; }
 .transfer-status {
   min-height: 20px; margin-top: 7px; display: flex; align-items: center; gap: 8px;
   color: var(--text2); font-size: 11px;
 }
 .transfer-status:empty { min-height: 0; margin-top: 0; }
 .transfer-status .progress-track {
-  width: 96px; height: 4px; overflow: hidden; background: rgba(255,255,255,.1); border-radius: 2px;
+  width: 96px; height: 4px; overflow: hidden; background: rgba(255, 255, 255, 0.1); border-radius: 2px;
 }
-.transfer-status .progress-fill { height: 100%; background: var(--accent); transition: width .15s linear; }
-.icon-btn.busy { opacity: .45; pointer-events: none; }
+.transfer-status .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); transition: width 0.15s linear; }
+.icon-btn.busy { opacity: 0.45; pointer-events: none; }
 
-/* ── Right panel ── */
+/* ── Right panel ───────────────────────────────────────────────────────── */
 .panel-section {
-  padding: 18px 20px;
-  border-bottom: 1px solid var(--border);
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--glass-border);
 }
 .panel-title {
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 11.5px;
+  font-weight: 750;
   text-transform: uppercase;
-  letter-spacing: 0.15em;
+  letter-spacing: 0.14em;
   color: var(--text3);
-  margin-bottom: 14px;
+  margin-bottom: 13px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -5334,52 +6094,54 @@ body {
   content: '';
   flex: 1;
   height: 1px;
-  background: linear-gradient(90deg, var(--border), transparent);
+  background: linear-gradient(90deg, var(--glass-border-hover), transparent);
 }
 
 .stat-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  gap: 10px;
 }
 .stat-box {
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.24);
+  border: 1px solid var(--glass-border);
   border-radius: 12px;
-  padding: 14px;
+  padding: 12px;
   text-align: center;
   transition: all 0.2s;
+  box-shadow: var(--glass-inset);
 }
 .stat-box:hover {
-  background: rgba(255,255,255,0.03);
-  border-color: var(--border2);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--glass-border-hover);
   transform: translateY(-2px);
 }
-.stat-box b { 
-  display: block; 
-  font-size: 24px; 
-  font-weight: 700; 
-  margin-bottom: 4px;
-  background: linear-gradient(135deg, var(--accent2), var(--accent));
+.stat-box b {
+  display: block;
+  font-size: 23px;
+  font-weight: 750;
+  margin-bottom: 3px;
+  background: linear-gradient(135deg, #9fc6ff, var(--accent));
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
 }
-.stat-box span { font-size: 11px; color: var(--text2); text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }
+.stat-box span { font-size: 10.5px; color: var(--text2); text-transform: uppercase; font-weight: 650; letter-spacing: 0.06em; }
 
 .session-item {
-  padding: 12px;
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
+  padding: 11px 12px;
+  background: rgba(0, 0, 0, 0.24);
+  border: 1px solid var(--glass-border);
   border-radius: 12px;
   margin-bottom: 8px;
   font-size: 13px;
   transition: all 0.2s;
 }
 .session-item:hover {
-  border-color: var(--border2);
-  background: rgba(255,255,255,0.02);
+  border-color: var(--glass-border-hover);
+  background: rgba(255, 255, 255, 0.03);
 }
-.session-item-name { font-weight: 600; margin-bottom: 4px; font-size: 14px; }
+.session-item-name { font-weight: 650; margin-bottom: 4px; font-size: 13.5px; }
 .session-item-meta { color: var(--text2); font-family: var(--mono); font-size: 11px; }
 .session-age {
   font-size: 11px;
@@ -5391,40 +6153,40 @@ body {
 .session-age .bar {
   flex: 1;
   height: 4px;
-  background: rgba(255,255,255,0.1);
+  background: rgba(255, 255, 255, 0.1);
   border-radius: 2px;
   overflow: hidden;
 }
 .session-age .fill {
   height: 100%;
-  background: linear-gradient(90deg, #34d39a, #10b981);
+  background: linear-gradient(90deg, #3ddc97, #10b981);
   border-radius: 2px;
   transition: width 0.3s;
-  box-shadow: 0 0 6px rgba(16, 185, 129, 0.4);
+  box-shadow: 0 0 8px rgba(61, 220, 151, 0.4);
 }
-.session-age .fill.warn { background: linear-gradient(90deg, #fbbf24, #f59e0b); box-shadow: 0 0 6px rgba(245, 158, 11, 0.4); }
-.session-age .fill.danger { background: linear-gradient(90deg, #fb7185, #e11d48); box-shadow: 0 0 6px rgba(225, 29, 72, 0.4); }
+.session-age .fill.warn { background: linear-gradient(90deg, #ffd57e, #f5a623); box-shadow: 0 0 8px rgba(245, 166, 35, 0.4); }
+.session-age .fill.danger { background: linear-gradient(90deg, #ff8ba0, #e5484d); box-shadow: 0 0 8px rgba(229, 72, 77, 0.4); }
 
 .file-item {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 14px;
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.24);
+  border: 1px solid var(--glass-border);
   border-radius: 12px;
   margin-bottom: 8px;
   transition: all 0.2s;
 }
 .file-item:hover {
   transform: translateY(-2px);
-  border-color: var(--border2);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  border-color: var(--glass-border-hover);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
 }
-.file-icon { 
-  font-size: 24px; 
-  flex-shrink: 0; 
-  background: rgba(255,255,255,0.05);
+.file-icon {
+  font-size: 22px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.05);
   width: 40px; height: 40px;
   display: flex; align-items: center; justify-content: center;
   border-radius: 10px;
@@ -5440,134 +6202,148 @@ body {
 }
 .file-meta { font-size: 11px; color: var(--text2); }
 .file-dl {
-  font-size: 20px;
+  font-size: 18px;
   color: var(--text3);
   text-decoration: none;
   transition: all 0.2s;
   flex-shrink: 0;
   width: 32px; height: 32px;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 8px;
+  border-radius: 9px;
+  border: 1px solid var(--glass-border);
 }
-.file-dl:hover { 
-  color: var(--accent); 
-  background: rgba(0, 210, 255, 0.1);
+.file-dl:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 .file-audio { width: 100%; height: 32px; margin-top: 6px; }
 .file-audio::-webkit-media-controls-panel { background: var(--s3); }
 
-/* ── Storage quota ── */
+/* ── Storage quota ─────────────────────────────────────────────────────── */
 .quota-row { font-size: 11px; margin-top: 8px; }
 .quota-row .bar {
-  height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; margin-top: 6px;
+  height: 5px; background: rgba(255, 255, 255, 0.1); border-radius: 3px; overflow: hidden; margin-top: 6px;
 }
 .quota-row .fill {
-  height: 100%; border-radius: 2px; transition: width 0.3s;
+  height: 100%; border-radius: 3px; transition: width 0.3s;
   background: linear-gradient(90deg, var(--accent2), var(--accent));
-  box-shadow: 0 0 6px var(--accent-glow);
+  box-shadow: 0 0 8px var(--accent-glow);
 }
-.quota-row .fill.warn { background: linear-gradient(90deg, #fbbf24, #f59e0b); box-shadow: 0 0 6px rgba(245, 158, 11, 0.4); }
-.quota-row .fill.danger { background: linear-gradient(90deg, #fb7185, #e11d48); box-shadow: 0 0 6px rgba(225, 29, 72, 0.4); }
+.quota-row .fill.warn { background: linear-gradient(90deg, #ffd57e, #f5a623); box-shadow: 0 0 8px rgba(245, 166, 35, 0.4); }
+.quota-row .fill.danger { background: linear-gradient(90deg, #ff8ba0, #e5484d); box-shadow: 0 0 8px rgba(229, 72, 77, 0.4); }
 .quota-label { display: flex; justify-content: space-between; color: var(--text2); }
 
-/* ── Group member management ── */
+/* ── Group member management ───────────────────────────────────────────── */
 .member-row {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-radius: 10px;
-  background: rgba(0,0,0,0.2); border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.24); border: 1px solid var(--glass-border);
   margin-bottom: 6px; font-size: 12px;
 }
 .member-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); }
 .member-row .role-tag {
   font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
-  color: var(--text3); background: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 999px;
+  color: var(--text3); background: rgba(255, 255, 255, 0.05); padding: 2px 7px; border-radius: 999px;
 }
 .member-row .rm-btn {
   background: none; border: none; color: var(--text3); cursor: pointer; font-size: 14px;
   width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
 }
-.member-row .rm-btn:hover { color: var(--danger); background: rgba(255, 51, 102, 0.1); }
+.member-row .rm-btn:hover { color: var(--danger); background: var(--danger-soft); }
 
-/* ── Load more history ── */
+/* ── Load more history ─────────────────────────────────────────────────── */
 .load-more-row { display: flex; justify-content: center; padding: 4px 0 14px; }
 .load-more-btn {
-  font-size: 12px; color: var(--text2); background: var(--s3);
-  border: 1px solid var(--border); border-radius: 999px; padding: 6px 16px; cursor: pointer;
+  font-size: 12px; color: var(--text2); background: rgba(20, 28, 44, 0.8);
+  border: 1px solid var(--glass-border); border-radius: 999px; padding: 7px 18px; cursor: pointer;
   transition: all 0.2s;
 }
-.load-more-btn:hover { border-color: var(--border2); color: var(--text1); }
+.load-more-btn:hover { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 14px var(--accent-soft); }
 
-/* ── Recording mic button ── */
+/* ── Recording ─────────────────────────────────────────────────────────── */
 .icon-btn.recording {
   color: var(--danger);
   animation: recPulse 1.2s infinite;
 }
 @keyframes recPulse {
-  0%,100% { opacity: 1; } 50% { opacity: 0.45; }
+  0%, 100% { opacity: 1; } 50% { opacity: 0.45; }
 }
 .rec-indicator {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--danger); font-family: var(--mono);
-  padding: 0 24px 8px;
+  padding: 0 26px 8px;
 }
 .rec-indicator .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--danger);
-  box-shadow: 0 0 6px var(--danger); animation: pulse 1s infinite;
+  box-shadow: 0 0 8px var(--danger); animation: pulse 1s infinite;
 }
 .rec-cancel {
-  margin-left: 8px; padding: 3px 8px; border: 1px solid rgba(255,51,102,.45);
+  margin-left: 8px; padding: 3px 9px; border: 1px solid rgba(255, 93, 125, 0.45);
   border-radius: 6px; background: transparent; color: var(--danger); cursor: pointer;
 }
 
-/* ── Modal (identity backup / restore) ── */
+/* ── Modals ────────────────────────────────────────────────────────────── */
 .modal-overlay {
-  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-  backdrop-filter: blur(4px); z-index: 100;
+  display: none; position: fixed; inset: 0; background: rgba(2, 5, 10, 0.66);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 100;
   align-items: center; justify-content: center;
 }
 .modal-overlay.open { display: flex; }
 .modal {
-  width: 420px; max-width: 92vw; max-height: 84vh; overflow-y: auto;
-  background: var(--s2); border: 1px solid var(--border2); border-radius: var(--rad);
-  box-shadow: var(--glass-shadow); padding: 22px;
+  width: 440px; max-width: 92vw; max-height: 84vh; overflow-y: auto;
+  background: rgba(15, 21, 33, 0.96);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  border: 1px solid var(--glass-border-hover); border-radius: var(--rad-lg);
+  box-shadow: var(--glass-shadow), var(--glass-inset); padding: 24px;
+  animation: modalIn 0.24s cubic-bezier(0.2, 0.8, 0.25, 1);
 }
-.modal h2 { font-size: 16px; margin-bottom: 6px; }
-.modal p.hint { font-size: 12px; color: var(--text2); margin-bottom: 14px; line-height: 1.5; }
+@keyframes modalIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.modal h2 { font-size: 17px; margin-bottom: 6px; font-weight: 700; }
+.modal p.hint { font-size: 12px; color: var(--text2); margin-bottom: 14px; line-height: 1.55; }
 .modal .field { margin-bottom: 10px; }
 .modal textarea.field { min-height: 90px; font-family: var(--mono); font-size: 11px; resize: vertical; }
 .modal-tabs { display: flex; gap: 6px; margin-bottom: 16px; }
 .modal-tabs button {
-  flex: 1; padding: 8px; font-size: 12px; border-radius: 8px; border: 1px solid var(--border);
-  background: var(--s3); color: var(--text2); cursor: pointer;
+  flex: 1; padding: 8px; font-size: 12px; border-radius: 9px; border: 1px solid var(--glass-border);
+  background: rgba(0, 0, 0, 0.25); color: var(--text2); cursor: pointer; transition: all 0.2s;
 }
-.modal-tabs button.active { color: #fff; border-color: var(--accent2); background: rgba(58,134,255,0.15); }
+.modal-tabs button.active { color: #fff; border-color: rgba(79, 124, 255, 0.55); background: var(--accent2-soft); }
 .modal-actions { display: flex; gap: 8px; margin-top: 14px; }
 
-/* ── Message search ── */
+/* ── Message search ────────────────────────────────────────────────────── */
 .search-results { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .search-result-item {
   text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px;
-  border: 1px solid var(--border); background: var(--s3); color: var(--text);
-  cursor: pointer; font-size: 13px; line-height: 1.4;
+  border: 1px solid var(--glass-border); background: rgba(0, 0, 0, 0.24); color: var(--text1);
+  cursor: pointer; font-size: 13px; line-height: 1.45; transition: all 0.15s;
 }
-.search-result-item:hover, .search-result-item:focus-visible { border-color: var(--accent2); background: rgba(58,134,255,0.1); }
+.search-result-item:hover, .search-result-item:focus-visible { border-color: var(--accent); background: var(--accent-soft); }
 .search-result-meta { font-size: 11px; color: var(--text3); margin-bottom: 4px; }
 .search-empty { font-size: 12px; color: var(--text3); text-align: center; padding: 18px 0; }
 
-/* ── Calls ── */
+/* ── Calls ─────────────────────────────────────────────────────────────── */
 .call-modal { text-align: center; }
 .call-modal-avatar {
   width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 14px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 30px; background: linear-gradient(135deg, var(--accent2), var(--accent));
+  font-size: 30px;
+  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.4), transparent 45%),
+              linear-gradient(135deg, var(--accent2), var(--accent));
   animation: call-pulse 1.4s ease-in-out infinite;
 }
 @keyframes call-pulse {
   0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
-  50% { box-shadow: 0 0 0 14px rgba(58,134,255,0); }
+  50% { box-shadow: 0 0 0 16px rgba(69, 216, 255, 0); }
 }
 .call-overlay {
-  position: fixed; inset: 0; z-index: 200; background: #050608;
+  position: fixed; inset: 0; z-index: 200; background: #04070d;
   display: flex; align-items: center; justify-content: center;
 }
 .call-overlay[hidden] { display: none; }
@@ -5577,16 +6353,18 @@ body {
 }
 #localVideo {
   position: absolute; bottom: 96px; right: 20px; width: 140px; height: 100px;
-  object-fit: cover; border-radius: 12px; border: 2px solid var(--border2);
+  object-fit: cover; border-radius: 12px; border: 1px solid var(--glass-border-hover);
   box-shadow: var(--glass-shadow); background: #111; z-index: 2;
 }
 .call-overlay-info {
   position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center;
-  gap: 8px; color: #fff; text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+  gap: 8px; color: #fff; text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
 }
 .call-overlay-avatar {
   width: 88px; height: 88px; border-radius: 50%; display: flex; align-items: center;
-  justify-content: center; font-size: 34px; background: linear-gradient(135deg, var(--accent2), var(--accent));
+  justify-content: center; font-size: 34px;
+  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.4), transparent 45%),
+              linear-gradient(135deg, var(--accent2), var(--accent));
 }
 .call-overlay-name { font-size: 20px; font-weight: 700; }
 .call-overlay-status { font-size: 13px; opacity: 0.85; }
@@ -5595,28 +6373,19 @@ body {
   display: flex; gap: 16px; z-index: 3;
 }
 .call-btn {
-  width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
-  background: rgba(255,255,255,0.14); color: #fff; font-size: 22px;
+  width: 56px; height: 56px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.14); cursor: pointer;
+  background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: #fff; font-size: 22px;
   display: flex; align-items: center; justify-content: center; transition: all 0.15s;
 }
-.call-btn:hover { background: rgba(255,255,255,0.24); }
+.call-btn:hover { background: rgba(255, 255, 255, 0.2); }
 .call-btn:active { transform: scale(0.94); }
-.call-btn.call-btn-muted { background: rgba(255,255,255,0.35); }
-.call-btn-end { background: var(--danger, #e5484d); }
-.call-btn-end:hover { filter: brightness(1.1); }
+.call-btn.call-btn-muted { background: rgba(255, 255, 255, 0.32); }
+.call-btn-end { background: rgba(229, 72, 77, 0.85); border-color: transparent; }
+.call-btn-end:hover { filter: brightness(1.1); background: rgba(229, 72, 77, 0.95); }
 
-/* ── Add friend / group panels ── */
-.slide-panel {
-  background: rgba(0,0,0,0.15);
-  border-bottom: 1px solid var(--border);
-  overflow: hidden;
-  max-height: 0;
-  transition: max-height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
-}
-.slide-panel.open { max-height: 400px; }
-.slide-panel-inner { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
-
-/* ── Buttons ── */
+/* ── Buttons ───────────────────────────────────────────────────────────── */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -5626,46 +6395,47 @@ body {
   border-radius: 12px;
   font-family: var(--font);
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 620;
   border: none;
   cursor: pointer;
   transition: all 0.2s;
 }
 .btn:active { transform: scale(0.96); }
-.btn-primary { 
-  background: linear-gradient(135deg, var(--accent2), var(--accent)); 
-  color: #fff; 
-  box-shadow: 0 4px 12px var(--accent-glow);
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
+  color: #04121f;
+  box-shadow: 0 4px 16px var(--accent-glow);
 }
-.btn-primary:hover { 
-  box-shadow: 0 6px 16px var(--accent-glow); 
-  filter: brightness(1.1);
+.btn-primary:hover {
+  box-shadow: 0 6px 22px var(--accent-glow);
+  filter: brightness(1.07);
 }
-.btn-secondary { 
-  background: rgba(255,255,255,0.05); 
-  color: var(--text1); 
-  border: 1px solid var(--border); 
+.btn-secondary {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text1);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-inset);
 }
-.btn-secondary:hover { 
-  border-color: var(--border2); 
-  background: rgba(255,255,255,0.08);
+.btn-secondary:hover {
+  border-color: var(--glass-border-hover);
+  background: rgba(255, 255, 255, 0.08);
 }
-.btn-danger { 
-  background: rgba(255, 51, 102, 0.1); 
-  color: var(--danger); 
-  border: 1px solid rgba(255, 51, 102, 0.2); 
+.btn-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid rgba(255, 93, 125, 0.28);
 }
-.btn-danger:hover { 
-  background: rgba(255, 51, 102, 0.2); 
-  box-shadow: 0 4px 12px rgba(255, 51, 102, 0.2);
+.btn-danger:hover {
+  background: rgba(255, 93, 125, 0.2);
+  box-shadow: 0 4px 14px rgba(255, 93, 125, 0.2);
 }
-.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 8px; }
+.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 9px; }
 
-/* ── Inputs ── */
+/* ── Inputs ────────────────────────────────────────────────────────────── */
 .field {
   width: 100%;
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.26);
+  border: 1px solid var(--glass-border);
   border-radius: 12px;
   padding: 12px 16px;
   color: var(--text1);
@@ -5674,14 +6444,14 @@ body {
   outline: none;
   transition: all 0.2s;
 }
-.field:focus { 
-  border-color: var(--accent); 
-  background: rgba(0,0,0,0.4);
-  box-shadow: 0 0 0 3px rgba(0, 210, 255, 0.1);
+.field:focus {
+  border-color: var(--accent);
+  background: rgba(0, 0, 0, 0.42);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .field::placeholder { color: var(--text3); }
 
-/* ── Toast ── */
+/* ── Toasts ────────────────────────────────────────────────────────────── */
 #toasts {
   position: fixed;
   bottom: 24px;
@@ -5693,24 +6463,24 @@ body {
   max-width: 380px;
 }
 .toast {
-  padding: 16px 20px;
-  border-radius: 16px;
-  background: rgba(18, 25, 40, 0.85);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--border);
-  font-size: 14px;
-  animation: slideIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-  box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+  padding: 14px 18px;
+  border-radius: 14px;
+  background: rgba(15, 21, 33, 0.94);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border: 1px solid var(--glass-border);
+  font-size: 13.5px;
+  animation: slideIn 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.2);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.5), var(--glass-inset);
   display: flex;
   align-items: flex-start;
   gap: 12px;
 }
-.toast.info { border-left: 4px solid var(--accent); }
-.toast.success { border-left: 4px solid #34d39a; }
-.toast.error { border-left: 4px solid var(--danger); }
-.toast.warning { border-left: 4px solid var(--warn); }
-.toast-icon { flex-shrink: 0; font-size: 18px; margin-top: 2px; }
+.toast.info { border-left: 3px solid var(--accent); }
+.toast.success { border-left: 3px solid var(--ok); }
+.toast.error { border-left: 3px solid var(--danger); }
+.toast.warning { border-left: 3px solid var(--warn); }
+.toast-icon { flex-shrink: 0; font-size: 17px; margin-top: 1px; }
 @keyframes slideIn {
   from { transform: translateX(120%); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
@@ -5719,76 +6489,139 @@ body {
   from { opacity: 1; transform: scale(1); }
   to { opacity: 0; transform: scale(0.9); }
 }
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 
-/* ── Empty states ── */
+/* ── Empty states ──────────────────────────────────────────────────────── */
 .empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   flex: 1;
-  gap: 16px;
+  gap: 14px;
   color: var(--text3);
   text-align: center;
   padding: 40px;
 }
-.empty-state .emo { 
-  font-size: 48px; 
-  margin-bottom: 8px;
-  filter: drop-shadow(0 8px 16px rgba(0,0,0,0.2));
+.empty-state .emo {
+  font-size: 52px;
+  margin-bottom: 6px;
+  filter: drop-shadow(0 10px 22px rgba(69, 216, 255, 0.22));
 }
-.empty-state h3 { font-size: 18px; color: var(--text1); font-weight: 600; }
-.empty-state p { font-size: 14px; max-width: 280px; line-height: 1.6; }
+.empty-state h3 { font-size: 18px; color: var(--text1); font-weight: 650; }
+.empty-state p { font-size: 13.5px; max-width: 300px; line-height: 1.65; }
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { 
-  background: rgba(255,255,255,0.1); 
-  border-radius: 6px; 
-}
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
-
-/* ── Mode selector ── */
-.mode-tabs {
-  display: flex;
-  gap: 4px;
-  margin: 12px 16px;
-  border-radius: 12px;
-  overflow: hidden;
-  background: rgba(0,0,0,0.2);
-  border: 1px solid var(--border);
-  padding: 4px;
-}
-.mode-tab {
-  flex: 1;
-  padding: 8px;
-  text-align: center;
-  font-size: 13px;
+/* ── Drop overlay ──────────────────────────────────────────────────────── */
+.drop-overlay {
+  position: absolute;
+  inset: 14px;
+  border: 2px dashed var(--accent);
+  border-radius: var(--rad-lg);
+  background: rgba(69, 216, 255, 0.06);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 40;
+  color: var(--accent);
+  font-size: 15px;
   font-weight: 600;
-  cursor: pointer;
-  background: transparent;
-  color: var(--text2);
-  border: none;
-  border-radius: 8px;
-  transition: all 0.2s;
+  pointer-events: none;
+  box-shadow: inset 0 0 40px var(--accent-soft);
 }
-.mode-tab:hover { color: var(--text1); background: rgba(255,255,255,0.05); }
-.mode-tab.active { 
-  background: rgba(255,255,255,0.1); 
-  color: #fff; 
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-}
+.drop-overlay.active { display: flex; animation: fadeIn 0.2s; }
 
-/* ── Misc ── */
+/* ── Header menu ───────────────────────────────────────────────────────── */
+.chat-header-actions { min-width: 0; flex-wrap: nowrap; }
+.header-menu { position: relative; }
+.header-menu > summary { list-style: none; cursor: pointer; }
+.header-menu > summary::-webkit-details-marker { display: none; }
+.header-menu-items {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 200px; padding: 6px;
+  border: 1px solid var(--glass-border-hover); border-radius: 12px;
+  background: rgba(15, 21, 33, 0.97);
+  backdrop-filter: blur(20px) saturate(1.2);
+  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+}
+.header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 7px; padding: 9px 10px; }
+
+/* ── Scrollbars ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 178, 226, 0.14);
+  border-radius: 7px;
+  border: 1px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(148, 178, 226, 0.28); }
+
+/* ── Misc ──────────────────────────────────────────────────────────────── */
 .muted { color: var(--text2); }
 .mono { font-family: var(--mono); }
+button, input, textarea, select, summary { font: inherit; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
 
+.mobile-back { display: none; }
+.mobile-info-btn { display: none; }
+.panel-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 5, 10, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 140;
+}
+.panel-overlay.open { display: block; }
+.panel-close-btn { display: none; }
+.connection-hint { display: none; }
+
+/* Flash highlight for jump-to-message */
+.msg-group.flash .msg-bubble {
+  animation: flashBg 1.6s ease-out;
+}
+@keyframes flashBg {
+  0% { box-shadow: 0 0 0 2px var(--accent), 0 0 24px var(--accent-glow); }
+  100% { box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38); }
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────── */
 @media (max-width: 960px) {
   #panel { display: none; }
 }
+@media (max-width: 1080px) {
+  .mobile-info-btn { display: inline-flex !important; }
+  #panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 320px;
+    max-width: 85vw;
+    z-index: 150;
+    transform: translateX(100%);
+    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: -14px 0 44px rgba(0, 0, 0, 0.55);
+    background: rgba(10, 15, 24, 0.97);
+    backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+    overflow-y: auto;
+    display: flex !important;
+  }
+  #panel.drawer-open { transform: translateX(0); }
+  .panel-close-btn { display: inline-flex !important; }
+}
 @media (max-width: 768px) {
-  #sidebar { width: 280px; min-width: 280px; }
+  #sidebar { width: 300px; min-width: 300px; }
 }
 @media (max-width: 640px) {
   #sidebar { width: 72px; min-width: 72px; }
@@ -5803,103 +6636,12 @@ body {
   .id-card-head { justify-content: center; }
   .id-card-head > div:last-child { display: none; }
   .composer { padding: 12px; }
+  .composer-context { padding: 0 12px 6px; }
   .messages-wrap { padding-left: 12px; padding-right: 12px; }
   .msg-bubble { max-width: 88%; }
   .attachment-card { width: min(310px, 76vw); }
-}
-
-/* ── v3.3 workspace polish ────────────────────────────────────────────────
-   Keep the dense chat layout calm and legible on both a laptop and a phone.
-   These tokens intentionally use solid surfaces: message content stays the
-   visual focus and the UI remains readable when transparency is disabled. */
-:root {
-  --bg: #0b1016;
-  --glass-bg: #111922;
-  --s1: #111922;
-  --s2: #17232d;
-  --s3: #1c2a35;
-  --s4: #263844;
-  --border: #2a3b47;
-  --border2: #496271;
-  --accent: #52d3b5;
-  --accent-glow: rgba(82, 211, 181, .2);
-  --accent2: #5ba8ff;
-  --accent2-glow: rgba(91, 168, 255, .2);
-  --danger: #ff7185;
-  --warn: #f2c861;
-  --text1: #f4f7f8;
-  --text2: #afbec6;
-  --text3: #73838d;
-  --out-bg: #176d66;
-  --in-bg: #1c2a35;
-  --rad: 8px;
-}
-body { background: var(--bg); background-image: none; }
-#sidebar, #panel, .chat-header, .composer { background: var(--glass-bg); backdrop-filter: none; -webkit-backdrop-filter: none; }
-.app-logo .icon, .id-avatar, .call-modal-avatar, .call-overlay-avatar { background: var(--accent); -webkit-text-fill-color: currentColor; filter: none; box-shadow: none; }
-.btn-primary { background: var(--accent); color: #071412; box-shadow: none; }
-.btn-primary:hover { filter: brightness(1.08); box-shadow: none; }
-.btn-secondary { background: #1a2730; }
-.btn-danger { color: #ff9aaa; }
-.friend-item { border-radius: 8px; margin: 2px 10px; }
-.friend-item.active { background: #203642; box-shadow: none; }
-.friend-item.active::before { background: var(--accent); box-shadow: none; }
-.msg-bubble { border-radius: 12px; box-shadow: none; }
-.msg-group.out .msg-bubble { background: var(--out-bg); box-shadow: none; }
-.msg-group.in .msg-bubble { background: var(--in-bg); backdrop-filter: none; -webkit-backdrop-filter: none; }
-.composer-inner { border-radius: 10px; background: #0d151c; box-shadow: none; }
-.composer-inner:focus-within { box-shadow: 0 0 0 3px var(--accent-glow); }
-.send-btn { background: var(--accent); color: #071412; box-shadow: none; border-radius: 8px; }
-.send-btn:hover { transform: none; box-shadow: none; }
-.char-hint.danger { color: var(--danger); font-weight: 700; }
-.toast { border-radius: 8px; background: #17232d; backdrop-filter: none; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
-.stat-box, .session-item, .file-item, .modal, .search-result-item { border-radius: 8px; }
-.stat-box b { background: none; -webkit-text-fill-color: currentColor; color: var(--accent); }
-button, input, textarea, select, summary { font: inherit; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.chat-header-actions { min-width: 0; flex-wrap: nowrap; }
-.header-menu { position: relative; }
-.header-menu > summary { list-style: none; cursor: pointer; }
-.header-menu > summary::-webkit-details-marker { display: none; }
-.header-menu-items { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 190px; padding: 6px; border: 1px solid var(--border2); border-radius: 8px; background: #17232d; box-shadow: 0 14px 34px rgba(0,0,0,.4); }
-.header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 5px; padding: 9px 10px; }
-.mobile-back { display: none; }
-.mobile-info-btn { display: none; }
-.panel-overlay {
-  display: none;
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  z-index: 140;
-}
-.panel-overlay.open { display: block; }
-.panel-close-btn { display: none; }
-.connection-hint { display: none; }
-@media (max-width: 1080px) {
-  .mobile-info-btn { display: inline-flex !important; }
-  #panel {
-    position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 320px;
-    max-width: 85vw;
-    z-index: 150;
-    transform: translateX(100%);
-    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    box-shadow: -10px 0 30px rgba(0,0,0,0.5);
-    background: #0e151d;
-    overflow-y: auto;
-    display: flex !important;
-  }
-  #panel.drawer-open {
-    transform: translateX(0);
-  }
-  .panel-close-btn {
-    display: inline-flex !important;
-  }
+  .reply-quote { max-width: 200px; }
+  .reply-quote .rq-body { max-width: 190px; }
 }
 @media (max-width: 720px) {
   body { overflow: hidden; }
@@ -5933,13 +6675,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   .composer { padding: 10px 12px 12px; }
   .composer-inner { padding: 8px 10px; }
   #text { font-size: 16px; }
-  .drop-overlay { border-radius: 8px; }
+  .drop-overlay { border-radius: 12px; }
   #toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>
+
 </head>
 <body>
 <div id="app">
@@ -6044,6 +6792,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <div class="drop-overlay" id="dropOverlay">
       <div style="font-size:36px">📎</div>
       <div>Drop file to send encrypted</div>
+    </div>
+
+    <!-- Reply / edit context bar -->
+    <div class="composer-context" id="composerContext" hidden>
+      <div class="ctx-bar" id="ctxBar">
+        <span class="ctx-icon" id="ctxIcon">↩</span>
+        <div class="ctx-body">
+          <div class="ctx-title" id="ctxTitle">Replying</div>
+          <div class="ctx-snippet" id="ctxSnippet"></div>
+        </div>
+        <button class="ctx-cancel" id="ctxCancel" title="Cancel (Esc)" aria-label="Cancel reply or edit"
+          onclick="cancelComposerContext()">✕</button>
+      </div>
     </div>
 
     <!-- Composer -->
@@ -6220,6 +6981,9 @@ let uploadInProgress = false;
 let pendingUploadName = '';
 let loadingMore = false;
 let searchDebounceTimer = null;
+// Composer context: null, or {mode:'reply', msgId, peer} / {mode:'edit', msgId, peer}
+// for the bar shown above the composer while composing a reply or an edit.
+let composerCtx = null;
 // Call state: at most one call in flight at a time in this UI.
 let pc = null;                 // RTCPeerConnection
 let localStream = null;
@@ -6255,6 +7019,9 @@ const relTime = ts => {
   return new Date(ts*1000).toLocaleDateString();
 };
 const fullTime = ts => ts ? new Date(ts*1000).toLocaleString() : '';
+// edited_at/deleted_at use millisecond resolution server-side (they are
+// ordering guards, not display timestamps); convert for rendering.
+const tsToSec = ts => ts > 1e12 ? Math.round(ts/1000) : ts;
 const dateLabel = ts => {
   if(!ts) return '';
   const d = new Date(ts*1000), today = new Date();
@@ -6314,6 +7081,14 @@ const avatarColor = key => {
   let h = 0;
   for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
   const colors = ['#1a3a8f','#2a1a8f','#1a6a5f','#5a1a6f','#8f3a1a','#1a5a8f'];
+  return colors[Math.abs(h) % colors.length];
+};
+// Brighter variant for group sender labels, so different members read apart
+// at a glance without introducing a second visual system.
+const senderColor = key => {
+  let h = 0;
+  for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
+  const colors = ['#45d8ff','#4f7cff','#7ee0a3','#ffb86c','#ff8ba0','#c792ea','#89e6d8','#f5d76e'];
   return colors[Math.abs(h) % colors.length];
 };
 
@@ -6435,7 +7210,13 @@ function handle(d) {
       if(d.message.group_id) bumpGroupUnread(d.message.group_id);
       else bumpUnread();
     }
-    renderMessages();
+    // Fast path: a live message for the open conversation appends one row to
+    // the DOM instead of re-rendering the whole timeline; anything out of
+    // order (device-sync replays, clock skew) falls back to the full render.
+    const appended = (isSelected && (keepAtBottom || d.message.direction === 'out'))
+      ? appendMessageLive(d.message)
+      : false;
+    if(!appended && isSelected) renderMessages();
     renderSidebar();
     if(isSelected && keepAtBottom) scrollBottom(false);
     // Reading a group conversation must not clear the sender's 1:1 badge —
@@ -6487,10 +7268,10 @@ function handle(d) {
     renderTyping();
   } else if(d.type === 'status_update') {
     const m = state.messages.find(x => x.msg_id === d.msg_id);
-    if(m) { m.status = d.status; renderMessages(); }
+    if(m) { m.status = d.status; patchMessageDom(d.msg_id, m); }
   } else if(d.type === 'read_receipt') {
     const m = state.messages.find(x => x.msg_id === d.msg_id);
-    if(m) { m.status = 'read'; m.read_at = d.read_at; renderMessages(); }
+    if(m) { m.status = 'read'; m.read_at = d.read_at; patchMessageDom(d.msg_id, m); }
   } else if(d.type === 'reaction') {
     const m = state.messages.find(x => x.msg_id === d.msg_id);
     if(m) {
@@ -6501,7 +7282,24 @@ function handle(d) {
       } else {
         m.reactions = m.reactions.filter(r => !(r.peer_pubkey === d.peer && r.emoji === d.emoji));
       }
-      renderMessages();
+      patchMessageDom(d.msg_id, m);
+    }
+  } else if(d.type === 'message_edited') {
+    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    if(m) {
+      m.body = d.body;
+      m.edited_at = d.edited_at;
+      patchMessageDom(d.msg_id, m) || renderMessages();
+      renderSidebar();
+    }
+  } else if(d.type === 'message_tombstoned') {
+    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    if(m) {
+      m.deleted_at = d.deleted_at || Math.floor(Date.now()/1000);
+      m.body = '';
+      m.reactions = [];
+      patchMessageDom(d.msg_id, m) || renderMessages();
+      renderSidebar();
     }
   } else if(d.type === 'message_deleted') {
     state.messages = state.messages.filter(m => m.msg_id !== d.msg_id);
@@ -6582,6 +7380,10 @@ function renderSidebar() {
       const lastMsg = [...state.messages].reverse().find(m =>
         !m.group_id && (m.sender_pubkey === f.pubkey || m.recipient_pubkey === f.pubkey)
       );
+      const lastPreview = lastMsg
+        ? (lastMsg.deleted_at ? '🚫 Message deleted'
+          : (lastMsg.edited_at && lastMsg.body ? lastMsg.body.slice(0,40) + ' ✎' : lastMsg.body.slice(0,40)))
+        : null;
       const unread = f.unread || 0;
       const div = document.createElement('div');
       div.className = 'friend-item' + (isSelected ? ' active' : '');
@@ -6600,7 +7402,7 @@ function renderSidebar() {
         </div>
         <div class="friend-info">
           <div class="friend-name">${esc(f.nickname||short(f.pubkey))}</div>
-          <div class="friend-preview">${lastMsg ? esc(lastMsg.body.slice(0,40)) : secure?'🔒 secure session':(f.verified?'✅ verified':'⚠️ unverified')}</div>
+          <div class="friend-preview">${lastPreview ? esc(lastPreview) : secure?'🔒 secure session':(f.verified?'✅ verified':'⚠️ unverified')}</div>
         </div>
         <div class="friend-meta">
           ${unread ? `<div class="unread-badge">${unread}</div>` : ''}
@@ -6686,6 +7488,123 @@ function renderAttachment(m) {
   </a>`;
 }
 
+// Find a loaded message by id across both real messages and synthesized
+// file-message rows (file transfers render as messages but live in files).
+function findMessageAny(id) {
+  if(!id) return null;
+  const m = state.messages.find(x => x.msg_id === id);
+  if(m) return m;
+  const f = (state.files||[]).find(x => `file-${x.file_id}` === id);
+  return f ? fileMessage(f) : null;
+}
+
+// Quoted-preview block rendered inside a bubble for a reply.
+function replyQuoteHtml(m) {
+  if(!m.reply_to) return '';
+  const quoted = findMessageAny(m.reply_to);
+  if(!quoted) {
+    return `<div class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+      <span class="rq-missing">Original message not loaded</span>
+    </div>`;
+  }
+  const isFile = !!quoted._isFile;
+  const body = isFile ? `📎 ${quoted._file?.filename || 'Attachment'}` : (quoted.body || '');
+  const snippet = body.length > 140 ? body.slice(0, 140) + '…' : body;
+  const deleted = quoted.deleted_at;
+  return `<div class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+    <span class="rq-sender">${esc(displayName(quoted.sender_pubkey))}</span>
+    <span class="rq-body">${deleted ? '<i>Message was deleted</i>' : esc(snippet)}</span>
+  </div>`;
+}
+
+// One message row. Used by the full timeline render AND the live-append fast
+// path, so the two can never drift apart.
+function messageRowHtml(m, opts) {
+  const {showSender, lastSender, live} = opts || {};
+  const isOut = m.direction === 'out';
+  const tombstone = !!m.deleted_at;
+
+  // Reactions ride the pairwise session with the message's author, so the
+  // transport target is the author — except your OWN group messages, where
+  // the author is you and no reaction route exists.
+  const reactionPeer = m.recipient_pubkey || m.sender_pubkey;
+  const canReact = !!reactionPeer && reactionPeer !== state.public_key && !tombstone;
+
+  const reactMap = {};
+  (m.reactions||[]).forEach(r => {
+    if(!reactMap[r.emoji]) reactMap[r.emoji] = {count:0, mine:false};
+    reactMap[r.emoji].count++;
+    if(r.peer_pubkey === state.public_key) reactMap[r.emoji].mine = true;
+  });
+  const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
+    canReact
+      ? `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')">${emoji} ${info.count}</span>`
+      : `<span class="reaction-chip ${info.mine?'mine':''}">${emoji} ${info.count}</span>`
+  ).join('');
+
+  const statusIcon = isOut ? msgStatus(m) : '';
+
+  // Hover toolbar: quick reactions plus reply / edit / copy / delete. The
+  // meta-row .msg-actions fallback below keeps everything reachable without
+  // a hover device (touch) and from the keyboard.
+  const canReply = !m._isFile && !tombstone;
+  const canEdit = canReply && isOut;
+  const canDeleteEverywhere = canReply && isOut;
+  const toolsHtml = (m._isFile || (!canReact && !canReply)) ? '' : `<div class="msg-tools">
+    ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" title="React ${e}" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('') : ''}
+    ${(canReact && canReply) ? '<span class="tools-sep"></span>' : ''}
+    ${canReply ? `<button class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">↩</button>` : ''}
+    ${canReply ? `<button class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">⧉</button>` : ''}
+    ${canEdit ? `<button class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">✏</button>` : ''}
+    ${canDeleteEverywhere ? `<button class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑</button>` : ''}
+    ${!m._isFile && !tombstone ? `<button class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">✕</button>` : ''}
+  </div>`;
+
+  const editedLabel = (!m._isFile && m.edited_at && !tombstone)
+    ? `<span class="edited-label" title="Edited ${fullTime(tsToSec(m.edited_at))}">(edited)</span>` : '';
+
+  let bodyHtml;
+  if(tombstone) {
+    bodyHtml = `<span class="tombstone-icon">🚫</span><span>Message deleted</span>`;
+  } else if(m._isFile) {
+    bodyHtml = renderAttachment(m);
+  } else {
+    bodyHtml = `<span>${linkify(esc(m.body))}</span>${editedLabel}`;
+  }
+
+  const sameGroup = m.sender_pubkey === lastSender;
+  const reactionBar = (m._isFile || !canReact) ? '' : `<div class="reaction-bar">
+    ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('')}
+  </div>`;
+
+  const metaActions = (m._isFile || tombstone) ? '' : `<div class="msg-actions">
+    ${canReply ? `<button class="msg-action-btn" title="Reply to this message" onclick="startReply('${esc(m.msg_id)}')">↩ Reply</button>` : ''}
+    ${canReply ? `<button class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">⧉ Copy</button>` : ''}
+    ${canEdit ? `<button class="msg-action-btn" title="Edit this message" onclick="startEdit('${esc(m.msg_id)}')">✏ Edit</button>` : ''}
+    ${canDeleteEverywhere ? `<button class="msg-action-btn" title="Delete for everyone" onclick="deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑 Delete all</button>` : ''}
+    <button class="msg-action-btn" title="Delete from this device only" onclick="deleteMessageLocally('${esc(m.msg_id)}')">✕ Local</button>
+  </div>`;
+
+  return `
+    <div class="msg-group ${isOut?'out':'in'}${live?' live':''}${sameGroup?' same-sender':''}" data-msg-id="${esc(m.msg_id)}" data-sender="${esc(m.sender_pubkey)}" data-ts="${m.timestamp}">
+      ${showSender ? `<div class="msg-sender" title="${esc(m.sender_pubkey)}" style="color:${senderColor(m.sender_pubkey)}">${esc(displayName(m.sender_pubkey))}</div>` : ''}
+      <div class="msg-bubble${tombstone?' tombstone':''}">
+        ${toolsHtml}
+        ${reactionBar}
+        ${replyQuoteHtml(m)}
+        ${bodyHtml}
+      </div>
+      ${reactHtml ? `<div class="reactions">${reactHtml}</div>` : ''}
+      <div class="msg-meta">
+        <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
+        ${statusIcon}
+        ${!isOut && !m.read_at && !tombstone ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}')">mark read</button>` : ''}
+        ${metaActions}
+      </div>
+    </div>
+  `;
+}
+
 function renderMessages() {
   const el = $('messages');
   // innerHTML replacement resets scrollTop to 0; without save/restore any
@@ -6726,70 +7645,81 @@ function renderMessages() {
   msgs.forEach((m, idx) => {
     const thisDate = dateLabel(m.timestamp);
     if(thisDate !== lastDate) {
-      html += `<div class="date-divider">${thisDate}</div>`;
+      html += `<div class="date-divider"><span>${thisDate}</span></div>`;
       lastDate = thisDate;
       lastSender = '';
     }
 
     const isOut = m.direction === 'out';
     const sameGroup = m.sender_pubkey === lastSender && idx > 0;
-    lastSender = m.sender_pubkey;
     // Group chats must show who sent each incoming message; consecutive
     // messages from the same sender are labeled once, like mainstream UIs.
     const showSender = selectedTarget.type === 'group' && !isOut && !sameGroup;
 
-    const statusIcon = isOut ? msgStatus(m) : '';
-
-    // Reactions ride the pairwise session with the message's author, so the
-    // transport target is the author — except your OWN group messages, where
-    // the author is you and no reaction route exists (the old UI rendered a
-    // hover bar whose buttons silently did nothing).
-    const reactionPeer = m.recipient_pubkey || m.sender_pubkey;
-    const canReact = !!reactionPeer && reactionPeer !== state.public_key;
-
-    // Reactions HTML
-    const reactMap = {};
-    (m.reactions||[]).forEach(r => {
-      if(!reactMap[r.emoji]) reactMap[r.emoji] = {count:0, mine:false};
-      reactMap[r.emoji].count++;
-      if(r.peer_pubkey === state.public_key) reactMap[r.emoji].mine = true;
-    });
-    const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
-      canReact
-        ? `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')">${emoji} ${info.count}</span>`
-        : `<span class="reaction-chip ${info.mine?'mine':''}">${emoji} ${info.count}</span>`
-    ).join('');
-
-    const bodyHtml = m._isFile ? renderAttachment(m) : `<span>${linkify(esc(m.body))}</span>`;
-
-    // Reaction bar
-    const reactionBar = (m._isFile || !canReact) ? '' : `<div class="reaction-bar">
-      ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('')}
-    </div>`;
-
-    html += `
-      <div class="msg-group ${isOut?'out':'in'}" data-msg-id="${esc(m.msg_id)}">
-        ${showSender ? `<div class="msg-sender" title="${esc(m.sender_pubkey)}">${esc(displayName(m.sender_pubkey))}</div>` : ''}
-        <div class="msg-bubble" style="${sameGroup?'margin-top:1px':''}">
-          ${reactionBar}
-          ${bodyHtml}
-        </div>
-        ${reactHtml ? `<div class="reactions" style="padding:0 4px">${reactHtml}</div>` : ''}
-        <div class="msg-meta">
-          <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
-          ${statusIcon}
-          ${!isOut && !m.read_at ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}')">mark read</button>` : ''}
-          ${m._isFile ? '' : `<div class="msg-actions">
-            <button class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">⧉ Copy</button>
-            <button class="msg-action-btn" title="Delete locally" onclick="deleteMessageLocally('${esc(m.msg_id)}')">🗑 Delete</button>
-          </div>`}
-        </div>
-      </div>
-    `;
+    html += messageRowHtml(m, {showSender, lastSender, live:false});
+    lastSender = m.sender_pubkey;
   });
 
   el.innerHTML = html;
   restoreScroll();
+}
+
+// Live-append fast path: one new message for the OPEN conversation, arriving
+// in order at the end of the timeline, becomes one DOM row instead of a full
+// re-render. Returns false whenever anything is uncertain (out-of-order
+// timestamp, empty container, mismatched conversation) — the caller then
+// falls back to renderMessages().
+function appendMessageLive(m) {
+  const el = $('messages');
+  if(!selectedTarget || !matchTarget(m)) return false;
+  if(!el.childElementCount) return false;
+  if(el.querySelector('.empty-state')) return false;
+  const rows = el.querySelectorAll('.msg-group');
+  if(!rows.length) return false;
+  const last = rows[rows.length - 1];
+  if(last.dataset.msgId === m.msg_id) return true;  // already appended
+  const lastTs = parseInt(last.dataset.ts || '0', 10);
+  if(!(m.timestamp >= lastTs)) return false;        // out of order → full render
+  // A conversation switch can leave a stale DOM; only append into the
+  // container that actually belongs to the current selection.
+  if(el.dataset.target !== selectedTarget.id) return false;
+
+  const lastSender = last.dataset.sender || '';
+  const isOut = m.direction === 'out';
+  const showSender = selectedTarget.type === 'group' && !isOut && lastSender !== m.sender_pubkey;
+  // Date divider when the day rolls over between the last row and this one.
+  const lastDate = dateLabel(lastTs);
+  const thisDate = dateLabel(m.timestamp);
+  const divider = thisDate !== lastDate ? `<div class="date-divider"><span>${thisDate}</span></div>` : '';
+  const insert = document.createElement('template');
+  insert.innerHTML = divider + messageRowHtml(m, {showSender, lastSender, live:true});
+  el.appendChild(insert.content);
+  return true;
+}
+
+// Targeted in-place patch for status ticks, read receipts, reactions, edits
+// and tombstones: rewrites only the affected row's bubble and meta instead
+// of rebuilding the whole timeline. Returns false if the row isn't in the
+// DOM (e.g. it belongs to an unloaded page) so the caller can fall back.
+function patchMessageDom(msgId, m) {
+  if(!selectedTarget || !matchTarget(m)) return false;
+  const row = document.querySelector(`#messages .msg-group[data-msg-id="${CSS.escape(msgId)}"]`);
+  if(!row) return false;
+  const isOut = m.direction === 'out';
+  const prev = row.previousElementSibling;
+  let lastSender = '';
+  if(prev && prev.classList.contains('msg-group')) lastSender = prev.dataset.sender || '';
+  else if(prev && prev.classList.contains('date-divider')) {
+    const before = prev.previousElementSibling;
+    if(before && before.classList.contains('msg-group')) lastSender = before.dataset.sender || '';
+  }
+  const showSender = selectedTarget.type === 'group' && !isOut && lastSender !== m.sender_pubkey;
+  const template = document.createElement('template');
+  template.innerHTML = messageRowHtml(m, {showSender, lastSender, live:false});
+  const fresh = template.content.firstElementChild;
+  if(!fresh) return false;
+  row.replaceWith(fresh);
+  return true;
 }
 
 function msgStatus(m) {
@@ -7014,6 +7944,9 @@ function rotateGroupKey(group_id) {
 function selectFriend(pubkey) {
   stopTyping();
   closeGroupManage();
+  // A pending reply/edit belongs to the conversation it was started in —
+  // carrying it across a switch would silently retarget the message.
+  cancelComposerContext();
   selectedTarget = {type:'friend', id:pubkey};
   delete typing[pubkey];
   renderTyping();
@@ -7031,6 +7964,7 @@ function selectFriend(pubkey) {
 function selectGroup(group_id) {
   stopTyping();
   closeGroupManage();
+  cancelComposerContext();
   selectedTarget = {type:'group', id:group_id};
   clearGroupUnread(group_id);
   renderSidebar();
@@ -7063,6 +7997,7 @@ function setMode(m) {
   $('tabGroups').className  = 'mode-tab' + (m==='groups' ?' active':'');
   stopTyping();
   closeGroupManage();
+  cancelComposerContext();
   selectedTarget = null;
   setMobileChat(false);
   renderSidebar();
@@ -7166,6 +8101,96 @@ function copyMessage(msgId) {
 function deleteMessageLocally(msgId) {
   if(!confirm('Delete this message from this device? The other participant and your other devices may still have their copies.')) return;
   send({type:'delete_message', msg_id:msgId});
+}
+
+function deleteMessageEverywhereUi(msgId) {
+  const m = findMessageAny(msgId);
+  if(!m || m._isFile) return;
+  if(!confirm('Delete this message for EVERYONE? It will be erased from the conversation on every participant\'s device (their copies of any quotes will show a placeholder).')) return;
+  send({type:'delete_message_everywhere', msg_id:msgId});
+}
+
+// ─── Reply & edit composer context ───────────────────────────────────────────
+function setComposerContext(ctx) {
+  composerCtx = ctx;
+  const wrap = $('composerContext'), bar = $('ctxBar');
+  const text = $('text'), sendBtn = $('sendBtn');
+  if(!ctx) {
+    wrap.hidden = true;
+    sendBtn.classList.remove('saving');
+    sendBtn.textContent = '➤';
+    sendBtn.title = 'Send';
+    updateSendBtn();
+    return;
+  }
+  const m = findMessageAny(ctx.msgId);
+  const quoted = m ? (m._isFile ? `📎 ${m._file?.filename || 'Attachment'}` : (m.body || '')) : '';
+  const snippet = quoted.length > 120 ? quoted.slice(0, 120) + '…' : quoted;
+  $('ctxIcon').textContent = ctx.mode === 'edit' ? '✏' : '↩';
+  $('ctxTitle').textContent = ctx.mode === 'edit'
+    ? 'Editing message'
+    : `Replying to ${displayName(ctx.peer)}`;
+  $('ctxSnippet').textContent = snippet || '…';
+  bar.classList.toggle('editing', ctx.mode === 'edit');
+  wrap.hidden = false;
+  if(ctx.mode === 'edit' && m && !m._isFile) {
+    $('text').value = m.body || '';
+    onTextInput();
+    sendBtn.classList.add('saving');
+    sendBtn.textContent = '✓';
+    sendBtn.title = 'Save edit';
+  }
+  updateSendBtn();
+  $('text').focus();
+}
+
+function startReply(msgId) {
+  const m = findMessageAny(msgId);
+  if(!m) return;
+  // Replying to a file is not supported yet: reply targets must exist as
+  // message rows on the receiving side, and file transfers live in a
+  // separate store. Quote-able text messages only, for now.
+  if(m._isFile) { toast('Replies to file attachments are not supported yet', 'info'); return; }
+  if(!selectedTarget) { toast('Select a conversation first', 'warning'); return; }
+  if(composerCtx && composerCtx.mode === 'edit') {
+    // Switching out of edit mode must restore the empty composer.
+    $('text').value = '';
+    onTextInput();
+  }
+  const peer = selectedTarget.type === 'friend' ? selectedTarget.id : (m.sender_pubkey === state.public_key ? m.recipient_pubkey : m.sender_pubkey);
+  setComposerContext({mode:'reply', msgId, peer});
+}
+
+function startEdit(msgId) {
+  const m = findMessageAny(msgId);
+  if(!m || m._isFile) return;
+  if(m.direction !== 'out' || m.sender_pubkey !== state.public_key) {
+    toast('Only your own messages can be edited', 'warning');
+    return;
+  }
+  if(m.deleted_at) { toast('This message was deleted', 'warning'); return; }
+  const peer = m.recipient_pubkey || (selectedTarget && selectedTarget.type === 'friend' ? selectedTarget.id : null);
+  setComposerContext({mode:'edit', msgId, peer});
+}
+
+function cancelComposerContext() {
+  if(composerCtx && composerCtx.mode === 'edit') {
+    $('text').value = '';
+    onTextInput();
+  }
+  setComposerContext(null);
+}
+
+// Up-arrow with an empty composer edits our most recent message in the open
+// conversation — the muscle-memory shortcut from mainstream messengers.
+function editLastOwnMessage() {
+  if(!selectedTarget) return;
+  const msgs = state.messages
+    .filter(m => matchTarget(m) && !m._isFile && !m.deleted_at
+      && m.direction === 'out' && m.sender_pubkey === state.public_key)
+    .sort((a,b) => a.timestamp - b.timestamp);
+  const last = msgs[msgs.length - 1];
+  if(last) startEdit(last.msg_id);
 }
 
 // ─── Message search ───────────────────────────────────────────────────────────
@@ -7489,12 +8514,20 @@ function sendMessage() {
     return;
   }
   let sent;
+  if(composerCtx && composerCtx.mode === 'edit') {
+    // Edit in place: replace the existing message everywhere it is held.
+    sent = send({type:'edit_message', msg_id:composerCtx.msgId, text});
+    if(sent) cancelComposerContext();
+    return;
+  }
+  const replyTo = composerCtx && composerCtx.mode === 'reply' ? composerCtx.msgId : undefined;
   if(selectedTarget.type === 'group') {
-    sent = send({type:'send_message', group_id:selectedTarget.id, text});
+    sent = send({type:'send_message', group_id:selectedTarget.id, text, reply_to:replyTo});
   } else {
-    sent = send({type:'send_message', pubkey:selectedTarget.id, text});
+    sent = send({type:'send_message', pubkey:selectedTarget.id, text, reply_to:replyTo});
   }
   if(!sent) return;
+  if(replyTo) cancelComposerContext();
   $('text').value = '';
   onTextInput();
   stopTyping();
@@ -7754,6 +8787,13 @@ function onTextKey(e) {
   // keydown that used to prematurely submit instead of committing the text.
   if(e.isComposing || e.keyCode === 229) return;
   if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  // Up-arrow with an empty composer (and nothing selected for editing yet)
+  // jumps straight into editing our last message in this conversation.
+  if(e.key === 'ArrowUp' && !$('text').value && !(composerCtx && composerCtx.mode === 'edit')) {
+    e.preventDefault();
+    editLastOwnMessage();
+  }
+  if(e.key === 'Escape' && composerCtx) { e.stopPropagation(); cancelComposerContext(); }
 }
 
 function autoResize(ta) {
@@ -7850,7 +8890,15 @@ document.addEventListener('click', event => {
   });
 });
 document.addEventListener('keydown', event => {
+  // Ctrl/Cmd+F opens the conversation search from anywhere in the app.
+  if((event.ctrlKey || event.metaKey) && (event.key === 'f' || event.key === 'F')) {
+    if(selectedTarget) { event.preventDefault(); openSearchModal(); }
+    return;
+  }
   if(event.key !== 'Escape') return;
+  // Canceling an in-flight reply or edit takes precedence over everything
+  // else Escape does — it is the primary affordance of the context bar.
+  if(composerCtx) { cancelComposerContext(); return; }
   // The incoming-call modal is the one dialog Escape MUST dismiss — it's a
   // full-screen interruption and it used to be the only one the handler
   // ignored (declineCall below is the same operation as its Decline button).

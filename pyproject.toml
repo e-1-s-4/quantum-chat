@@ -1,6 +1,6 @@
 [project]
 name = "quantum-chat"
-version = "3.5.0"
+version = "4.0.0"
 description = "Single-file post-quantum end-to-end encrypted peer-to-peer chat with a browser UI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,7 @@ select = [
 # Standalone scripts adjust sys.path before importing chat.
 "e2e_test.py" = ["E402"]
 "new_features_test.py" = ["E402"]
+"scripts/demo_driver.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

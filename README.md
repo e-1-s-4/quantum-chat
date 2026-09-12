@@ -1,8 +1,8 @@
 # Quantum Chat
 
-**v3.5.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
+**v4.0.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
 
-Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
+Quantum Chat ships a refined dark-glass web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, **message replies with quoted previews**, **edit-your-own-messages**, **delete-for-everyone**, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
 
 > **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has **not** been independently audited. Treat it as hardened experimental application code, not a certified secure messenger. Remote production deployments still need an external security review, TLS termination, operational monitoring, and a clear key-backup plan.
 
@@ -10,6 +10,7 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 
 ## Table of contents
 
+- [What's new in v4.0.0](#whats-new-in-v400)
 - [What's new in v3.5.0](#whats-new-in-v350)
 - [What's new in v3.4.1](#whats-new-in-v341)
 - [What's new in v3.4.0](#whats-new-in-v340)
@@ -34,6 +35,49 @@ Quantum Chat ships a local dark-mode web UI, a local UI WebSocket API, an option
 - [Packaging and development](#packaging-and-development)
 - [Historical changelog](#historical-changelog)
 - [License](#license)
+
+---
+
+## What's new in v4.0.0
+
+v4.0.0 is the conversation upgrade: the three most-requested messaging primitives (replies, edits, delete-for-everyone), a redesigned browser UI, and a set of platform fixes found while load-testing the new features against the real relay. Wire-compatible additions only — v3.5 peers keep working; unknown frame kinds are ignored per the v3.4 forward-compatibility rule.
+
+### New features
+
+- **Message replies with quoted previews (1:1 and groups).** Hover any message → ↩ (or double-click the meta-row button) and the composer shows a reply context bar with the quoted sender and snippet. The reply itself renders a clickable quote block inside the bubble; clicking jumps to the original (and flash-highlights it). Reply references travel inside the encrypted, AAD-authenticated chat payload, so the relay learns nothing — not even that a message *is* a reply. References are UUID-shape-validated on the receive side; a quote whose original predates your local history window renders a graceful placeholder instead of dangling.
+- **Edit any of your own messages.** ✏ in the hover toolbar (or ↑ with an empty composer to edit your last message). The replacement text is sealed under the same per-counter HKDF-derived message-key scheme as `chat` frames — the relay never sees the edit — and `edited_at` is millisecond-resolution and monotonic on the receiver, so a replayed or late-arriving older edit can never roll a newer correction back. Group edits travel as signed `group_message_edit` frames sealed under the current group epoch key. Edits sync to your other devices via the existing device-sync channel. Edited messages show a subtle *“(edited)”* label with a timestamp tooltip.
+- **Delete-for-everyone.** 🗑 in the hover toolbar on your own messages. Recipients verify the signature, the routing, and that the stored author is really the sender before tombstoning their copy — a peer cannot erase someone else's words from your history. The tombstone erases the ciphertext *and* the plaintext body from the database (the row survives so reply chains quoting it still resolve, rendering "Message deleted"); reactions are dropped with it. A separate ✕ action keeps the v3 "delete locally only" behavior.
+
+### Browser UI — refined dark glass
+
+- The whole interface was redesigned around layered frosted-glass surfaces, ambient gradient background, and quiet glow accents: gradient-traced bubbles with sharp corner tails, floating hover toolbar (quick reactions + reply/copy/edit/delete), redesigned sidebar cards with gradient-ringed avatars, polished modals, toasts, empty states, and a WCAG-AA-checked text palette (the contrast test now asserts computed ratios rather than specific hex literals).
+- Composer: glow focus ring; reply/edit context bar with cancel (Esc); edit mode turns the send button into a save (✓).
+- New keyboard shortcuts: **↑** in an empty composer edits your last message, **Ctrl/Cmd+F** opens conversation search, **Esc** cancels a pending reply/edit (and still dismisses modals).
+- Performance: live messages append one DOM row instead of re-rendering the timeline, and status ticks / read receipts / reactions patch the single affected row in place; full re-renders remain the fallback for history loads and conversation switches.
+
+### Performance & fixes
+
+- **Fixed: the HTTP→UI WebSocket bridge deadlocked on every opening handshake.** `_bridge_websocket` forwarded the upgrade request and then called a bare `rfile.peek()` — which issues a raw read when the buffer is empty. A WebSocket client sends nothing until it sees the 101, so the bridge hung until the client's own timeout; the browser only survived by failing over to the direct UI port after two failed attempts (several seconds of "connecting…" on every load). The peek is now bounded to 50ms, and pipelined bytes are still forwarded correctly. This makes the single-port/reverse-proxy deployment mode work as documented.
+- **Fixed: tombstoned rows crashed hydration.** The first delete-for-everyone implementation wrote `body=''` without clearing the body's AEAD nonce, so every later hydration of the row raised `InvalidTag` — taking the whole state payload (and the UI) down. Nonces are cleared with the body, and hydration tolerates legacy rows with an empty body + stray nonce.
+- **Faster encrypted-column access.** The AES-GCM cipher object for at-rest encryption is constructed once per `Database` and cached, instead of re-deriving the key schedule for every row — history hydration, search scans, and message writes all benefit.
+- Message timestamps stay second-grained for display; edit/delete ordering fields (`edited_at`) use millisecond resolution so two legitimate edits inside the same second both apply.
+
+### Security
+
+- Reply targets, edit targets, and delete targets arriving over the network are UUID-shape validated (`validate_msg_id`) — a hostile peer can't park oversized blobs in lookups or logs.
+- Edit/delete-for-everyone are owner-only, with signature + routing + stored-author checks on every receiver (pinned by tests that try cross-author edits/deletes from authenticated peers).
+- 1:1 edit frames are session-bound: queued outbox edits are retired visibly if the session rekeys while offline, instead of being delivered as undecryptable garbage.
+- Deleted-for-everyone bodies are truly erased from the database — not merely flagged.
+
+### Compatibility
+
+- Schema migrates in place: opening a v3.5 database adds the `reply_to`, `edited_at`, and `deleted_at` columns (`SCHEMA_VERSION` 5 → 6) and keeps every existing row readable.
+- New UI commands (`edit_message`, `delete_message_everywhere`, `send_message{reply_to}`) and new relay frame kinds (`message_edit`, `group_message_edit`, `message_delete`) are additive; older peers ignore unknown kinds as before.
+
+### Testing
+
+- New `test_v400_features.py` (38 tests) covering reply round-trips and hostile references, edit monotonicity and cross-author rejection, tombstone semantics and reload hydration, device sync of the new events, schema migration from v3.5, the cached cipher object, and a real-socket regression test for the bridge deadlock.
+- The full matrix (221 pytest + 15 e2e + 13 smoke checks) passes on Python 3.12; ruff is clean; CI runs lint + tests on 3.10–3.13 plus e2e and smoke jobs (`.github/workflows/ci.yml`).
 
 ---
 
@@ -247,10 +291,13 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 
 **Messaging**
 - 1:1 and group chat, with target-scoped message history, quick text filter, and a "Load older messages" pager.
-- Full-text message search (🔍 in the chat header), scoped to the open 1:1 or group conversation, with click-to-jump navigation to the matched message.
+- **Message replies with quoted previews** (v4): reply to any message, see the quoted sender + snippet inside the bubble, click the quote to jump back to the original. Works in 1:1 and group chats and syncs across devices.
+- **Edit your own messages** (v4): edit-in-place with the replacement text encrypted under the same per-counter message-key scheme as chat; monotonic `edited_at` keeps replayed older edits from rolling back newer ones; *“(edited)”* label in the timeline.
+- **Delete for everyone** (v4): authorship-checked, signed delete notices tombstone the message on every participant's device and erase the plaintext from the database; reply chains quoting a deleted message still resolve to a placeholder. Local-only delete remains available separately.
+- Full-text message search (🔍 in the chat header, or Ctrl/Cmd+F), scoped to the open 1:1 or group conversation, with click-to-jump navigation to the matched message.
 - Typing indicators (ephemeral relay messages), delivery/read status ticks, a manual **mark read** action, and touch- and keyboard-accessible emoji reaction controls.
 - Per-friend unread counts persist in SQLite and clear when a conversation is read. Browser notifications and title unread-count updates fire when messages arrive while the page is unfocused.
-- Copy-message-to-clipboard and persistent local delete actions on every message. Deletion affects only this device's database, not the peer or other devices.
+- Copy-message-to-clipboard; persistent local delete on every message (this device only) and delete-for-everywhere on your own messages.
 - URL auto-linking with `rel="noopener noreferrer"`.
 
 **Files**
@@ -510,16 +557,19 @@ python chat.py signal --host 0.0.0.0 --port 8766
 chat.py                                # Application, crypto, DB, WebSocket relay/client, HTTP UI
 requirements.txt                       # Runtime dependencies
 pyproject.toml                         # Package metadata and console entry point
+.github/workflows/ci.yml              # CI: ruff + pytest (3.10–3.13) + e2e + smoke
 README.md                              # This document
 LICENSE                                # MIT
-test_validation_and_database.py        # Unit tests (49 cases)
-test_node_relay_and_signaling.py       # Node/relay protocol unit tests (63 cases)
+test_validation_and_database.py        # Unit tests (44 cases)
+test_node_relay_and_signaling.py       # Node/relay protocol unit tests (61 cases)
 test_error_propagation.py              # Error-surfacing tests (6 cases)
 test_enhancements.py                   # v3.4.0 security/reliability regression tests (36 cases)
 test_v350_fixes.py                     # v3.5.0 security/reliability/correctness regression tests (24 cases)
+test_v400_features.py                  # v4.0.0 replies/edit/delete + platform regression tests (38 cases)
 smoke_test.py                          # Live HTTP smoke test (13 checks)
 e2e_test.py                            # End-to-end protocol test (15 checks)
 new_features_test.py                   # Multi-device sync, calls, search, parallel file transfer (14 checks)
+scripts/demo_driver.py                 # Optional: boots a relay + two seeded demo nodes for trying the UI
 quantum_chat.db                        # Created at runtime
 quantum_chat.db.key                    # Created at runtime; local at-rest encryption key
 files/                                 # Created at runtime for encrypted transferred files
@@ -550,11 +600,12 @@ Important remaining limits:
 ### Unit tests
 
 ```bash
-pytest                                       # all unit suites (178 cases)
+pytest                                       # all unit suites (221 cases)
 pytest test_validation_and_database.py       # validation, storage, HTTP
 pytest test_node_relay_and_signaling.py      # node/relay protocol behavior
 pytest test_enhancements.py                  # v3.4.0 security/reliability fixes
 pytest test_v350_fixes.py                    # v3.5.0 security/reliability/correctness fixes
+pytest test_v400_features.py                 # v4.0.0 replies/edit/delete + platform fixes
 ```
 
 `test_validation_and_database.py` — 44 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
@@ -570,6 +621,8 @@ nodes are wired together in-process — relay traffic is delivered straight into
 the peer's handler and sockets are small fakes — so real post-quantum crypto and
 SQLite persistence are exercised without a network or subprocesses.
 
+`test_v400_features.py` — 38 cases covering the v4.0.0 surface: reply round-trips for 1:1 and groups (plus hostile/malformed reply references and cross-conversation quote attempts), edit monotonicity (a replayed older edit cannot roll back a newer one), owner-only enforcement for edits and deletes, hostile edit/delete frames for messages authored by someone else, tombstone semantics (body erased, reactions dropped, hydration clean after reload, reply chains still resolvable), device-sync of edit/tombstone events, the new UI commands, schema migration from a hand-built v3.5 database, `validate_msg_id`, the cached AES-GCM cipher object (correctness plus a 2000-row hydration batch), a real-socket regression test for the HTTP→UI WebSocket bridge handshake deadlock, and UI HTML sanity checks for the v4 affordances.
+
 ### Error-propagation tests
 
 ```bash
@@ -581,7 +634,7 @@ pytest test_error_propagation.py
 ### Live HTTP smoke test
 
 ```bash
-python scripts/smoke_test.py
+python smoke_test.py
 ```
 
 Starts a fresh node on private ports, hits `/health`, `/version`, `/`, `/files/<bad-id>`, `HEAD /health`, and `OPTIONS /`, verifies all security headers, then sends `SIGTERM` to verify the graceful-shutdown path. 13 checks.
@@ -589,7 +642,7 @@ Starts a fresh node on private ports, hits `/health`, `/version`, `/`, `/files/<
 ### End-to-end protocol test
 
 ```bash
-python scripts/e2e_test.py
+python e2e_test.py
 ```
 
 Starts a real signaling server + two real nodes (Alice and Bob), establishes a Kyber session, exchanges an encrypted chat, verifies delivery acks, read receipts, and reactions all propagate end-to-end, and exercises nickname rename + block/unblock. 15 checks. This is the test that caught all three v3.1.0 critical bugs.
@@ -597,7 +650,7 @@ Starts a real signaling server + two real nodes (Alice and Bob), establishes a K
 ### New-feature integration test
 
 ```bash
-python scripts/new_features_test.py
+python new_features_test.py
 ```
 
 Starts a real signaling server + three real nodes: Bob, and Alice running on two devices that share one identity. Verifies both of Alice's devices can be online simultaneously and see each other's identity; that a message Alice sends from device 1 syncs to device 2; that a reply from Bob syncs to device 2 even though device 2 never held a session with Bob; message search (positive and negative); a full call handshake (offer → incoming → answer → active → ICE → busy-on-second-offer → end); and that a multi-chunk file sent with the new bounded-concurrency transfer still reassembles byte-for-byte correctly despite out-of-order parallel chunk arrival. 14 checks.
@@ -646,6 +699,21 @@ Compile the app:
 
 ```bash
 python -m py_compile chat.py
+```
+
+Lint (configuration lives in `pyproject.toml`):
+
+```bash
+ruff check .
+```
+
+Continuous integration (`.github/workflows/ci.yml`) runs on every push and pull request: ruff lint, the full pytest suite across Python 3.10–3.13, the two-node end-to-end protocol test, and the HTTP smoke test.
+
+Try the UI with a seeded two-node demo (two browsers, one relay, a conversation that already contains replies, an edit, and a deleted-for-everyone message):
+
+```bash
+python scripts/demo_driver.py
+# then open the two URLs it prints (default http://127.0.0.1:28101/ and http://127.0.0.1:28111/)
 ```
 
 ---
