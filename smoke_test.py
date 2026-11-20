@@ -38,6 +38,7 @@ DIRECT_PORT = 18768
 if __name__ == "__main__":
     env = dict(os.environ)
     env["QUANTUM_CHAT_KEY_MODE"] = "file"  # skip passphrase wrapping for the smoke test
+    env["QUANTUM_CHAT_RELAY_DB"] = str(WORKDIR / "relay.db")
 
     cmd = [
         sys.executable, "chat.py",

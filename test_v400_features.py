@@ -16,8 +16,10 @@ fix, and the new UI protocol commands.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -196,7 +198,7 @@ def test_hostile_reply_reference_is_shape_checked(pair):
     # Rebuild a chat frame carrying a malformed reply_to (not a UUID) —
     # the receiver must reject the whole frame rather than persist it.
     session_key = bob.sessions[alice.public_key]
-    counter = alice.db.next_send_counter(alice.public_key)
+    counter = alice.db.next_send_counter(bob.public_key)
     payload = {
         "msg_id": str(uuid.uuid4()), "from": alice.public_key,
         "to": bob.public_key, "group_id": None,
@@ -754,3 +756,394 @@ def test_ui_state_messages_expose_new_fields(pair):
     state = bob.state_payload()
     msg = next(m for m in state["messages"] if m["body"] == "field probe")
     assert "reply_to" in msg and "edited_at" in msg and "deleted_at" in msg
+
+
+# ─── Audit & hardening regressions ───────────────────────────────────────────
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def test_http_to_ui_ws_bridge_transfers_large_frames(tmp_path):
+    """Bridged WebSockets run on non-blocking sockets and must handle partial
+    writes (BlockingIOError) cleanly for large payloads >256 KB."""
+    websockets = chat_module.require_websockets()
+    http_port = _free_port()
+    ui_port = _free_port()
+    node = chat_module.QuantumNode(
+        str(tmp_path / "large_bridge.db"), "ws://127.0.0.1:1", enable_direct=False
+    )
+    httpd = chat_module.start_http(
+        node, "127.0.0.1", http_port, ui_ws_port=ui_port, require_http_auth=False
+    )
+
+    async def backend():
+        async def echo(ws):
+            try:
+                async for msg in ws:
+                    await ws.send(msg)
+            except Exception:
+                pass
+        async with websockets.serve(echo, "127.0.0.1", ui_port, max_size=2 * 1024 * 1024):
+            await asyncio.Future()
+
+    threading.Thread(target=lambda: asyncio.run(backend()), daemon=True).start()
+    time.sleep(0.4)
+
+    big_payload = "Q" * (600 * 1024)
+
+    async def probe():
+        async with websockets.connect(
+            f"ws://127.0.0.1:{http_port}/?token={node.ui_token}",
+            open_timeout=5, max_size=2 * 1024 * 1024,
+        ) as ws:
+            await ws.send(big_payload)
+            got = await asyncio.wait_for(ws.recv(), timeout=5)
+            return got == big_payload
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            assert loop.run_until_complete(probe()) is True
+        finally:
+            loop.close()
+    finally:
+        node._shutting_down = True
+        httpd.shutdown()
+        httpd.server_close()
+        node.db.close()
+
+
+def test_cross_context_edits_are_rejected(trio):
+    alice, bob, carol = trio
+    establish(alice, bob)
+    establish(alice, carol)
+
+    group_a = str(uuid.uuid4())
+    group_b = str(uuid.uuid4())
+    key_a = b"a" * 32
+    key_b = b"b" * 32
+    for gid, k in ((group_a, key_a), (group_b, key_b)):
+        for n in (alice, bob, carol):
+            n.db.create_group(gid, f"grp-{gid[:4]}", alice.public_key)
+            n.db.add_group_member(gid, alice.public_key)
+            n.db.add_group_member(gid, bob.public_key)
+            n.db.add_group_member(gid, carol.public_key)
+            n.db.save_group_key(gid, 1, k, alice.public_key)
+
+    asyncio.run(alice.send_group_chat(group_a, "in group a"))
+    grp_msg = find_body(bob, "in group a")
+
+    # 1. Trying to edit a group message over a 1:1 session must be rejected.
+    session_key = alice.sessions[bob.public_key]
+    counter = alice.db.next_send_counter(bob.public_key)
+    payload = {
+        "msg_id": grp_msg["msg_id"], "from": alice.public_key, "to": bob.public_key,
+        "counter": counter, "edited_at": chat_module.utc_ts_ms(),
+    }
+    msg_key = alice.crypto.derive_message_key(
+        session_key, alice.public_key, bob.public_key, counter, "edit"
+    )
+    packet = alice.crypto.encrypt(msg_key, chat_module.pad_plaintext(b"dm hijack"), canonical_json(payload))
+    with pytest.raises(ValueError, match="group message"):
+        asyncio.run(bob.handle_relay_payload(
+            alice.public_key, {"kind": "message_edit", "payload": payload, "packet": packet}
+        ))
+
+    # 2. Trying to edit a Group A message using a Group B envelope must be rejected.
+    meta_b = {
+        "msg_id": grp_msg["msg_id"], "from": alice.public_key, "group_id": group_b,
+        "epoch": 1, "edited_at": chat_module.utc_ts_ms(),
+    }
+    packet_b = alice.crypto.encrypt(key_b, chat_module.pad_plaintext(b"cross group"), canonical_json(meta_b))
+    frame_b = alice.signed_payload("group_message_edit", {"meta": meta_b, "packet": packet_b})
+    with pytest.raises(ValueError, match="does not belong to this group"):
+        asyncio.run(bob.handle_relay_payload(alice.public_key, frame_b))
+
+    assert find_body(bob, "in group a")["body"] == "in group a"
+
+
+def test_edit_message_atomic_against_tombstone_and_stale_timestamp(tmp_path):
+    db = chat_module.Database(str(tmp_path / "atomic_edit.db"), master_key=b"m" * 32)
+    try:
+        mid = str(uuid.uuid4())
+        pk = "ab" * 32
+        db.save_message(mid, pk, "initial", "out", recipient="cd" * 32)
+        assert db.edit_message(mid, "newer", 2000) is True
+        assert db.edit_message(mid, "stale", 1500) is False
+        assert db.get_message(mid)["body"] == "newer"
+        assert db.tombstone_message(mid, deleted_at=3000) is True
+        assert db.edit_message(mid, "resurrect", 4000) is False
+        row = db.get_message(mid)
+        assert row["deleted_at"] == 3000
+        assert row["body"] == ""
+    finally:
+        db.close()
+
+
+def test_reserve_send_counters_requires_active_session(tmp_path):
+    db = chat_module.Database(str(tmp_path / "no_sess.db"), master_key=b"n" * 32)
+    try:
+        with pytest.raises(ValueError, match="No active session"):
+            db.reserve_send_counters("ef" * 32, 1)
+    finally:
+        db.close()
+
+
+def test_group_edit_fanout_isolates_failing_recipient_and_group_delivered_flag(trio):
+    alice, bob, carol = trio
+    establish(alice, bob)
+    establish(alice, carol)
+    group_id = str(uuid.uuid4())
+    for n in (alice, bob, carol):
+        n.db.create_group(group_id, "resilient", alice.public_key)
+        n.db.add_group_member(group_id, alice.public_key)
+        n.db.add_group_member(group_id, bob.public_key)
+        n.db.add_group_member(group_id, carol.public_key)
+        n.db.save_group_key(group_id, 1, b"k" * 32, alice.public_key)
+
+    asyncio.run(alice.send_group_chat(group_id, "original"))
+    target = find_body(carol, "original")
+
+    orig_send_relay = alice.send_relay
+
+    async def flaky_send_relay(peer, payload, **kwargs):
+        if peer == bob.public_key:
+            raise RuntimeError("bob relay broken")
+        return await orig_send_relay(peer, payload, **kwargs)
+
+    alice.send_relay = flaky_send_relay
+    try:
+        asyncio.run(alice.send_message_edit(target["msg_id"], "fixed"))
+    finally:
+        alice.send_relay = orig_send_relay
+
+    assert find_body(carol, "fixed") is not None
+    assert alice.db.get_message(target["msg_id"])["body"] == "fixed"
+
+    # When all sends fail in send_group_chat, DB delivered must be 0.
+    async def all_fail(peer, payload, **kwargs):
+        raise RuntimeError("network down")
+
+    alice.send_relay = all_fail
+    try:
+        asyncio.run(alice.send_group_chat(group_id, "offline group msg"))
+    finally:
+        alice.send_relay = orig_send_relay
+    failed_msg = alice.db.search_messages("offline group msg")[0]
+    assert failed_msg["delivered"] == 0
+
+
+def test_handle_chat_rejects_unknown_group_id(pair):
+    alice, bob = pair
+    establish(alice, bob)
+    session_key = alice.sessions[bob.public_key]
+    counter = alice.db.next_send_counter(bob.public_key)
+    payload = {
+        "msg_id": str(uuid.uuid4()), "from": alice.public_key,
+        "to": bob.public_key, "group_id": str(uuid.uuid4()),
+        "reply_to": None, "counter": counter, "sent_at": chat_module.utc_ts(),
+    }
+    msg_key = alice.crypto.derive_message_key(
+        session_key, alice.public_key, bob.public_key, counter, "chat"
+    )
+    packet = alice.crypto.encrypt(msg_key, chat_module.pad_plaintext(b"injected"), canonical_json(payload))
+    with pytest.raises(ValueError, match="unknown group"):
+        asyncio.run(bob.handle_relay_payload(
+            alice.public_key, {"kind": "chat", "payload": payload, "packet": packet}
+        ))
+
+
+def test_file_chunk_rejects_late_chunks_mismatches_and_cleans_corrupt_shards(pair):
+    alice, bob = pair
+    establish(alice, bob)
+
+    # Normal 2-chunk transfer succeeds and stores complete file
+    raw = b"A" * (chat_module.MAX_CHUNK_BYTES + 128)
+    fid = str(uuid.uuid4())
+    sha = hashlib.sha256(raw).hexdigest()
+    total_chunks = 2
+
+    def build_chunk(idx, chunk_bytes, file_id=fid, tot=total_chunks, size=len(raw), file_sha=sha, gid=None):
+        counter = alice.db.next_send_counter(bob.public_key)
+        meta = {
+            "file_id": file_id, "filename": "f.bin", "size": size, "sha256": file_sha,
+            "from": alice.public_key, "to": bob.public_key, "group_id": gid,
+            "mime_type": "application/octet-stream",
+            "total_chunks": tot, "chunk_size": chat_module.MAX_CHUNK_BYTES,
+            "sent_at": chat_module.utc_ts(), "chunk_index": idx,
+            "counter": counter, "chunk_sha256": hashlib.sha256(chunk_bytes).hexdigest(),
+        }
+        mk = alice.crypto.derive_message_key(
+            alice.sessions[bob.public_key], alice.public_key, bob.public_key, counter, "file-chunk"
+        )
+        pkt = alice.crypto.encrypt(mk, chunk_bytes, canonical_json(meta))
+        return {"kind": "file_chunk", "payload": meta, "packet": pkt}
+
+    c0 = build_chunk(0, raw[:chat_module.MAX_CHUNK_BYTES])
+    c1 = build_chunk(1, raw[chat_module.MAX_CHUNK_BYTES:])
+    asyncio.run(bob.handle_relay_payload(alice.public_key, c0))
+    asyncio.run(bob.handle_relay_payload(alice.public_key, c1))
+    assert bob.db.get_file(fid) is not None
+
+    # Late chunk for already-completed file must be rejected without leaving shard dir
+    c_late = build_chunk(0, raw[:chat_module.MAX_CHUNK_BYTES])
+    with pytest.raises(ValueError, match="already completed"):
+        asyncio.run(bob.handle_relay_payload(alice.public_key, c_late))
+    assert not (bob.files_dir / f"{fid}.chunks").exists()
+
+    # Corrupted shard on disk during final reassembly must clean up shards
+    fid2 = str(uuid.uuid4())
+    sha2 = hashlib.sha256(raw).hexdigest()
+    d0 = build_chunk(0, raw[:chat_module.MAX_CHUNK_BYTES], file_id=fid2, file_sha=sha2)
+    d1 = build_chunk(1, raw[chat_module.MAX_CHUNK_BYTES:], file_id=fid2, file_sha=sha2)
+    asyncio.run(bob.handle_relay_payload(alice.public_key, d0))
+    # Mismatched total_chunks for fid2 must be rejected
+    bad_tot = build_chunk(0, b"xyz", file_id=fid2, tot=1, size=3, file_sha=hashlib.sha256(b"xyz").hexdigest())
+    with pytest.raises(ValueError, match="Conflicting"):
+        asyncio.run(bob.handle_relay_payload(alice.public_key, bad_tot))
+    # Corrupt shard 0 ciphertext on disk before chunk 1 arrives
+    shard0 = bob.files_dir / f"{fid2}.chunks" / "0"
+    shard0.write_bytes(b"corrupted-ciphertext")
+    with pytest.raises(Exception):
+        asyncio.run(bob.handle_relay_payload(alice.public_key, d1))
+    assert bob.db.file_chunks(fid2) == []
+    assert not (bob.files_dir / f"{fid2}.chunks").exists()
+
+    # Unknown group_id in file chunk must be rejected
+    bad_grp = build_chunk(0, b"hi", file_id=str(uuid.uuid4()), tot=1, size=2,
+                          file_sha=hashlib.sha256(b"hi").hexdigest(), gid=str(uuid.uuid4()))
+    with pytest.raises(ValueError, match="unknown group"):
+        asyncio.run(bob.handle_relay_payload(alice.public_key, bad_grp))
+
+
+def test_signaling_server_purges_expired_queue_and_caps_rate_buckets(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUANTUM_CHAT_RELAY_DB", str(tmp_path / "relay_cap.db"))
+    srv = chat_module.SignalingServer()
+    try:
+        target = "cd" * 1312
+        old_ts = chat_module.utc_ts() - chat_module.OFFLINE_QUEUE_TTL - 10
+        for _ in range(chat_module.MAX_OFFLINE_QUEUE_PER_TARGET):
+            srv.relay_db.execute(
+                "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
+                (target, "{}", old_ts),
+            )
+        srv.relay_db.commit()
+        assert srv._offline_queue_full(target) is False
+        assert srv._offline_queue_count(target) == 0
+
+        ws = object()
+        for _ in range(10):
+            srv._rate_ok(ws, limit=3)
+        assert len(srv.rate[ws]) == 3
+
+        for _ in range(10):
+            srv._pubkey_rate_ok(target, limit=4)
+        assert len(srv.pubkey_rate[target]) == 4
+    finally:
+        srv.relay_db.close()
+
+
+def test_direct_pool_eviction_and_closed_socket_reacquire(tmp_path):
+    node = chat_module.QuantumNode(
+        str(tmp_path / "pool.db"), "ws://127.0.0.1:1", enable_direct=True
+    )
+    try:
+        closed_calls = []
+
+        class FakeWS:
+            def __init__(self, is_open=True):
+                self.close_code = None if is_open else 1000
+
+            async def close(self):
+                closed_calls.append(True)
+                self.close_code = 1000
+
+        async def run():
+            old_ws = FakeWS(is_open=True)
+            node.peer_direct["peer1"] = "ws://127.0.0.1:9001"
+            node._direct_pool["ws://127.0.0.1:9001"] = old_ws
+            # Evicting an unused URL closes its pooled WebSocket.
+            await node._handle_signaling_message({
+                "type": "peers",
+                "peers": {"peer1": {"relay_alias": None, "direct_url": "ws://127.0.0.1:9002"}},
+            })
+            await asyncio.sleep(0.05)
+            assert closed_calls == [True]
+            assert "ws://127.0.0.1:9001" not in node._direct_pool
+
+            # _acquire_direct_conn drops closed pooled sockets instead of reusing them.
+            dead_ws = FakeWS(is_open=False)
+            node._direct_pool["ws://127.0.0.1:9002"] = dead_ws
+            assert node._is_ws_open(dead_ws) is False
+
+        asyncio.run(run())
+    finally:
+        node.db.close()
+
+
+def test_ui_group_read_receipt_keeps_dm_unread_and_device_sync_validates(pair):
+    alice, bob = pair
+    establish(alice, bob)
+    bob.db.increment_unread(alice.public_key)
+    group_id = str(uuid.uuid4())
+    bob.db.create_group(group_id, "Team", alice.public_key)
+    bob.db.add_group_member(group_id, bob.public_key)
+    gid_msg = str(uuid.uuid4())
+    bob.db.save_message(gid_msg, alice.public_key, "in group", "in", group_id=group_id)
+
+    ui_ws = add_ui(bob)
+    asyncio.run(bob._dispatch_ui(ui_ws, {
+        "type": "read_receipt", "pubkey": alice.public_key, "msg_id": gid_msg, "group_id": group_id,
+    }))
+    friend = next(f for f in bob.db.get_friends() if f["pubkey"] == alice.public_key)
+    assert friend["unread"] == 1
+
+    # Invalid synced message with empty body must be rejected
+    key = bob.crypto.derive_device_sync_key(bob.secret_key)
+    bad_body = canonical_json({
+        "event": "chat_in",
+        "data": {"msg_id": "x", "sender_pubkey": alice.public_key, "body": ""},
+    })
+    env = bob.signed_payload("device_sync", {"packet": bob.crypto.encrypt(key, bad_body)})
+    with pytest.raises(ValueError, match="Invalid synced chat message"):
+        asyncio.run(bob._handle_device_sync(bob.public_key, env))
+
+
+def test_ui_html_v401_hardening_checks():
+    html = chat_module.HTML
+    assert "location.protocol === 'https:' ? '443' : '80'" in html
+    assert "selectedTarget.type === 'friend' ? selectedTarget.id : m.sender_pubkey" in html
+    assert "function copyTextToClipboard(" in html
+    assert "((a.id ?? 1e15) - (b.id ?? 1e15))" in html
+    assert "displayName(m.sender_pubkey)" in html
+    assert "0 / 65,536" in html
+    assert ".msg-actions { display: none; }" in html
+    assert "ws://[::1]:*" not in html
+
+    handler = object.__new__(chat_module.ChatHTTPHandler)
+    handler.require_http_auth = False
+    sent = []
+    handler.send_header = lambda k, v: sent.append((k, v))
+    handler.headers = {"Host": "127.0.0.1:8000"}
+    chat_module.ChatHTTPHandler._security_headers(handler)
+    csp = next(v for k, v in sent if k == "Content-Security-Policy")
+    assert "[::1]" not in csp
+    assert "ws://127.0.0.1:*" in csp
+
+
+def test_signaling_purge_empty_commits_transaction(tmp_path, monkeypatch):
+    relay_db = tmp_path / "relay_purge.db"
+    monkeypatch.setenv("QUANTUM_CHAT_RELAY_DB", str(relay_db))
+    srv = chat_module.SignalingServer()
+    try:
+        srv._purge_expired_offline_queue()
+        assert srv.relay_db.in_transaction is False
+    finally:
+        srv.relay_db.close()
+
+
+

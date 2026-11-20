@@ -131,6 +131,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -805,13 +806,13 @@ class Database:
         self.path = db_path
         self.master_key = master_key
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, notably faster fsync behavior
             self.conn.execute("PRAGMA foreign_keys=ON")
-            self.conn.execute("PRAGMA busy_timeout=5000")
+            self.conn.execute("PRAGMA busy_timeout=30000")
             self._init_tables()
 
     def _init_tables(self) -> None:
@@ -1231,7 +1232,9 @@ class Database:
             row = self.conn.execute(
                 "SELECT send_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
             ).fetchone()
-            start = int(row["send_counter"] if row else 0) + 1
+            if row is None:
+                raise ValueError("No active session to reserve send counters")
+            start = int(row["send_counter"]) + 1
             end = start + count - 1
             self.conn.execute(
                 "UPDATE sessions SET send_counter=? WHERE peer_pubkey=?", (end, peer_pubkey)
@@ -1427,24 +1430,31 @@ class Database:
         if not new_body or len(new_body.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Edited message is empty or too large")
         plaintext = new_body.encode("utf-8")
-        row = self.get_message(msg_id)
-        if row is None or row.get("deleted_at"):
-            return False
-        if row.get("edited_at") and int(row["edited_at"]) >= int(edited_at):
-            return False
-        aad = (f"message:{msg_id}:{row['sender_pubkey']}:"
-               f"{row.get('recipient_pubkey') or ''}:{row.get('group_id') or ''}").encode()
-        blob, nonce, version = self.encrypt_blob(plaintext, aad)
+        edited_ts = int(edited_at)
         with self.lock:
+            raw_row = self.conn.execute(
+                "SELECT * FROM messages WHERE msg_id=?", (str(msg_id or ""),)
+            ).fetchone()
+            if raw_row is None:
+                return False
+            row = self._hydrate_message_row(raw_row)
+            if row.get("deleted_at"):
+                return False
+            if row.get("edited_at") and int(row["edited_at"]) >= edited_ts:
+                return False
+            aad = (f"message:{msg_id}:{row['sender_pubkey']}:"
+                   f"{row.get('recipient_pubkey') or ''}:{row.get('group_id') or ''}").encode()
+            blob, nonce, version = self.encrypt_blob(plaintext, aad)
             cur = self.conn.execute(
-                "UPDATE messages SET body=?, body_nonce=?, key_version=?, edited_at=? WHERE msg_id=?",
+                "UPDATE messages SET body=?, body_nonce=?, key_version=?, edited_at=? "
+                "WHERE msg_id=? AND deleted_at IS NULL AND (edited_at IS NULL OR edited_at < ?)",
                 (blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
-                 nonce, version, int(edited_at), msg_id)
+                 nonce, version, edited_ts, msg_id, edited_ts)
             )
             self.conn.commit()
             return cur.rowcount > 0
 
-    def tombstone_message(self, msg_id: str) -> bool:
+    def tombstone_message(self, msg_id: str, deleted_at: int | None = None) -> bool:
         """Erase the body of one message and mark it deleted-for-everyone.
 
         The row is kept (not dropped) so reply chains that quote it still
@@ -1455,11 +1465,12 @@ class Database:
         nonce over an empty "ciphertext" fails AES-GCM authentication and
         would make every later hydration of the row raise InvalidTag.
         """
+        ts = int(deleted_at) if deleted_at is not None else utc_ts()
         with self.lock:
             cur = self.conn.execute(
                 "UPDATE messages SET body='', body_nonce=NULL, deleted_at=?, edited_at=NULL "
                 "WHERE msg_id=? AND deleted_at IS NULL",
-                (utc_ts(), str(msg_id or ""))
+                (ts, str(msg_id or ""))
             )
             if cur.rowcount:
                 self.conn.execute("DELETE FROM reactions WHERE msg_id=?", (msg_id,))
@@ -1905,6 +1916,7 @@ class QuantumNode:
         self._direct_pool: dict[str, Any] = {}
         self._direct_send_locks: dict[str, asyncio.Lock] = {}
         self._direct_pool_lock = asyncio.Lock()
+        self._pending_file_meta: dict[str, tuple[str, int, int, str, str | None]] = {}
         # peer_pubkey -> {"call_id", "role" ("caller"/"callee"), "media"
         # ("audio"/"video"), "state" ("ringing"/"active")}. Call *signaling*
         # (offer/answer/ICE candidates) rides the same PQ-authenticated
@@ -2056,7 +2068,9 @@ class QuantumNode:
         self.db.metric_inc("relay_sent")
 
     async def send_direct(self, peer_pubkey: str, payload: dict[str, Any]) -> None:
-        direct_url = self.peer_direct[peer_pubkey]
+        direct_url = self.peer_direct.get(peer_pubkey)
+        if not direct_url:
+            raise RuntimeError("No direct URL advertised for peer")
         hello = {"from": self.public_key, "to": peer_pubkey, "sent_at": utc_ts(), "payload": payload}
         sig = b64e(self.crypto.sign(self.secret_key, canonical_json(hello)))
         frame = json.dumps({"type": "direct", **hello, "signature": sig})
@@ -2168,15 +2182,31 @@ class QuantumNode:
         except Exception as exc:
             LOG.debug("Direct peer connection from %s ended: %s", remote_host, exc)
 
+    @staticmethod
+    def _is_ws_open(ws: Any) -> bool:
+        if getattr(ws, "closed", False):
+            return False
+        if getattr(ws, "close_code", None) is not None:
+            return False
+        state = getattr(ws, "state", None)
+        if state is not None and getattr(state, "name", None) in {"CLOSING", "CLOSED"}:
+            return False
+        return True
+
     async def _acquire_direct_conn(self, direct_url: str) -> Any:
         """Return a live pooled connection for this direct URL, dialing a new
         one only when the pool has none. Reusing connections removes a full
         TCP+WebSocket handshake from every file chunk / message delivery."""
         pooled = self._direct_pool.get(direct_url)
         if pooled is not None:
-            return pooled
+            if self._is_ws_open(pooled):
+                return pooled
+            self._direct_pool.pop(direct_url, None)
         async with self._direct_pool_lock:
             pooled = self._direct_pool.get(direct_url)
+            if pooled is not None and not self._is_ws_open(pooled):
+                self._direct_pool.pop(direct_url, None)
+                pooled = None
             if pooled is None:
                 websockets = require_websockets()
                 pooled = await websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2)
@@ -2494,6 +2524,10 @@ class QuantumNode:
                         group_id: str | None = None,
                         reply_to: str | None = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
+        if group_id is not None:
+            group_id = validate_file_id(str(group_id))
+            if self.public_key not in self.db.group_members(group_id):
+                raise ValueError("You are not a member of this group")
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Message is empty or too large")
@@ -2592,6 +2626,11 @@ class QuantumNode:
         # plaintext in our database just because it decrypts cleanly.
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Chat message is empty or too large")
+        group_id = payload.get("group_id")
+        if group_id is not None:
+            group_id = validate_file_id(str(group_id))
+            if self.public_key not in self.db.group_members(group_id):
+                raise ValueError("Chat message for unknown group")
         # Consume the replay counter only after every validation above
         # succeeded — burning it first made a corrupted/oversized message
         # unrepairable (the identical retransmission would trip duplicate
@@ -2607,11 +2646,12 @@ class QuantumNode:
             reply_to = validate_msg_id(reply_to, "Reply target")
         inserted = self.db.save_message(
             payload["msg_id"], peer_pubkey, text, "in",
-            recipient=self.public_key, group_id=payload.get("group_id"),
+            recipient=self.public_key, group_id=group_id,
             delivered=True, status="delivered", reply_to=reply_to
         )
         if inserted:
-            self.db.increment_unread(peer_pubkey)
+            if not group_id:
+                self.db.increment_unread(peer_pubkey)
             ack = self.signed_payload("delivery_ack", {
                 "from": self.public_key, "to": peer_pubkey,
                 "msg_id": payload["msg_id"], "delivered_at": utc_ts(),
@@ -2830,9 +2870,16 @@ class QuantumNode:
                     "epoch": int(group_key["epoch"]), "edited_at": edited_at}
             packet = self.crypto.encrypt(group_key["key"], pad_plaintext(text.encode()), canonical_json(meta))
             envelope = self.signed_payload("group_message_edit", {"meta": meta, "packet": packet})
-            for peer in members - {self.public_key}:
-                if self.db.is_friend(peer):
+            recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
+
+            async def deliver_edit(peer: str) -> None:
+                try:
                     await self.send_relay(peer, envelope, queue_on_failure=True)
+                except Exception as exc:
+                    LOG.warning("Group edit fan-out to %s failed: %s", short_key(peer), exc)
+
+            if recipients:
+                await asyncio.gather(*(deliver_edit(peer) for peer in recipients))
         else:
             peer_pubkey = row.get("recipient_pubkey") or ""
             peer_pubkey = self.validate_peer_key(peer_pubkey)
@@ -2881,10 +2928,13 @@ class QuantumNode:
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Edited message is empty or too large")
         # Only the message's author may rewrite it — a peer must not be able
-        # to edit OUR copy of a message someone else sent.
+        # to edit OUR copy of a message someone else sent, nor edit a group
+        # message over a 1:1 session channel.
         row = self.db.get_message(msg_id)
         if row is None or row.get("sender_pubkey") != peer_pubkey:
             raise ValueError("Edit target was not authored by the sender")
+        if row.get("group_id") is not None:
+            raise ValueError("Cannot edit a group message over a 1:1 session")
         # Consume the replay counter only after every validation above
         # succeeded, mirroring handle_chat's re-transmittable failure mode.
         self.db.mark_recv_counter(peer_pubkey, counter)
@@ -2906,7 +2956,7 @@ class QuantumNode:
         if meta.get("from") != peer_pubkey:
             raise ValueError("Group edit sender mismatch")
         msg_id = validate_msg_id(meta.get("msg_id", ""), "Edit target")
-        group_id = str(meta.get("group_id", ""))
+        group_id = validate_file_id(str(meta.get("group_id", "")))
         if self.public_key not in self.db.group_members(group_id):
             raise ValueError("Group edit for unknown group")
         group_key = self.db.get_group_key(group_id, int(meta.get("epoch", 0)))
@@ -2920,6 +2970,8 @@ class QuantumNode:
         row = self.db.get_message(msg_id)
         if row is None or row.get("sender_pubkey") != peer_pubkey:
             raise ValueError("Edit target was not authored by the sender")
+        if row.get("group_id") != group_id:
+            raise ValueError("Edit target does not belong to this group")
         edited_at = int(meta.get("edited_at") or utc_ts_ms())
         if self.db.edit_message(msg_id, text, edited_at):
             await self.broadcast_ui({
@@ -2953,7 +3005,7 @@ class QuantumNode:
             peer_pubkey = self.validate_peer_key(peer_pubkey)
             targets = [peer_pubkey]
 
-        if not self.db.tombstone_message(msg_id):
+        if not self.db.tombstone_message(msg_id, deleted_at=deleted_at):
             raise ValueError("Message is not available to delete")
 
         # Each recipient gets its own signed frame stamped `to` them: group
@@ -2973,7 +3025,7 @@ class QuantumNode:
         await self.broadcast_ui({
             "type": "message_tombstoned", "msg_id": msg_id, "deleted_at": deleted_at,
         })
-        await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id})
+        await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id, "deleted_at": deleted_at})
 
     async def handle_message_delete(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         """Tombstone our copy of a message its author deleted everywhere."""
@@ -3000,12 +3052,13 @@ class QuantumNode:
             raise ValueError("Message deletion routing mismatch")
         if row.get("sender_pubkey") != peer_pubkey:
             raise ValueError("Only the message author may delete it for everyone")
-        if self.db.tombstone_message(msg_id):
+        deleted_at = int(payload.get("deleted_at") or utc_ts())
+        if self.db.tombstone_message(msg_id, deleted_at=deleted_at):
             await self.broadcast_ui({
                 "type": "message_tombstoned", "msg_id": msg_id,
-                "deleted_at": int(payload.get("deleted_at") or utc_ts()),
+                "deleted_at": deleted_at,
             })
-            await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id})
+            await self.sync_to_devices("message_tombstoned", {"msg_id": msg_id, "deleted_at": deleted_at})
 
     # ── Multi-device sync ────────────────────────────────────────────────────
 
@@ -3039,20 +3092,24 @@ class QuantumNode:
         data = body.get("data", {}) or {}
         if event in ("chat_out", "chat_in"):
             direction = "out" if event == "chat_out" else "in"
+            msg_id = str(data.get("msg_id") or "").strip()
+            sender = str(data.get("sender_pubkey") or "").strip()
+            body_text = str(data.get("body") or "")
+            if not msg_id or not sender or not body_text or len(body_text.encode()) > MAX_TEXT_BYTES:
+                raise ValueError("Invalid synced chat message")
             inserted = self.db.save_message(
-                str(data.get("msg_id", "")), str(data.get("sender_pubkey", "")),
-                str(data.get("body", "")), direction,
+                msg_id, sender, body_text, direction,
                 recipient=data.get("recipient_pubkey"), group_id=data.get("group_id"),
                 delivered=bool(data.get("delivered", True)), status=str(data.get("status", "delivered")),
                 reply_to=data.get("reply_to"),
             )
             if inserted:
                 if direction == "in" and not data.get("group_id"):
-                    self.db.increment_unread(str(data.get("sender_pubkey", "")))
+                    self.db.increment_unread(sender)
                 await self.broadcast_ui({"type": "message", "message": {
-                    "msg_id": data.get("msg_id"), "sender_pubkey": data.get("sender_pubkey"),
+                    "msg_id": msg_id, "sender_pubkey": sender,
                     "recipient_pubkey": data.get("recipient_pubkey"), "group_id": data.get("group_id"),
-                    "body": data.get("body"), "direction": direction, "timestamp": utc_ts(),
+                    "body": body_text, "direction": direction, "timestamp": utc_ts(),
                     "delivered": int(bool(data.get("delivered", True))),
                     "status": data.get("status", "delivered"), "reactions": [], "read_at": None,
                     "reply_to": data.get("reply_to"), "edited_at": None, "deleted_at": None,
@@ -3061,16 +3118,19 @@ class QuantumNode:
             # A sibling device edited one of our own messages: apply the same
             # monotonic edited_at guard so two devices racing to edit converge.
             msg_id = str(data.get("msg_id", ""))
-            body = str(data.get("body", ""))
+            body_text = str(data.get("body", ""))
             edited_at = int(data.get("edited_at") or utc_ts_ms())
-            if body and self.db.edit_message(msg_id, body, edited_at):
+            if body_text and self.db.edit_message(msg_id, body_text, edited_at):
                 await self.broadcast_ui({
-                    "type": "message_edited", "msg_id": msg_id, "body": body, "edited_at": edited_at,
+                    "type": "message_edited", "msg_id": msg_id, "body": body_text, "edited_at": edited_at,
                 })
         elif event == "message_tombstoned":
             msg_id = str(data.get("msg_id", ""))
-            if self.db.tombstone_message(msg_id):
-                await self.broadcast_ui({"type": "message_tombstoned", "msg_id": msg_id})
+            deleted_at = int(data.get("deleted_at") or utc_ts())
+            if self.db.tombstone_message(msg_id, deleted_at=deleted_at):
+                await self.broadcast_ui({
+                    "type": "message_tombstoned", "msg_id": msg_id, "deleted_at": deleted_at,
+                })
         elif event == "reaction":
             msg_id = str(data.get("msg_id", ""))
             peer = str(data.get("peer", ""))
@@ -3362,6 +3422,8 @@ class QuantumNode:
         recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
         results = await asyncio.gather(*(deliver(peer) for peer in recipients)) if recipients else []
         actually_sent = sum(1 for ok in results if ok)
+        if recipients and actually_sent == 0:
+            self.db.update_message_status(msg_id, "sent_to_group", delivered=False)
         await self.broadcast_ui({"type": "message", "message": {
             "msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": None,
             "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
@@ -3463,6 +3525,17 @@ class QuantumNode:
             "storage_bytes": self._storage_bytes_used(),
         })
 
+    def _validate_file_transfer_meta(self, meta: dict[str, Any]) -> tuple[str, str | None]:
+        sha256 = str(meta.get("sha256", ""))
+        if not HEX_RE.fullmatch(sha256) or len(sha256) != 64:
+            raise ValueError("Invalid file checksum format")
+        group_id = meta.get("group_id")
+        if group_id is not None:
+            group_id = validate_file_id(str(group_id))
+            if self.public_key not in self.db.group_members(group_id):
+                raise ValueError("File transfer for unknown group")
+        return sha256, group_id
+
     async def handle_file(self, peer_pubkey: str, data: dict[str, Any]) -> None:
         # Backward-compatible single-packet file receiver.
         session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
@@ -3470,6 +3543,7 @@ class QuantumNode:
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
             raise ValueError("File routing metadata mismatch")
         file_id = validate_file_id(meta.get("file_id", ""))
+        self._validate_file_transfer_meta(meta)
         counter = int(meta.get("counter", 0))
         msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, self.public_key, counter, "file")
         raw = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
@@ -3482,7 +3556,8 @@ class QuantumNode:
         meta = data.get("payload", {})
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
             raise ValueError("File manifest routing mismatch")
-        validate_file_id(meta.get("file_id", ""))
+        file_id = validate_file_id(meta.get("file_id", ""))
+        sha256, group_id = self._validate_file_transfer_meta(meta)
         size = int(meta.get("size", -1))
         total_chunks = int(meta.get("total_chunks", 0))
         expected_chunks = max(1, (size + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES) if size >= 0 else 0
@@ -3490,6 +3565,7 @@ class QuantumNode:
             raise ValueError("File exceeds configured limit")
         if total_chunks != expected_chunks or int(meta.get("chunk_size", 0)) != MAX_CHUNK_BYTES:
             raise ValueError("Invalid file manifest chunk layout")
+        self._pending_file_meta[file_id] = (peer_pubkey, total_chunks, size, sha256, group_id)
         # Manifest metadata is re-sanitized where it is actually persisted
         # (_store_complete_file); calling the validators here and discarding
         # the results validated nothing.
@@ -3505,6 +3581,9 @@ class QuantumNode:
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
             raise ValueError("File chunk routing metadata mismatch")
         file_id = validate_file_id(meta.get("file_id", ""))
+        if self.db.get_file(file_id) is not None:
+            raise ValueError("File transfer already completed")
+        sha256, group_id = self._validate_file_transfer_meta(meta)
         counter = int(meta.get("counter", 0))
         msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, self.public_key, counter, "file-chunk")
         chunk = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
@@ -3523,11 +3602,19 @@ class QuantumNode:
                          min(MAX_CHUNK_BYTES, declared_size - chunk_index * MAX_CHUNK_BYTES))
         if len(chunk) != expected_size:
             raise ValueError("File chunk size mismatch")
+        expected_tuple = (peer_pubkey, total_chunks, declared_size, sha256, group_id)
+        prior_tuple = self._pending_file_meta.get(file_id)
+        if prior_tuple is not None and prior_tuple != expected_tuple:
+            raise ValueError("Conflicting file chunk metadata")
+        existing_chunks = self.db.file_chunks(file_id)
+        if existing_chunks and int(existing_chunks[0]["total_chunks"]) != total_chunks:
+            raise ValueError("Conflicting total_chunks for file transfer")
         # Consume the replay counter only after every validation above
         # succeeded — burning it first made a corrupted chunk unrepairable:
         # the sender's retransmission of that exact chunk would trip
         # duplicate detection instead of being stored.
         self.db.mark_recv_counter(peer_pubkey, counter)
+        self._pending_file_meta.setdefault(file_id, expected_tuple)
         self._check_storage_quota(len(chunk))
         self.files_dir.mkdir(parents=True, exist_ok=True)
         chunk_dir = self.files_dir / f"{file_id}.chunks"
@@ -3545,10 +3632,15 @@ class QuantumNode:
             self._track_storage(len(stored_chunk))
         chunks = self.db.file_chunks(file_id)
         if len(chunks) == total_chunks:
-            raw = b"".join(
-                self.decrypt_chunk_from_disk(Path(c["storage_path"]).read_bytes(), file_id, c["chunk_index"], c.get("chunk_nonce"))
-                for c in chunks
-            )
+            self._pending_file_meta.pop(file_id, None)
+            try:
+                raw = b"".join(
+                    self.decrypt_chunk_from_disk(Path(c["storage_path"]).read_bytes(), file_id, c["chunk_index"], c.get("chunk_nonce"))
+                    for c in chunks
+                )
+            except Exception:
+                self._cleanup_file_chunks(file_id, chunks)
+                raise
             # Chunk shards are only scratch space for reassembly; clean them
             # up as soon as we have the full plaintext in memory, before
             # storing the final file or telling any UI client about it, so
@@ -3560,6 +3652,7 @@ class QuantumNode:
         """Delete on-disk chunk shards and their DB rows once a transfer is
         reassembled (or has failed), so no encrypted-at-rest debris or stale
         rows linger, and the storage quota accounting stays accurate."""
+        self._pending_file_meta.pop(file_id, None)
         freed = 0
         for c in chunks:
             path = Path(c["storage_path"])
@@ -3825,6 +3918,11 @@ class QuantumNode:
             return
         self.ui_clients.add(ws)
         try:
+            import websockets.exceptions as _ws_exc
+            conn_closed_exc: tuple[type[BaseException], ...] = (_ws_exc.ConnectionClosed,)
+        except Exception:
+            conn_closed_exc = ()
+        try:
             # The handshake push belongs inside the guarded region: if the
             # client vanishes between the WebSocket handshake and this first
             # send, the finally below must still discard it — leaving the
@@ -3854,6 +3952,8 @@ class QuantumNode:
                         "type": "notice", "level": "error",
                         "text": f"Internal error: {type(exc).__name__}: {exc}"
                     }))
+        except conn_closed_exc as exc:
+            LOG.debug("UI client disconnected: %s", exc)
         finally:
             self.ui_clients.discard(ws)
 
@@ -3998,14 +4098,18 @@ class QuantumNode:
             # incoming message's read_at, so the button reappeared after
             # every reload (mark_message_read was dead code until now).
             self.db.mark_message_read(msg_id)
-            self.db.clear_unread(msg["pubkey"])
+            msg_row = self.db.get_message(msg_id)
+            is_group_msg = bool(msg.get("group_id") or (msg_row and msg_row.get("group_id")))
+            if not is_group_msg:
+                self.db.clear_unread(msg["pubkey"])
             await self.broadcast_ui({
                 "type": "read_receipt", "msg_id": msg_id,
                 "peer": self.public_key, "read_at": utc_ts(),
                 "local": True,
             })
-            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
-            await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"], "msg_id": msg_id})
+            if not is_group_msg:
+                await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+                await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"], "msg_id": msg_id})
         elif typ == "reaction":
             await self.send_reaction(
                 msg["pubkey"], str(msg["msg_id"]),
@@ -4100,15 +4204,20 @@ class QuantumNode:
                         # retrying the connection beats sending an unsigned
                         # register that can only be rejected.
                         raise ValueError("Signaling server did not issue a registration challenge")
-                    await self.broadcast_ui({
-                        "type": "notice", "level": "success",
-                        "text": "Connected to signaling server"
-                    })
-                    async for raw in ws:
-                        try:
-                            await self._handle_signaling_message(json.loads(raw))
-                        except Exception as exc:
-                            LOG.warning("Ignored malformed signaling message: %s", exc)
+                    try:
+                        await self.broadcast_ui({
+                            "type": "notice", "level": "success",
+                            "text": "Connected to signaling server"
+                        })
+                        async for raw in ws:
+                            try:
+                                await self._handle_signaling_message(json.loads(raw))
+                            except Exception as exc:
+                                LOG.warning("Ignored malformed signaling message: %s", exc)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(ws.close(), timeout=1.0)
+                        raise
                     # The `async with` also exits without raising when the
                     # relay closes the connection cleanly (restart, deploy).
                     # Nulling the reference here is what lets send_relay queue
@@ -4149,6 +4258,20 @@ class QuantumNode:
                 await asyncio.sleep(wait)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
+    def _evict_direct_url(self, url: str) -> None:
+        if any(v == url for v in self.peer_direct.values()):
+            return
+        evicted = self._direct_pool.pop(url, None)
+        if evicted is not None:
+            async def _close_evicted(conn: Any = evicted) -> None:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+            with contextlib.suppress(RuntimeError):
+                asyncio.ensure_future(_close_evicted())
+        lock = self._direct_send_locks.get(url)
+        if lock is not None and not lock.locked():
+            self._direct_send_locks.pop(url, None)
+
     async def _handle_signaling_message(self, msg: dict[str, Any]) -> None:
         if msg.get("type") == "peers":
             raw_peers = msg.get("peers", [])
@@ -4164,13 +4287,11 @@ class QuantumNode:
                             # (restart, port change) invalidates pooled
                             # connections to the old endpoint.
                             if old_url and old_url != direct_url:
-                                self._direct_pool.pop(old_url, None)
-                                self._direct_send_locks.pop(old_url, None)
+                                self._evict_direct_url(old_url)
                         else:
                             self.peer_direct.pop(peer, None)
                             if old_url:
-                                self._direct_pool.pop(old_url, None)
-                                self._direct_send_locks.pop(old_url, None)
+                                self._evict_direct_url(old_url)
                         self.db.set_friend_transport(peer, meta.get("relay_alias"), direct_url)
             else:
                 self.online_peers = set(raw_peers) - {self.public_key}
@@ -4197,7 +4318,10 @@ class SignalingServer:
         self.clients: dict[str, set[Any]] = {}
         self.aliases: dict[str, str] = {}
         self.peer_meta: dict[str, dict[str, Any]] = {}
-        self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), check_same_thread=False)
+        self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), timeout=30.0, check_same_thread=False)
+        self.relay_db.execute("PRAGMA journal_mode=WAL")
+        self.relay_db.execute("PRAGMA synchronous=NORMAL")
+        self.relay_db.execute("PRAGMA busy_timeout=30000")
         self.relay_db.execute("CREATE TABLE IF NOT EXISTS offline_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
         self.relay_db.execute("CREATE INDEX IF NOT EXISTS idx_offline_queue_target ON offline_queue(target, id)")
         self.relay_db.commit()
@@ -4213,22 +4337,34 @@ class SignalingServer:
     def _rate_ok(self, ws: Any, limit: int = 120, window: int = 60) -> bool:
         now = utc_ts()
         events = [t for t in self.rate.get(ws, []) if now - t < window]
+        if len(events) >= limit:
+            self.rate[ws] = events
+            return False
         events.append(now)
         self.rate[ws] = events
-        return len(events) <= limit
+        return True
 
     def _pubkey_rate_ok(self, pubkey: str, limit: int = 300, window: int = 60) -> bool:
         now = utc_ts()
         events = [t for t in self.pubkey_rate.get(pubkey, []) if now - t < window]
+        if len(events) >= limit:
+            self.pubkey_rate[pubkey] = events
+            return False
         events.append(now)
         self.pubkey_rate[pubkey] = events
-        return len(events) <= limit
+        return True
 
     def _offline_queue_count(self, target: str) -> int:
         row = self.relay_db.execute(
             "SELECT COUNT(*) FROM offline_queue WHERE target=?", (target,)
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def _offline_queue_full(self, target: str) -> bool:
+        if self._offline_queue_count(target) < MAX_OFFLINE_QUEUE_PER_TARGET:
+            return False
+        self._purge_expired_offline_queue()
+        return self._offline_queue_count(target) >= MAX_OFFLINE_QUEUE_PER_TARGET
 
     def _purge_expired_offline_queue(self) -> None:
         """Delete offline-queue rows older than the TTL.
@@ -4238,9 +4374,9 @@ class SignalingServer:
         query cheap and bounds total disk use."""
         cutoff = utc_ts() - OFFLINE_QUEUE_TTL
         cur = self.relay_db.execute("DELETE FROM offline_queue WHERE created_at <= ?", (cutoff,))
+        self.relay_db.commit()
         if cur.rowcount:
             LOG.info("Purged %d expired offline-queue envelope(s)", cur.rowcount)
-            self.relay_db.commit()
 
     async def _drain_offline_queue(self, ws: Any, pubkey: str) -> None:
         """Deliver persisted offline envelopes to a freshly registered socket.
@@ -4289,8 +4425,13 @@ class SignalingServer:
     async def handle(self, ws: Any) -> None:
         pubkey = None
         nonce = secrets.token_urlsafe(32)
-        await ws.send(json.dumps({"type": "register_challenge", "nonce": nonce}))
         try:
+            import websockets.exceptions as _ws_exc
+            conn_closed_exc: tuple[type[BaseException], ...] = (_ws_exc.ConnectionClosed,)
+        except Exception:
+            conn_closed_exc = ()
+        try:
+            await ws.send(json.dumps({"type": "register_challenge", "nonce": nonce}))
             async for raw in ws:
                 if not self._rate_ok(ws):
                     await ws.send(json.dumps({"type": "error", "text": "Rate limit exceeded"}))
@@ -4412,7 +4553,7 @@ class SignalingServer:
                                 # device online, or spam a relay/direct message the
                                 # instant a peer reconnects long after it's stale.
                                 await ws.send(json.dumps({"type": "queued", "to": target, "ephemeral": True}))
-                            elif self._offline_queue_count(target) >= MAX_OFFLINE_QUEUE_PER_TARGET:
+                            elif self._offline_queue_full(target):
                                 await ws.send(json.dumps({"type": "error", "text": "Peer offline queue is full"}))
                             else:
                                 queued = {"type": "relay", "from": pubkey, "payload": payload, "offline": True}
@@ -4438,6 +4579,8 @@ class SignalingServer:
                     LOG.warning("Rejected signaling frame with internal error: %s", exc)
                     LOG.debug("Signaling frame rejection traceback", exc_info=True)
                     await ws.send(json.dumps({"type": "error", "text": "Invalid frame"}))
+        except conn_closed_exc as exc:
+            LOG.debug("Signaling connection closed: %s", exc)
         finally:
             self.rate.pop(ws, None)
             if pubkey and pubkey in self.clients:
@@ -4619,10 +4762,40 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             client_sock.setblocking(False)
             backend.setblocking(False)
 
-            sockets = [client_sock, backend]
-            while sockets:
-                rlist, _, xlist = select.select(sockets, [], sockets, 60.0)
+            pending: dict[socket.socket, bytearray] = {
+                client_sock: bytearray(),
+                backend: bytearray(),
+            }
+            max_pending = MAX_FILE_BYTES * 2
+            eof_from: set[socket.socket] = set()
+            while True:
+                if self.node and getattr(self.node, "_shutting_down", False):
+                    break
+                rwatch = [
+                    s for s in (client_sock, backend)
+                    if s not in eof_from and len(pending[backend if s is client_sock else client_sock]) < max_pending
+                ]
+                wwatch = [s for s in (client_sock, backend) if pending[s]]
+                if not rwatch and not wwatch:
+                    break
+                rlist, wlist, xlist = select.select(rwatch, wwatch, [client_sock, backend], 2.0)
                 if xlist:
+                    break
+                for s in wlist:
+                    buf = pending[s]
+                    if not buf:
+                        continue
+                    try:
+                        sent = s.send(buf)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except Exception:
+                        buf.clear()
+                        eof_from.update((client_sock, backend))
+                        break
+                    if sent:
+                        del buf[:sent]
+                if client_sock in eof_from and backend in eof_from:
                     break
                 for s in rlist:
                     other = backend if s is client_sock else client_sock
@@ -4633,13 +4806,25 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                     except Exception:
                         data = b""
                     if not data:
-                        sockets.clear()
-                        break
-                    try:
-                        other.sendall(data)
-                    except Exception:
-                        sockets.clear()
-                        break
+                        eof_from.add(s)
+                        if not pending[other]:
+                            eof_from.add(other)
+                        continue
+                    buf = pending[other]
+                    if not buf:
+                        try:
+                            sent = other.send(data)
+                            if sent < len(data):
+                                buf.extend(data[sent:])
+                        except (BlockingIOError, InterruptedError):
+                            buf.extend(data)
+                        except Exception:
+                            eof_from.update((client_sock, backend))
+                            break
+                    else:
+                        buf.extend(data)
+                if eof_from and not pending[client_sock] and not pending[backend]:
+                    break
         except Exception as exc:
             LOG.debug("WebSocket bridge connection terminated: %s", exc)
         finally:
@@ -4826,8 +5011,8 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         # reach ICE servers for voice/video calls — CSP3-compliant browsers
         # apply connect-src to WebRTC connections, not just fetch/WebSocket.
         connect_src = ("connect-src 'self' stun: turn: stuns: turns: "
-                       "ws://127.0.0.1:* ws://localhost:* ws://[::1]:* "
-                       "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;")
+                       "ws://127.0.0.1:* ws://localhost:* "
+                       "wss://127.0.0.1:* wss://localhost:*;")
         if self.require_http_auth:
             host = (self.headers.get("Host", "") or "").strip()
             # Only interpolate a syntactically valid host[:port] into the CSP.
@@ -4841,8 +5026,8 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                 host = host.split("/", 1)[0]
                 connect_src = (
                     f"connect-src 'self' stun: turn: stuns: turns: ws://{host} wss://{host} "
-                    "ws://127.0.0.1:* ws://localhost:* ws://[::1]:* "
-                    "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
+                    "ws://127.0.0.1:* ws://localhost:* "
+                    "wss://127.0.0.1:* wss://localhost:*;"
                 )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -5578,11 +5763,13 @@ body {
 .msg-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   font-size: 10.5px;
   color: var(--text3);
   margin: 4px 8px 0;
   min-height: 16px;
+  white-space: nowrap;
 }
 .msg-status { display: inline-flex; }
 .check { color: var(--text3); font-size: 11px; letter-spacing: -1.5px; }
@@ -5651,14 +5838,24 @@ body {
   .msg-tools {
     opacity: 1; visibility: visible; transform: none;
     position: static;
-    margin: 4px 0 2px;
+    margin: 0 0 8px;
+    padding: 3px 4px;
+    flex-wrap: wrap;
+    max-width: 100%;
+    background: rgba(7, 12, 22, 0.42);
     box-shadow: none;
     align-self: flex-start;
   }
   .msg-group.out .msg-tools { align-self: flex-end; }
+  .msg-tools .reaction-btn,
+  .msg-tools .msg-tool-btn {
+    width: 28px;
+    height: 28px;
+    font-size: 14px;
+  }
 }
 
-/* Legacy meta-row actions kept for keyboard/touch reachability */
+/* Legacy meta-row actions kept for keyboard/hover reachability */
 .msg-actions {
   display: flex;
   gap: 4px;
@@ -5671,7 +5868,7 @@ body {
 .msg-meta:hover .msg-actions,
 .msg-meta:focus-within .msg-actions { opacity: 1; }
 @media (hover: none), (max-width: 768px) {
-  .msg-actions { opacity: 1; }
+  .msg-actions { display: none; }
 }
 .msg-action-btn {
   background: none; border: none; cursor: pointer;
@@ -6781,7 +6978,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
         </div>
       </div>
       <div class="transfer-status" id="transferStatus"></div>
-      <div class="char-hint" id="charHint">0 / 65536</div>
+      <div class="char-hint" id="charHint">0 / 65,536</div>
     </div>
   </main>
 
@@ -7058,7 +7255,8 @@ function wsConnect() {
   if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(wsRetryTimer);
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const useBridge = wsUseBridgedPort || (location.port && location.port !== String(UI_WS_PORT));
+  const pagePort = location.port || (location.protocol === 'https:' ? '443' : '80');
+  const useBridge = wsUseBridgedPort || (pagePort !== String(UI_WS_PORT));
   const portStr = useBridge ? (location.port ? `:${location.port}` : '') : `:${UI_WS_PORT}`;
   const url = `${scheme}://${location.hostname}${portStr}/?token=${encodeURIComponent(UI_TOKEN)}`;
   try {
@@ -7552,7 +7750,7 @@ function messageRowHtml(m, opts) {
       <div class="msg-meta">
         <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
         ${statusIcon}
-        ${!isOut && !m.read_at && !tombstone ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}')">mark read</button>` : ''}
+        ${!isOut && !m.read_at && !tombstone ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}','${esc(m.group_id||'')}')">mark read</button>` : ''}
         ${metaActions}
       </div>
     </div>
@@ -7582,7 +7780,7 @@ function renderMessages() {
   const msgs = [
     ...(state.messages||[]),
     ...(state.files||[]).map(fileMessage),
-  ].filter(m => matchTarget(m)).sort((a,b) => (a.timestamp-b.timestamp) || String(a.msg_id).localeCompare(String(b.msg_id)));
+  ].filter(m => matchTarget(m)).sort((a,b) => (a.timestamp-b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
   const loadMoreHtml = state.has_more_messages
     ? `<div class="load-more-row"><button class="load-more-btn" onclick="loadMore()" ${loadingMore?'disabled':''}>${loadingMore?'Loading…':'Load older messages'}</button></div>`
     : '';
@@ -7817,7 +8015,7 @@ function renderChatHeader() {
     const isOwner = g && g.owner_pubkey === state.public_key;
     el.innerHTML = `
       <button class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">&#8592;</button>
-      <div class="chat-header-avatar">👥</div>
+      <div class="chat-header-avatar" style="background:#1a3a8f">👥</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
         <div class="chat-header-sub">${(g?.members||[]).length} members · epoch ${g?.epoch??0} · ${esc(g?.fingerprint||'')}</div>
@@ -7968,8 +8166,35 @@ function toggleId() {
   a.style.display = show ? 'flex' : 'none';
 }
 
+function copyTextToClipboard(text, successMsg) {
+  const legacyCopy = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      if(document.execCommand('copy')) toast(successMsg, 'success');
+      else toast('Copy failed — copy the selected text manually', 'error');
+    } catch(err) {
+      console.warn('Copy failed', err);
+      toast('Copy failed', 'error');
+    }
+    document.body.removeChild(ta);
+  };
+  if(navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(() => toast(successMsg, 'success'))
+      .catch(err => { console.warn('Clipboard write failed, falling back', err); legacyCopy(); });
+  } else {
+    legacyCopy();
+  }
+}
+
 function copyKey() {
-  navigator.clipboard.writeText(state.public_key||'').then(()=>toast('Public key copied','success'));
+  if(!state.public_key) return;
+  copyTextToClipboard(state.public_key, 'Public key copied');
 }
 
 function toggleAdd() {
@@ -7987,7 +8212,7 @@ function toggleGroup() {
 function addFriend() {
   const pk = $('friendKey').value.trim(), nick = $('friendName').value.trim();
   if(!pk) return;
-  send({type:'add_friend', pubkey:pk, nickname:nick||undefined});
+  if(!send({type:'add_friend', pubkey:pk, nickname:nick||undefined})) return;
   $('friendKey').value=''; $('friendName').value='';
   $('addPanel').classList.remove('open');
   setMode('friends');
@@ -7995,8 +8220,10 @@ function addFriend() {
 
 function removeFriend(pubkey) {
   if(!confirm('Remove this friend and their local session?')) return;
-  send({type:'remove_friend', pubkey});
+  if(!send({type:'remove_friend', pubkey})) return;
+  cancelComposerContext();
   selectedTarget = null;
+  setMobileChat(false);
   renderChatHeader();
   renderMessages();
 }
@@ -8037,19 +8264,7 @@ function blockFriend(blocked) {
 function copyMessage(msgId) {
   const m = state.messages.find(x => x.msg_id === msgId);
   if(!m || !m.body) return;
-  // Use the Clipboard API with a textarea fallback for older browsers.
-  if(navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(m.body).then(() => toast('Message copied', 'success'));
-  } else {
-    const ta = document.createElement('textarea');
-    ta.value = m.body; document.body.appendChild(ta); ta.select();
-    try {
-      if(document.execCommand('copy')) toast('Message copied', 'success');
-      else toast('Copy failed — copy the selected text manually', 'error');
-    }
-    catch(err) { console.warn('Copy failed', err); toast('Copy failed', 'error'); }
-    document.body.removeChild(ta);
-  }
+  copyTextToClipboard(m.body, 'Message copied');
 }
 
 function deleteMessageLocally(msgId) {
@@ -8111,7 +8326,7 @@ function startReply(msgId) {
     $('text').value = '';
     onTextInput();
   }
-  const peer = selectedTarget.type === 'friend' ? selectedTarget.id : (m.sender_pubkey === state.public_key ? m.recipient_pubkey : m.sender_pubkey);
+  const peer = selectedTarget.type === 'friend' ? selectedTarget.id : m.sender_pubkey;
   setComposerContext({mode:'reply', msgId, peer});
 }
 
@@ -8142,7 +8357,7 @@ function editLastOwnMessage() {
   const msgs = state.messages
     .filter(m => matchTarget(m) && !m._isFile && !m.deleted_at
       && m.direction === 'out' && m.sender_pubkey === state.public_key)
-    .sort((a,b) => a.timestamp - b.timestamp);
+    .sort((a,b) => (a.timestamp - b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
   const last = msgs[msgs.length - 1];
   if(last) startEdit(last.msg_id);
 }
@@ -8189,7 +8404,7 @@ function renderSearchResults(query, results, seq) {
   el.innerHTML = results.map(m => {
     const body = String(m.body ?? '');
     const snippet = body.length > 160 ? body.slice(0, 160) + '…' : body;
-    const who = m.direction === 'out' ? 'You' : short(m.sender_pubkey);
+    const who = m.direction === 'out' ? 'You' : displayName(m.sender_pubkey);
     return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}')">
       <div class="search-result-meta">${esc(who)} · ${relTime(m.timestamp)}</div>
       ${esc(snippet)}
@@ -8668,14 +8883,16 @@ function createGroup() {
   const raw = $('groupMembers').value.trim();
   const members = raw ? raw.split(',').map(s=>s.trim()).filter(Boolean)
     : (selectedTarget?.type==='friend' ? [selectedTarget.id] : []);
-  send({type:'create_group', name, members});
+  if(!send({type:'create_group', name, members})) return;
   $('groupName').value=''; $('groupMembers').value='';
   $('groupPanel').classList.remove('open');
   setMode('groups');
 }
 
-function markRead(msg_id, peer_pubkey) {
-  send({type:'read_receipt', pubkey:peer_pubkey, msg_id});
+function markRead(msg_id, peer_pubkey, group_id='') {
+  const payload = {type:'read_receipt', pubkey:peer_pubkey, msg_id};
+  if(group_id) payload.group_id = group_id;
+  send(payload);
 }
 
 function loadMore() {

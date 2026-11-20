@@ -84,10 +84,17 @@ v4.0.0 is the conversation upgrade: the three most-requested messaging primitive
 - Schema migrates in place: opening a v3.5 database adds the `reply_to`, `edited_at`, and `deleted_at` columns (`SCHEMA_VERSION` 5 → 6) and keeps every existing row readable.
 - New UI commands (`edit_message`, `delete_message_everywhere`, `send_message{reply_to}`) and new relay frame kinds (`message_edit`, `group_message_edit`, `message_delete`) are additive; older peers ignore unknown kinds as before.
 
+### Audit & hardening fixes
+
+- **Protocol & session integrity:** cross-context edits (`message_edit` targeting a group message or `group_message_edit` mismatched against its stored `group_id`) are rejected; inbound `chat` frames validate `group_id` membership and isolate group unread counters from 1:1 DM unread badges; `Database.reserve_send_counters` raises when no active session exists instead of returning a phantom counter.
+- **Atomicity & deletion consistency:** `Database.edit_message` executes hydration, encryption, and SQL `UPDATE` inside a single lock acquisition so concurrent tombstones or newer edits cannot race; `delete_message_everywhere` propagates the exact same `deleted_at` timestamp to the local DB, UI, peers, and synced devices; `read_receipt` from the UI preserves the sender's 1:1 unread count when marking a group message read.
+- **File transfer & relay hardening:** late `file_chunk` frames for already-completed transfers and conflicting manifest/chunk metadata are rejected; corrupted shard cleanup removes stale `.chunks` directories and DB rows; `SignalingServer` enables SQLite WAL mode with generous busy timeouts, always commits `_purge_expired_offline_queue` transactions (preventing lingering write locks when 0 rows match), caps rate-limit timestamp lists cleanly, purges expired offline envelopes before rejecting full queues, and catches normal `ConnectionClosed` disconnects without tracebacks; node signaling teardown closes WebSockets cleanly on task cancellation.
+- **HTTP→UI bridge, direct transport & browser UI:** `_bridge_websocket` buffers non-blocking socket writes (`BlockingIOError`) cleanly for large frames and exits promptly on shutdown; closed pooled direct sockets are re-dialed cleanly and evicted URLs close idle connections safely; UI composer sorting is deterministic by `(timestamp, id)`, group chats display the actual sender on reply previews and search results, clipboard copies include error handling and fallback, friend/group forms retain inputs when disconnected, mobile action bars avoid duplicate rows, and the CSP `connect-src` header omits invalid bracketed IPv6 wildcards so browsers parse it cleanly.
+
 ### Testing
 
-- New `test_v400_features.py` (38 tests) covering reply round-trips and hostile references, edit monotonicity and cross-author rejection, tombstone semantics and reload hydration, device sync of the new events, schema migration from v3.5, the cached cipher object, and a real-socket regression test for the bridge deadlock.
-- The full matrix (221 pytest + 15 e2e + 13 smoke checks) passes on Python 3.12; ruff is clean; CI runs lint + tests on 3.10–3.13 plus e2e and smoke jobs (`.github/workflows/ci.yml`).
+- `test_v400_features.py` (50 tests) covering reply round-trips and hostile references, edit monotonicity and cross-context/cross-author rejection, atomic tombstone semantics and reload hydration, device sync of the new events, schema migration from v3.5, the cached cipher object, non-blocking large-frame HTTP→UI WebSocket bridging, file-chunk validation/cleanup, relay queue/rate/transaction hardening, and UI HTML/CSP checks.
+- The full verification matrix (**233 pytest + 15 e2e + 13 smoke + 14 new-feature checks**) passes alongside `python -m py_compile chat.py` and `ruff check .` (see [Testing](#testing)).
 
 ---
 
@@ -353,7 +360,7 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 
 - Python 3.10+ (tested on 3.12)
 - Packages listed in `requirements.txt`:
-  - `cryptography>=42.0.0`
+  - `cryptography>=44.0.1`
   - `websockets>=12.0`
   - `pqcrypto>=0.3.0`
 
@@ -567,15 +574,15 @@ python chat.py signal --host 0.0.0.0 --port 8766
 chat.py                                # Application, crypto, DB, WebSocket relay/client, HTTP UI
 requirements.txt                       # Runtime dependencies
 pyproject.toml                         # Package metadata and console entry point
-.github/workflows/ci.yml              # CI: ruff + pytest (3.10–3.13) + e2e + smoke
 README.md                              # This document
 LICENSE                                # MIT
-test_validation_and_database.py        # Unit tests (44 cases)
-test_node_relay_and_signaling.py       # Node/relay protocol unit tests (61 cases)
+test_validation_and_database.py        # Unit tests (49 cases)
+test_node_relay_and_signaling.py       # Node/relay protocol unit tests (63 cases)
 test_error_propagation.py              # Error-surfacing tests (6 cases)
 test_enhancements.py                   # v3.4.0 security/reliability regression tests (36 cases)
+test_enhancements_v2.py                # Device sync, WebSocket bridge, group unread & UI contrast tests (5 cases)
 test_v350_fixes.py                     # v3.5.0 security/reliability/correctness regression tests (24 cases)
-test_v400_features.py                  # v4.0.0 replies/edit/delete + platform regression tests (38 cases)
+test_v400_features.py                  # v4.0.0 replies/edit/delete, platform & audit regression tests (50 cases)
 smoke_test.py                          # Live HTTP smoke test (13 checks)
 e2e_test.py                            # End-to-end protocol test (15 checks)
 new_features_test.py                   # Multi-device sync, calls, search, parallel file transfer (14 checks)
@@ -610,17 +617,18 @@ Important remaining limits:
 ### Unit tests
 
 ```bash
-pytest                                       # all unit suites (221 cases)
-pytest test_validation_and_database.py       # validation, storage, HTTP
-pytest test_node_relay_and_signaling.py      # node/relay protocol behavior
-pytest test_enhancements.py                  # v3.4.0 security/reliability fixes
-pytest test_v350_fixes.py                    # v3.5.0 security/reliability/correctness fixes
-pytest test_v400_features.py                 # v4.0.0 replies/edit/delete + platform fixes
+pytest                                       # all unit suites (233 cases)
+pytest test_validation_and_database.py       # validation, storage, HTTP (49 cases)
+pytest test_node_relay_and_signaling.py      # node/relay protocol behavior (63 cases)
+pytest test_enhancements.py                  # v3.4.0 security/reliability fixes (36 cases)
+pytest test_enhancements_v2.py               # device sync, WS bridge, unread isolation & contrast (5 cases)
+pytest test_v350_fixes.py                    # v3.5.0 security/reliability/correctness fixes (24 cases)
+pytest test_v400_features.py                 # v4.0.0 replies/edit/delete + audit hardening (50 cases)
 ```
 
-`test_validation_and_database.py` — 44 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, and ICE server configuration (default/env-override/malformed-JSON handling).
+`test_validation_and_database.py` — 49 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, ICE server configuration, signed registration challenge validation, direct URL validation, host-header protection, and blocked-peer filtering.
 
-`test_node_relay_and_signaling.py` — 61 cases driving the pieces the suite above
+`test_node_relay_and_signaling.py` — 63 cases driving the pieces the suite above
 barely reached: the `SignalingServer.handle` frame loop (registration challenge,
 duplicate/oversized/malformed frames, relay routing, offline queue drain,
 ephemeral drops, rate limits, multi-device fan-out), the `QuantumNode` protocol
@@ -631,7 +639,9 @@ nodes are wired together in-process — relay traffic is delivered straight into
 the peer's handler and sockets are small fakes — so real post-quantum crypto and
 SQLite persistence are exercised without a network or subprocesses.
 
-`test_v400_features.py` — 38 cases covering the v4.0.0 surface: reply round-trips for 1:1 and groups (plus hostile/malformed reply references and cross-conversation quote attempts), edit monotonicity (a replayed older edit cannot roll back a newer one), owner-only enforcement for edits and deletes, hostile edit/delete frames for messages authored by someone else, tombstone semantics (body erased, reactions dropped, hydration clean after reload, reply chains still resolvable), device-sync of edit/tombstone events, the new UI commands, schema migration from a hand-built v3.5 database, `validate_msg_id`, the cached AES-GCM cipher object (correctness plus a 2000-row hydration batch), a real-socket regression test for the HTTP→UI WebSocket bridge handshake deadlock, and UI HTML sanity checks for the v4 affordances.
+`test_enhancements_v2.py` — 5 cases verifying device sync for reactions, group unread isolation from 1:1 friend badges, WCAG AA contrast against dark surfaces, and HTTP handler WebSocket bridge routing and auth checks.
+
+`test_v400_features.py` — 50 cases covering the v4.0.0 surface and audit hardening fixes: reply round-trips for 1:1 and groups (plus hostile/malformed reply references and cross-conversation quote attempts), edit monotonicity (a replayed older edit cannot roll back a newer one), cross-context edit rejection (`message_edit` vs `group_message_edit`), atomic edit/tombstone concurrency, owner-only enforcement for edits and deletes, tombstone semantics (body erased, reactions dropped, hydration clean after reload, reply chains still resolvable), device-sync validation and edit/tombstone sync, active-session check in `reserve_send_counters`, group edit fan-out resilience, unknown `group_id` rejection on incoming chats, late/conflicting `file_chunk` rejection and corrupt shard cleanup, relay offline-queue expiry purges/transaction commits and bounded rate buckets, direct WebSocket pool eviction/closed-socket detection, UI group read-receipt unread isolation, the new UI commands, schema migration from a hand-built v3.5 database, `validate_msg_id`, the cached AES-GCM cipher object (correctness plus a 2000-row hydration batch), real-socket HTTP→UI WebSocket bridge handshake and large-frame (>256 KB) non-blocking write tests, and UI HTML/CSP checks.
 
 ### Error-propagation tests
 
@@ -717,7 +727,11 @@ Lint (configuration lives in `pyproject.toml`):
 ruff check .
 ```
 
-Continuous integration (`.github/workflows/ci.yml`) runs on every push and pull request: ruff lint, the full pytest suite across Python 3.10–3.13, the two-node end-to-end protocol test, and the HTTP smoke test.
+Run the full local verification suite (`py_compile`, `ruff`, `pytest`, `smoke_test.py`, `e2e_test.py`, and `new_features_test.py`):
+
+```bash
+python -m py_compile chat.py && ruff check . && pytest && python smoke_test.py && python e2e_test.py && python new_features_test.py
+```
 
 Try the UI with a seeded two-node demo (two browsers, one relay, a conversation that already contains replies, an edit, and a deleted-for-everyone message):
 

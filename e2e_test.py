@@ -23,8 +23,11 @@ PORTS = {
     "bob_http":   28011, "bob_ui":   28012, "bob_direct":   28013,
 }
 
-sys.path.insert(0, str(ROOT))
 import logging
+import os
+
+os.environ["QUANTUM_CHAT_RELAY_DB"] = str(WORKDIR / "relay.db")
+sys.path.insert(0, str(ROOT))
 
 import chat
 

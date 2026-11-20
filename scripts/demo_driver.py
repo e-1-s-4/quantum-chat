@@ -13,19 +13,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
+WORKDIR = ROOT / "scripts" / "demo"
+WORKDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("QUANTUM_CHAT_RELAY_DB", str(WORKDIR / "relay.db"))
 sys.path.insert(0, str(ROOT))
 
 import chat  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-WORKDIR = ROOT / "scripts" / "demo"
-WORKDIR.mkdir(parents=True, exist_ok=True)
 
 PORTS = {
     "signaling": 28100,
