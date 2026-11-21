@@ -239,7 +239,7 @@ RELAY_PAYLOAD_KINDS = {
     "file_chunk", "group_chat", "typing", "read_receipt", "reaction",
     "message_edit", "group_message_edit", "message_delete", "device_sync",
     "call_offer", "call_answer", "call_ice", "call_end", "delivery_ack",
-    "group_invite",
+    "group_invite", "group_leave",
 }
 # Ephemeral presence/call frames from a blocked peer are dropped silently:
 # their handlers already treat bad peers as background noise, and raising
@@ -282,6 +282,18 @@ DEFAULT_MAX_STORAGE_MB = 4096      # default disk quota for received/sent file b
 MESSAGE_PAGE_SIZE = 200            # messages sent on initial state sync / per page
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1    # passphrase KDF work factor
 LOG = logging.getLogger("quantum_chat")
+
+FAVICON_SVG: bytes = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">'
+    b'<rect width="64" height="64" rx="16" fill="#070b13"/>'
+    b'<rect x="2" y="2" width="60" height="60" rx="14" stroke="#45d8ff" stroke-opacity="0.28" stroke-width="2"/>'
+    b'<path d="M32 11L49 20.5V35.5C49 45.2 41.6 51.4 32 54.5C22.4 51.4 15 45.2 15 35.5V20.5L32 11Z" '
+    b'fill="#0f1521" stroke="#45d8ff" stroke-width="2.5" stroke-linejoin="round"/>'
+    b'<path d="M32 22L40 26.6V35.8L32 40.4L24 35.8V26.6L32 22Z" '
+    b'stroke="#edf3fa" stroke-width="2" stroke-linejoin="round"/>'
+    b'<circle cx="32" cy="31.2" r="2.8" fill="#45d8ff"/>'
+    b'</svg>'
+)
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -536,22 +548,28 @@ class PQModule:
     def __init__(self) -> None:
         try:
             from pqcrypto.sign import ml_dsa_65 as sign_mod  # type: ignore
+            self.sign_algo_name = "ML-DSA-65"
         except ImportError:
             try:
                 from pqcrypto.sign import dilithium3 as sign_mod  # type: ignore
+                self.sign_algo_name = "Dilithium3"
             except ImportError:
                 try:
                     from pqcrypto.dilithium import Dilithium3 as sign_mod  # type: ignore
+                    self.sign_algo_name = "Dilithium3"
                 except ImportError as exc:
                     raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         try:
             from pqcrypto.kem import ml_kem_512 as kem_mod  # type: ignore
+            self.kem_algo_name = "ML-KEM-512"
         except ImportError:
             try:
                 from pqcrypto.kem import kyber512 as kem_mod  # type: ignore
+                self.kem_algo_name = "Kyber-512"
             except ImportError:
                 try:
                     from pqcrypto.kyber import Kyber512 as kem_mod  # type: ignore
+                    self.kem_algo_name = "Kyber-512"
                 except ImportError as exc:
                     raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         self.sign_mod = sign_mod
@@ -1893,6 +1911,13 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def delete_file_record(self, file_id: str) -> bool:
+        file_id = validate_file_id(file_id)
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM files WHERE file_id=?", (file_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
     # ── Outbox ────────────────────────────────────────────────────────────────
 
     def queue_outbox(self, target_pubkey: str, payload: dict[str, Any]) -> None:
@@ -2201,6 +2226,11 @@ class QuantumNode:
             "storage_bytes": self._storage_bytes_used(),
             "max_storage_bytes": self.max_storage_bytes,
             "version": VERSION,
+            "crypto_suite": (
+                f"{self.crypto.pq.kem_algo_name} · {self.crypto.pq.sign_algo_name} · AES-256-GCM"
+                if getattr(getattr(self, "crypto", None), "pq", None)
+                else "Hybrid Post-Quantum · AES-256-GCM"
+            ),
             "ice_servers": self.ice_servers,
         }
 
@@ -2538,6 +2568,11 @@ class QuantumNode:
             "metrics": self.db.metrics(),
             "file_storage_bytes": self._storage_bytes_used(),
             "max_storage_bytes": self.max_storage_bytes,
+            "crypto_suite": (
+                f"{self.crypto.pq.kem_algo_name} · {self.crypto.pq.sign_algo_name} · AES-256-GCM"
+                if getattr(getattr(self, "crypto", None), "pq", None)
+                else "Hybrid Post-Quantum · AES-256-GCM"
+            ),
             "timestamp": utc_ts(),
         }
 
@@ -3698,6 +3733,49 @@ class QuantumNode:
             raise ValueError("That public key is not a member of this group")
         await self.rotate_group_key(group_id)
 
+    async def leave_group(self, group_id: str) -> None:
+        group_id = validate_file_id(group_id)
+        role = self.db.group_role(group_id, self.public_key)
+        if role is None:
+            raise ValueError("You are not a member of this group")
+        if role == "owner":
+            raise ValueError("Group owners cannot leave their own group")
+        groups = {g["group_id"]: g for g in self.db.groups_for(self.public_key)}
+        group = groups.get(group_id)
+        owner = group.get("owner_pubkey") if group else None
+        self.db.remove_group_member(group_id, self.public_key)
+        if owner and owner != self.public_key and self.db.is_friend(owner):
+            try:
+                await self.send_relay(owner, self.signed_payload("group_leave", {
+                    "group_id": group_id,
+                    "from": self.public_key,
+                    "to": owner,
+                    "left_at": utc_ts(),
+                }), queue_on_failure=True)
+            except Exception as exc:
+                LOG.warning("Could not notify group owner %s of departure: %s", short_key(owner), exc)
+        await self.broadcast_ui({
+            "type": "notice", "level": "info",
+            "text": f"Left group {group['name'] if group else group_id[:8]}"
+        })
+        await self.broadcast_ui(self.state_payload())
+
+    async def handle_group_leave(self, peer_pubkey: str, data: dict[str, Any]) -> None:
+        if not self.db.is_friend(peer_pubkey) or not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid group leave notice")
+        payload = data.get("payload", {})
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Group leave routing mismatch")
+        group_id = validate_file_id(str(payload.get("group_id", "")))
+        if self.db.group_role(group_id, self.public_key) != "owner":
+            return
+        if self.db.remove_group_member(group_id, peer_pubkey):
+            await self.rotate_group_key(group_id)
+            await self.broadcast_ui({
+                "type": "notice", "level": "info",
+                "text": f"{short_key(peer_pubkey)} left the group — rotated key"
+            })
+
     # ── Group messaging ───────────────────────────────────────────────────────
 
     async def send_group_chat(self, group_id: str, text: str,
@@ -3774,6 +3852,73 @@ class QuantumNode:
             "reply_to": reply_to,
         })
 
+    def _stage_local_file(self, file_id: str, safe_name: str, mime_type: str,
+                          raw: bytes, sha: str, recipient: str | None = None,
+                          group_id: str | None = None) -> tuple[str, int]:
+        """Encrypt `raw` to disk once and register its metadata row."""
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        storage = str(self.files_dir / file_id)
+        stored, file_nonce = self.encrypt_for_disk(raw, file_id)
+        tmp_path = Path(storage + ".tmp")
+        tmp_path.write_bytes(stored)
+        try:
+            inserted = self.db.save_file(
+                file_id, safe_name, self.public_key, len(raw), sha, storage,
+                recipient=recipient, group_id=group_id,
+                file_nonce=file_nonce, replace=False, mime_type=mime_type
+            )
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        if not inserted:
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError("File id is already in use")
+        try:
+            os.replace(tmp_path, storage)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            self.db.delete_file_record(file_id)
+            raise
+        self._track_storage(len(stored))
+        return storage, len(stored)
+
+    async def _send_file_chunks_to_peer(self, peer_pubkey: str, file_id: str, safe_name: str,
+                                        mime_type: str, raw: bytes, sha: str,
+                                        group_id: str | None = None) -> None:
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
+        total_chunks = max(1, (len(raw) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES)
+        manifest = {
+            "file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
+            "from": self.public_key, "to": peer_pubkey, "group_id": group_id,
+            "mime_type": mime_type,
+            "total_chunks": total_chunks, "chunk_size": MAX_CHUNK_BYTES, "sent_at": utc_ts(),
+        }
+        await self.send_relay(peer_pubkey, self.signed_payload("file_manifest", manifest), queue_on_failure=True)
+        counters = self.db.reserve_send_counters(peer_pubkey, total_chunks)
+        chunk_semaphore = asyncio.Semaphore(FILE_CHUNK_CONCURRENCY)
+
+        async def send_chunk(idx: int, counter: int) -> None:
+            async with chunk_semaphore:
+                chunk = raw[idx * MAX_CHUNK_BYTES:(idx + 1) * MAX_CHUNK_BYTES]
+                meta = {**manifest, "chunk_index": idx, "counter": counter,
+                        "chunk_sha256": hashlib.sha256(chunk).hexdigest()}
+                msg_key = self.crypto.derive_message_key(
+                    session_key, self.public_key, peer_pubkey, counter, "file-chunk"
+                )
+                packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
+                await self.send_relay(
+                    peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet},
+                    queue_on_failure=True
+                )
+
+        results = await asyncio.gather(
+            *(send_chunk(idx, counters[idx]) for idx in range(total_chunks)),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                raise r
+
     async def send_group_file(self, group_id: str, filename: str, encoded: str,
                               content_type: str | None = None) -> None:
         group_id = validate_file_id(group_id)
@@ -3783,11 +3928,23 @@ class QuantumNode:
         recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
         if not recipients:
             raise ValueError("No group members with active friend records available")
+        raw = b64d(encoded)
+        if len(raw) > MAX_FILE_BYTES:
+            raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
+        self._check_storage_quota(len(raw))
+        file_id = str(uuid.uuid4())
+        safe_name = safe_filename(filename)
+        mime_type = safe_content_type(content_type, safe_name)
+        sha = hashlib.sha256(raw).hexdigest()
+        storage, stored_len = self._stage_local_file(
+            file_id, safe_name, mime_type, raw, sha, recipient=None, group_id=group_id
+        )
 
         async def deliver(peer: str) -> bool:
             try:
-                await self.send_file(peer, filename, encoded, group_id=group_id,
-                                     content_type=content_type)
+                await self._send_file_chunks_to_peer(
+                    peer, file_id, safe_name, mime_type, raw, sha, group_id=group_id
+                )
                 return True
             except Exception as exc:
                 # One member without a fresh session (require_fresh_session
@@ -3799,7 +3956,16 @@ class QuantumNode:
 
         results = await asyncio.gather(*(deliver(peer) for peer in recipients))
         if not any(results):
+            Path(storage).unlink(missing_ok=True)
+            self.db.delete_file_record(file_id)
+            self._track_storage(-stored_len)
             raise ValueError("Group file could not be delivered to any member")
+        saved_file = self.db.get_file(file_id)
+        await self.broadcast_ui({
+            "type": "file",
+            "file": self._public_file(saved_file) if saved_file else {},
+            "storage_bytes": self._storage_bytes_used(),
+        })
 
     # ── File transfer ─────────────────────────────────────────────────────────
 
@@ -3811,67 +3977,17 @@ class QuantumNode:
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
         self._check_storage_quota(len(raw))
-        session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
+        await self.require_fresh_session(peer_pubkey, outgoing=True)
         file_id = str(uuid.uuid4())
         safe_name = safe_filename(filename)
         mime_type = safe_content_type(content_type, safe_name)
         sha = hashlib.sha256(raw).hexdigest()
-        self.files_dir.mkdir(parents=True, exist_ok=True)
-        storage = str(self.files_dir / file_id)
-        stored, file_nonce = self.encrypt_for_disk(raw, file_id)
-        # Stage to a temp file so a failed DB insert can't leave a stray
-        # plaintext-adjacent artifact, and so the final path only appears once
-        # the row that explains it exists.
-        tmp_path = Path(storage + ".tmp")
-        tmp_path.write_bytes(stored)
-        try:
-            inserted = self.db.save_file(file_id, safe_name, self.public_key, len(raw), sha, storage,
-                                         recipient=peer_pubkey, group_id=group_id,
-                                         file_nonce=file_nonce, replace=False, mime_type=mime_type)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
-        if not inserted:
-            tmp_path.unlink(missing_ok=True)
-            raise ValueError("File id is already in use")
-        try:
-            os.replace(tmp_path, storage)
-        except OSError:
-            tmp_path.unlink(missing_ok=True)
-            raise
-        self._track_storage(len(stored))
-        total_chunks = max(1, (len(raw) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES)
-        manifest = {"file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
-                    "from": self.public_key, "to": peer_pubkey, "group_id": group_id,
-                    "mime_type": mime_type,
-                    "total_chunks": total_chunks, "chunk_size": MAX_CHUNK_BYTES, "sent_at": utc_ts()}
-        await self.send_relay(peer_pubkey, self.signed_payload("file_manifest", manifest), queue_on_failure=True)
-        # Chunk counters must be allocated in strict order up front (the
-        # underlying counter is a simple per-peer increment), but the
-        # encrypt+send work for each chunk is independent, so it's safe and
-        # meaningfully faster — especially over a non-local relay — to fan
-        # those out with bounded concurrency rather than one at a time. The
-        # receive-side replay window (REPLAY_WINDOW) comfortably tolerates
-        # the resulting out-of-order arrival.
-        counters = self.db.reserve_send_counters(peer_pubkey, total_chunks)
-        chunk_semaphore = asyncio.Semaphore(FILE_CHUNK_CONCURRENCY)
-
-        async def send_chunk(idx: int, counter: int) -> None:
-            async with chunk_semaphore:
-                chunk = raw[idx * MAX_CHUNK_BYTES:(idx + 1) * MAX_CHUNK_BYTES]
-                meta = {**manifest, "chunk_index": idx, "counter": counter,
-                        "chunk_sha256": hashlib.sha256(chunk).hexdigest()}
-                msg_key = self.crypto.derive_message_key(session_key, self.public_key, peer_pubkey, counter, "file-chunk")
-                packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
-                await self.send_relay(peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet}, queue_on_failure=True)
-
-        results = await asyncio.gather(
-            *(send_chunk(idx, counters[idx]) for idx in range(total_chunks)),
-            return_exceptions=True,
+        self._stage_local_file(
+            file_id, safe_name, mime_type, raw, sha, recipient=peer_pubkey, group_id=group_id
         )
-        for r in results:
-            if isinstance(r, Exception):
-                raise r
+        await self._send_file_chunks_to_peer(
+            peer_pubkey, file_id, safe_name, mime_type, raw, sha, group_id=group_id
+        )
         saved_file = self.db.get_file(file_id)
         await self.broadcast_ui({
             "type": "file",
@@ -4228,6 +4344,8 @@ class QuantumNode:
                 "msg_id": str(data.get("msg_id", "")),
                 "status": "delivered_to_peer",
             })
+        elif kind == "group_leave":
+            await self.handle_group_leave(peer_pubkey, payload)
         elif kind == "group_invite":
             if not self.db.is_friend(peer_pubkey) or not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid group invite")
@@ -4486,6 +4604,8 @@ class QuantumNode:
         elif typ == "remove_group_member":
             await self.remove_group_member(validate_file_id(str(msg.get("group_id", ""))),
                                            self.validate_peer_key(msg["pubkey"]))
+        elif typ == "leave_group":
+            await self.leave_group(validate_file_id(str(msg.get("group_id", ""))))
         elif typ == "rotate_group_key":
             await self.rotate_group_key(validate_file_id(str(msg.get("group_id", ""))))
         elif typ == "export_backup":
@@ -4508,9 +4628,17 @@ class QuantumNode:
             self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
             self.sessions.clear()
             self.pending_offers.clear()
+            if self.signaling_ws is not None:
+                old_ws = self.signaling_ws
+                self.signaling_ws = None
+                with contextlib.suppress(Exception):
+                    await old_ws.close()
+                notice_msg = f"Identity imported: {key_fingerprint(self.public_key)}. Reconnecting to signaling with your restored identity."
+            else:
+                notice_msg = f"Identity imported: {key_fingerprint(self.public_key)}."
             await self.broadcast_ui({
                 "type": "notice", "level": "success",
-                "text": f"Identity imported: {key_fingerprint(self.public_key)}. Restart to reconnect to signaling with the new identity."
+                "text": notice_msg,
             })
             await self.broadcast_ui(self.state_payload())
         elif typ == "typing":
@@ -5154,6 +5282,10 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self._bridge_websocket()
             return
 
+        if path == "/favicon.ico":
+            self._send(200, FAVICON_SVG, "image/svg+xml")
+            return
+
         if path == "/version":
             # Lightweight version probe — useful for monitoring/CI without
             # pulling the full /health payload (which includes identity).
@@ -5390,6 +5522,13 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         if not self._host_allowed():
             self.send_error(421, "Misdirected Request")
             return
+        if path == "/favicon.ico":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(FAVICON_SVG)))
+            self._security_headers()
+            self.end_headers()
+            return
         if path == "/version":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -5594,61 +5733,63 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚛ Quantum Chat</title>
+<title>Quantum Chat</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <style>
 /* ═══════════════════════════════════════════════════════════════════════════
-   Quantum Chat v4 — refined dark glass
-   Layered frosted panels, soft ambient gradients, quiet glow accents.
-   Readability first: text sits on solid-enough surfaces; glass decorates
-   chrome, never the words themselves.
+   Quantum Chat — Cryo-Cryptographic Workspace
+   Deep obsidian instrument surfaces, hairline geometry, calibrated cyan accents,
+   tabular numerals, zero-pill metadata, and high-legibility dark surfaces.
    ═══════════════════════════════════════════════════════════════════════════ */
 :root {
   --bg: #070b13;
-  --bg-deep: #04070d;
+  --bg-deep: #04070e;
 
-  /* Glass surfaces */
-  --glass-bg: rgba(15, 21, 33, 0.78);
-  --glass-bg-strong: rgba(11, 16, 26, 0.92);
-  --glass-panel: rgba(18, 25, 39, 0.62);
-  --glass-blur: 26px;
-  --glass-border: rgba(148, 178, 226, 0.10);
-  --glass-border-hover: rgba(148, 178, 226, 0.22);
-  --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  /* Structural surfaces (WCAG AA solid baselines + translucent glass) */
+  --glass-bg: rgba(12, 18, 30, 0.84);
+  --glass-bg-strong: rgba(9, 14, 24, 0.96);
+  --glass-panel: rgba(14, 21, 35, 0.76);
+  --glass-blur: 24px;
+  --glass-border: rgba(148, 178, 226, 0.11);
+  --glass-border-hover: rgba(148, 178, 226, 0.24);
+  --glass-shadow: 0 16px 44px rgba(0, 0, 0, 0.48);
+  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.045);
 
-  /* Legacy surface aliases (kept: many rules still reference them) */
-  --s1: rgba(15, 21, 33, 0.78);
-  --s2: rgba(20, 28, 44, 0.72);
-  --s3: rgba(26, 36, 55, 0.78);
-  --s4: rgba(36, 50, 76, 0.85);
+  --s1: rgba(15, 21, 33, 0.84);
+  --s2: rgba(20, 28, 44, 0.78);
+  --s3: rgba(26, 36, 55, 0.84);
+  --s4: rgba(36, 50, 76, 0.88);
   --border: var(--glass-border);
   --border2: var(--glass-border-hover);
 
-  /* Accents */
-  --accent: #45d8ff;
-  --accent-glow: rgba(69, 216, 255, 0.35);
-  --accent-soft: rgba(69, 216, 255, 0.14);
-  --accent2: #4f7cff;
-  --accent2-glow: rgba(79, 124, 255, 0.35);
-  --accent2-soft: rgba(79, 124, 255, 0.16);
-  --danger: #ff5d7d;
-  --danger-soft: rgba(255, 93, 125, 0.12);
-  --warn: #ffc857;
-  --ok: #3ddc97;
+  /* Calibrated Accents */
+  --accent: #3fd0f5;
+  --accent-glow: rgba(63, 208, 245, 0.28);
+  --accent-soft: rgba(63, 208, 245, 0.13);
+  --accent2: #4e7bff;
+  --accent2-glow: rgba(78, 123, 255, 0.28);
+  --accent2-soft: rgba(78, 123, 255, 0.15);
+  --danger: #ff6482;
+  --danger-soft: rgba(255, 100, 130, 0.12);
+  --warn: #f6c453;
+  --warn-soft: rgba(246, 196, 83, 0.12);
+  --ok: #36d994;
+  --ok-soft: rgba(54, 217, 148, 0.12);
 
+  /* Text tokens — verified >= 4.5:1 WCAG AA against #070b13, #0f1521, #1a2437 */
   --text1: #edf3fa;
   --text2: #a9b6c6;
-  --text3: #8494a6;
+  --text3: #8a9bb2;
 
   /* Message bubbles */
-  --out-bg: linear-gradient(160deg, rgba(79, 124, 255, 0.34), rgba(69, 195, 255, 0.24));
-  --out-border: rgba(130, 175, 255, 0.38);
-  --in-bg: rgba(28, 38, 58, 0.66);
+  --out-bg: linear-gradient(155deg, rgba(58, 104, 232, 0.34), rgba(50, 174, 224, 0.22));
+  --out-border: rgba(122, 174, 255, 0.36);
+  --in-bg: rgba(23, 32, 50, 0.78);
 
-  --rad: 14px;
-  --rad-lg: 20px;
-  --font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --mono: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+  --rad: 12px;
+  --rad-lg: 16px;
+  --font: "Plus Jakarta Sans", "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", Consolas, ui-monospace, monospace;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -5658,23 +5799,21 @@ html { color-scheme: dark; }
 body {
   font-family: var(--font);
   background-color: var(--bg);
-  /* Ambient aurora: three quiet gradients fixed behind the glass layers */
   background-image:
-    radial-gradient(1100px 700px at 8% -10%, rgba(79, 124, 255, 0.16), transparent 55%),
-    radial-gradient(900px 600px at 108% 18%, rgba(69, 216, 255, 0.10), transparent 55%),
-    radial-gradient(1000px 800px at 50% 118%, rgba(120, 87, 255, 0.10), transparent 60%);
+    radial-gradient(960px 620px at 6% -8%, rgba(78, 123, 255, 0.13), transparent 55%),
+    radial-gradient(820px 560px at 104% 12%, rgba(63, 208, 245, 0.08), transparent 52%),
+    linear-gradient(180deg, rgba(14, 20, 34, 0.32) 0%, transparent 100%);
   background-attachment: fixed;
   color: var(--text1);
   height: 100vh;
   overflow: hidden;
-  font-size: 15px;
+  font-size: 14.5px;
   line-height: 1.5;
+  letter-spacing: 0.005em;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-/* Solid-surface fallback when backdrop-filter is unavailable: the glass
-   surfaces above are translucent and need the blur to stay legible. */
 @supports not ((backdrop-filter: blur(2px)) or (-webkit-backdrop-filter: blur(2px))) {
   :root {
     --glass-bg: #0f1521;
@@ -5685,19 +5824,31 @@ body {
   }
 }
 
-/* ── Layout ────────────────────────────────────────────────────────────── */
-#app { display: flex; height: 100vh; }
+.svg-ico {
+  width: 1em; height: 1em;
+  display: inline-block;
+  vertical-align: -0.15em;
+  flex-shrink: 0;
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────── */
+#app {
+  display: flex;
+  height: 100vh;
+  width: 100%;
+  overflow: hidden;
+}
 
 #sidebar {
-  width: 330px;
-  min-width: 330px;
+  width: 320px;
+  min-width: 320px;
   display: flex;
   flex-direction: column;
   background: var(--glass-bg);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   border-right: 1px solid var(--glass-border);
-  box-shadow: var(--glass-shadow), var(--glass-inset);
+  box-shadow: var(--glass-inset);
   z-index: 10;
 }
 
@@ -5706,6 +5857,7 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  position: relative;
   background: transparent;
 }
 
@@ -5713,203 +5865,187 @@ body {
   width: 300px;
   min-width: 300px;
   background: var(--glass-bg);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   border-left: 1px solid var(--glass-border);
-  box-shadow: var(--glass-shadow), var(--glass-inset);
+  box-shadow: var(--glass-inset);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
   z-index: 10;
 }
 
-/* ── Sidebar head ──────────────────────────────────────────────────────── */
+/* Hide composer & floating scroll helper until a conversation is selected */
+#app:not(.has-selection) .composer,
+#app:not(.has-selection) .composer-context,
+#app:not(.has-selection) #typing-indicator,
+#app:not(.has-selection) #recIndicator {
+  display: none;
+}
+
+/* ── Sidebar header ────────────────────────────────────────────────────── */
 .sidebar-head {
-  padding: 18px 20px 16px;
+  padding: 18px 18px 14px;
   border-bottom: 1px solid var(--glass-border);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .app-logo {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: 11px;
+  min-width: 0;
 }
 
-.app-logo .icon {
-  font-size: 27px;
-  line-height: 1;
-  filter: drop-shadow(0 0 10px var(--accent-glow));
+.brand-mark {
+  width: 34px; height: 34px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(145deg, rgba(78, 123, 255, 0.2), rgba(63, 208, 245, 0.14));
+  border: 1px solid rgba(114, 188, 255, 0.28);
+  color: var(--accent);
+  flex-shrink: 0;
 }
+.brand-mark svg { width: 20px; height: 20px; }
 
 .app-logo h1 {
-  font-size: 18px;
-  font-weight: 750;
-  letter-spacing: -0.02em;
-  background: linear-gradient(100deg, #ffffff 30%, #a9d8ff 75%, var(--accent));
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--text1);
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .app-logo .ver {
   font-size: 11px;
   color: var(--text3);
   font-family: var(--mono);
-  margin-top: 2px;
-  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  margin-top: 1px;
 }
 
 .conn-badge {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  font-weight: 550;
-  padding: 5px 12px;
-  border-radius: 999px;
-  background: var(--s3);
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 4px 9px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--glass-border);
   color: var(--text2);
-  transition: all 0.3s ease;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
 }
 .conn-badge.connected {
-  border-color: rgba(69, 216, 255, 0.45);
-  color: #dff6ff;
-  background: var(--accent-soft);
-  box-shadow: 0 0 18px rgba(69, 216, 255, 0.12);
+  border-color: rgba(54, 217, 148, 0.34);
+  color: #cef8e6;
+  background: rgba(54, 217, 148, 0.10);
 }
 .conn-badge .dot {
-  width: 8px; height: 8px;
+  width: 6px; height: 6px;
   border-radius: 50%;
   background: var(--text3);
-  transition: all 0.3s;
+  flex-shrink: 0;
 }
 .conn-badge.connected .dot {
-  background: var(--accent);
-  box-shadow: 0 0 10px var(--accent);
-  animation: pulse 2s infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 10px var(--accent); }
-  50% { opacity: 0.5; transform: scale(0.8); box-shadow: 0 0 2px var(--accent); }
+  background: var(--ok);
 }
 
 /* ── Identity card ─────────────────────────────────────────────────────── */
 .id-card {
-  margin: 14px 16px 12px;
-  padding: 14px;
-  background: linear-gradient(150deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  margin: 12px 14px 10px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--glass-border);
   border-radius: var(--rad);
   cursor: pointer;
-  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-  position: relative;
-  overflow: hidden;
+  transition: background 0.18s ease, border-color 0.18s ease;
   box-shadow: var(--glass-inset);
 }
-.id-card::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0; height: 2px;
-  background: linear-gradient(90deg, var(--accent2), var(--accent), transparent);
-  opacity: 0;
-  transition: opacity 0.3s;
-}
 .id-card:hover {
-  transform: translateY(-2px);
-  background: linear-gradient(150deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35), var(--glass-inset);
+  background: rgba(255, 255, 255, 0.045);
   border-color: var(--glass-border-hover);
 }
-.id-card:hover::before { opacity: 1; }
 
 .id-card-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 6px;
+  gap: 11px;
 }
 .id-avatar {
-  width: 42px; height: 42px;
-  border-radius: 50%;
-  background:
-    radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.45), transparent 42%),
-    linear-gradient(135deg, var(--accent2), var(--accent));
-  box-shadow: 0 4px 14px var(--accent2-glow), 0 0 0 1px rgba(255, 255, 255, 0.12) inset;
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(78, 123, 255, 0.3), rgba(63, 208, 245, 0.22));
+  border: 1px solid rgba(122, 186, 255, 0.28);
   display: flex; align-items: center; justify-content: center;
-  font-size: 20px;
   flex-shrink: 0;
-  color: white;
+  color: var(--accent);
 }
-.id-name { font-weight: 650; font-size: 15px; }
+.id-avatar svg { width: 18px; height: 18px; }
+.id-meta { flex: 1; min-width: 0; }
+.id-name { font-weight: 600; font-size: 13.5px; color: var(--text1); line-height: 1.25; }
 .id-fp {
   font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   font-size: 11px;
   color: var(--text3);
-  letter-spacing: 0.05em;
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.id-chevron {
+  color: var(--text3);
+  transition: transform 0.2s ease, color 0.2s ease;
+  flex-shrink: 0;
+}
+.id-card[aria-expanded="true"] .id-chevron {
+  transform: rotate(180deg);
+  color: var(--accent);
 }
 .id-key {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text2);
   word-break: break-all;
-  padding: 10px;
-  background: rgba(0, 0, 0, 0.35);
-  border-radius: 10px;
+  padding: 9px 10px;
+  background: rgba(4, 7, 14, 0.55);
+  border-radius: 8px;
   border: 1px solid var(--glass-border);
   display: none;
-  margin-top: 12px;
-  line-height: 1.6;
+  margin-top: 10px;
+  line-height: 1.55;
+  user-select: all;
 }
 .id-key.visible {
   display: block;
-  max-height: 120px;
+  max-height: 110px;
   overflow-y: auto;
-  animation: fadeIn 0.3s;
+  animation: fadeIn 0.2s ease;
 }
-.id-actions { display: flex; gap: 8px; margin-top: 12px; }
+.id-actions { display: flex; gap: 8px; margin-top: 10px; }
 
-/* ── Search ────────────────────────────────────────────────────────────── */
-.search-wrap {
-  padding: 10px 16px 12px;
-  border-bottom: 1px solid var(--glass-border);
-}
-.search-input {
-  width: 100%;
-  padding: 9px 14px;
-  border-radius: 12px;
-  border: 1px solid var(--glass-border);
-  background: rgba(0, 0, 0, 0.28);
-  color: var(--text1);
-  font-size: 13.5px;
-  outline: none;
-  transition: all 0.25s;
-}
-.search-input:focus {
-  border-color: var(--accent);
-  background: rgba(0, 0, 0, 0.42);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.search-input::placeholder { color: var(--text3); }
-
-/* ── Mode tabs ─────────────────────────────────────────────────────────── */
+/* ── Search & Mode tabs ────────────────────────────────────────────────── */
 .mode-tabs {
   display: flex;
   gap: 4px;
-  margin: 12px 16px 8px;
-  border-radius: 12px;
-  overflow: hidden;
-  background: rgba(0, 0, 0, 0.28);
+  margin: 4px 14px 8px;
+  border-radius: 10px;
+  background: rgba(4, 7, 14, 0.45);
   border: 1px solid var(--glass-border);
-  padding: 4px;
-  box-shadow: var(--glass-inset);
+  padding: 3px;
 }
 .mode-tab {
   flex: 1;
-  padding: 8px;
+  padding: 7px 10px;
   text-align: center;
   font-size: 13px;
   font-weight: 600;
@@ -5917,43 +6053,71 @@ body {
   background: transparent;
   color: var(--text2);
   border: none;
-  border-radius: 9px;
-  transition: all 0.2s;
+  border-radius: 7px;
+  white-space: nowrap;
+  transition: color 0.15s, background 0.15s;
 }
-.mode-tab:hover { color: var(--text1); background: rgba(255, 255, 255, 0.05); }
+.mode-tab:hover { color: var(--text1); background: rgba(255, 255, 255, 0.04); }
 .mode-tab.active {
-  background: linear-gradient(135deg, var(--accent2-soft), var(--accent-soft));
-  color: #fff;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  background: rgba(78, 123, 255, 0.22);
+  color: var(--text1);
+  box-shadow: inset 0 0 0 1px rgba(122, 174, 255, 0.28);
 }
 
-/* ── Slide panels (add friend / group) ─────────────────────────────────── */
+.search-wrap {
+  padding: 4px 14px 10px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.search-input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--glass-border);
+  background: rgba(4, 7, 14, 0.42);
+  color: var(--text1);
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color 0.2s, background 0.2s;
+}
+.search-input:focus {
+  border-color: var(--accent);
+  background: rgba(4, 7, 14, 0.65);
+}
+.search-input::placeholder { color: var(--text3); }
+
+/* ── Slide panels (add friend / group / group management) ──────────────── */
 .slide-panel {
-  background: rgba(0, 0, 0, 0.2);
+  background: rgba(5, 9, 17, 0.55);
   border-bottom: 1px solid var(--glass-border);
   overflow: hidden;
   max-height: 0;
-  transition: max-height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+  visibility: hidden;
+  pointer-events: none;
+  transition: max-height 0.32s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.32s;
 }
-.slide-panel.open { max-height: 420px; }
-.slide-panel-inner { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+.slide-panel.open {
+  max-height: 440px;
+  visibility: visible;
+  pointer-events: auto;
+  transition: max-height 0.32s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0s;
+}
+.slide-panel-inner { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
 
 /* ── Conversation list ─────────────────────────────────────────────────── */
 .list-section {
   flex: 1;
   overflow-y: auto;
-  padding: 6px 0 16px;
+  padding: 4px 0 16px;
 }
 
 .section-label {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 22px 8px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+  padding: 10px 18px 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--text3);
 }
 .section-label button {
@@ -5961,89 +6125,68 @@ body {
   color: var(--text2);
   border: 1px solid var(--glass-border);
   width: 26px; height: 26px;
-  border-radius: 8px;
+  border-radius: 7px;
   cursor: pointer;
-  font-size: 15px;
-  line-height: 1;
   display: flex; align-items: center; justify-content: center;
-  transition: all 0.2s;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
 }
 .section-label button:hover {
   color: var(--accent);
-  border-color: var(--accent);
-  box-shadow: 0 0 12px var(--accent-soft);
+  border-color: rgba(63, 208, 245, 0.45);
+  background: var(--accent-soft);
 }
 
 .friend-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  margin: 2px 10px;
-  width: calc(100% - 20px);
+  gap: 11px;
+  padding: 10px 12px;
+  margin: 2px 8px;
+  width: calc(100% - 16px);
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
-  border-radius: 12px;
+  border-radius: 10px;
   cursor: pointer;
-  transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
+  transition: background 0.15s, border-color 0.15s;
   position: relative;
   border: 1px solid transparent;
 }
 .friend-item:hover {
-  background: rgba(255, 255, 255, 0.045);
+  background: rgba(255, 255, 255, 0.04);
 }
 .friend-item.active {
-  background: linear-gradient(135deg, var(--accent2-soft), rgba(69, 216, 255, 0.07));
-  border-color: rgba(120, 165, 255, 0.22);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04), 0 4px 18px rgba(0, 0, 0, 0.25);
-}
-.friend-item.active::before {
-  content: '';
-  position: absolute;
-  left: 0; top: 22%; bottom: 22%;
-  width: 3px;
-  border-radius: 3px;
-  background: linear-gradient(180deg, var(--accent), var(--accent2));
-  box-shadow: 0 0 10px var(--accent-glow);
+  background: rgba(78, 123, 255, 0.14);
+  border-color: rgba(122, 174, 255, 0.25);
 }
 
 .friend-avatar { position: relative; flex-shrink: 0; }
 .avatar-circle {
-  width: 42px; height: 42px;
-  border-radius: 50%;
+  width: 38px; height: 38px;
+  border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
   color: #fff;
   font-weight: 650;
-  font-size: 16px;
-  position: relative;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 4px 12px rgba(0, 0, 0, 0.35);
-}
-.avatar-circle::after {
-  content: '';
-  position: absolute; inset: 0;
-  border-radius: 50%;
-  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.35), transparent 45%);
+  font-size: 15px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 .online-dot {
   position: absolute;
-  bottom: 0; right: 0;
-  width: 11px; height: 11px;
+  bottom: -2px; right: -2px;
+  width: 10px; height: 10px;
   border-radius: 50%;
   background: #3a4557;
-  border: 2px solid #0e1420;
-  transition: all 0.25s;
+  border: 2px solid #0b111d;
 }
-.online-dot.online {
-  background: var(--ok);
-  box-shadow: 0 0 8px rgba(61, 220, 151, 0.55);
-}
+.online-dot.online { background: var(--ok); }
 
 .friend-info { flex: 1; min-width: 0; }
+.friend-name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .friend-name {
-  font-size: 14.5px;
+  font-size: 14px;
   font-weight: 600;
+  color: var(--text1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6063,79 +6206,167 @@ body {
   gap: 4px;
   flex-shrink: 0;
 }
-.time-tag { font-size: 10.5px; color: var(--text3); font-family: var(--mono); }
-.secure-tag { font-size: 11px; }
+.time-tag {
+  font-size: 11px;
+  color: var(--text3);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.meta-icons {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text3);
+  font-size: 11px;
+}
+.meta-icons .ico-ok { color: var(--ok); }
+.meta-icons .ico-warn { color: var(--warn); }
+.meta-icons .ico-lock { color: var(--accent); }
+
 .unread-badge {
-  min-width: 20px;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, var(--accent2), var(--accent));
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--accent);
   color: #04121f;
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 0 12px var(--accent-glow);
 }
 
 /* ── Chat header ───────────────────────────────────────────────────────── */
 .chat-header {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 14px 22px;
+  gap: 12px;
+  padding: 12px 22px;
   border-bottom: 1px solid var(--glass-border);
   background: var(--glass-panel);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
-  min-height: 72px;
-  box-shadow: var(--glass-inset);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  min-height: 66px;
   z-index: 6;
 }
 .chat-header-avatar {
-  width: 44px; height: 44px;
-  border-radius: 50%;
+  width: 38px; height: 38px;
+  border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 17px;
+  font-size: 15px;
   font-weight: 650;
   color: #fff;
   flex-shrink: 0;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 4px 14px rgba(0, 0, 0, 0.35);
-  position: relative;
-}
-.chat-header-avatar::after {
-  content: '';
-  position: absolute; inset: 0;
-  border-radius: 50%;
-  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.32), transparent 45%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
 }
 .chat-header-info { flex: 1; min-width: 0; }
 .chat-header-name {
-  font-size: 16px;
+  font-size: 15.5px;
   font-weight: 650;
+  color: var(--text1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .chat-header-sub {
-  font-size: 11.5px;
-  color: var(--text3);
+  font-size: 12px;
+  color: var(--text2);
   margin-top: 2px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
 }
-.chat-header-actions { display: flex; gap: 8px; align-items: center; }
+.chat-header-sub .status-ok { color: var(--ok); font-weight: 600; }
+.chat-header-sub .status-warn { color: var(--warn); }
+.chat-header-sub .status-accent { color: var(--accent); }
+.chat-header-actions { display: flex; gap: 6px; align-items: center; min-width: 0; flex-wrap: nowrap; flex-shrink: 0; }
+
+/* ── Welcome Hero (empty selection) ────────────────────────────────────── */
+.welcome-hero {
+  margin: auto;
+  max-width: 680px;
+  width: 100%;
+  padding: 36px 28px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+.welcome-emblem {
+  width: 64px; height: 64px;
+  border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(145deg, rgba(78, 123, 255, 0.18), rgba(63, 208, 245, 0.12));
+  border: 1px solid rgba(114, 188, 255, 0.25);
+  color: var(--accent);
+}
+.welcome-emblem svg { width: 34px; height: 34px; }
+.welcome-hero h2 {
+  font-size: clamp(22px, 2.4vw, 28px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text1);
+  text-wrap: balance;
+}
+.welcome-hero p.welcome-copy {
+  font-size: 14px;
+  color: var(--text2);
+  max-width: 460px;
+  line-height: 1.6;
+}
+.welcome-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 4px;
+}
+.welcome-specs {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 18px;
+  border-top: 1px solid var(--glass-border);
+  text-align: left;
+}
+.welcome-spec {
+  padding: 11px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--glass-border);
+  min-width: 0;
+}
+.welcome-spec-label {
+  font-size: 11px;
+  color: var(--text3);
+  margin-bottom: 4px;
+}
+.welcome-spec-val {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text1);
+  font-weight: 600;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
 
 /* ── Messages ──────────────────────────────────────────────────────────── */
 .messages-wrap {
   flex: 1;
   overflow-y: auto;
-  padding: 22px 26px 10px;
+  padding: 20px 26px 10px;
   scroll-behavior: smooth;
   overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
 }
 
 .date-divider {
@@ -6143,9 +6374,8 @@ body {
   margin: 18px 0 12px;
   position: relative;
   font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.06em;
   color: var(--text3);
 }
 .date-divider::before {
@@ -6157,11 +6387,9 @@ body {
 }
 .date-divider span {
   position: relative;
-  background: linear-gradient(180deg, rgba(13, 19, 30, 0.92), rgba(13, 19, 30, 0.75));
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  padding: 4px 14px;
-  border-radius: 999px;
+  background: rgba(12, 18, 30, 0.94);
+  padding: 3px 12px;
+  border-radius: 6px;
   border: 1px solid var(--glass-border);
 }
 
@@ -6170,38 +6398,33 @@ body {
   flex-direction: column;
   margin: 3px 0;
   position: relative;
-  animation: msgIn 0.28s cubic-bezier(0.2, 0.8, 0.25, 1);
+  animation: none;
 }
 .msg-group.out { align-items: flex-end; }
 .msg-group.in { align-items: flex-start; }
 @keyframes msgIn {
-  from { opacity: 0; transform: translateY(9px) scale(0.99); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-/* Only animate messages that arrive live, not the whole re-rendered list:
-   JS stamps .live on freshly appended rows. */
-.msg-group { animation: none; }
-.msg-group.live { animation: msgIn 0.28s cubic-bezier(0.2, 0.8, 0.25, 1); }
-/* Consecutive messages from the same sender tighten up into a run. */
+.msg-group.live { animation: msgIn 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
 .msg-group.same-sender { margin-top: 1px; }
 .msg-group.same-sender .msg-sender { display: none; }
 
 .msg-sender {
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 650;
   color: var(--accent);
   margin: 10px 6px 3px;
-  letter-spacing: 0.01em;
 }
 
 .msg-bubble {
-  max-width: 68%;
+  max-width: min(68%, 68ch);
   padding: 9px 14px 10px;
-  border-radius: 18px;
+  border-radius: 14px;
   position: relative;
   word-wrap: break-word;
   overflow-wrap: break-word;
-  transition: box-shadow 0.2s;
+  transition: border-color 0.15s;
 }
 .msg-text {
   white-space: pre-wrap;
@@ -6209,49 +6432,51 @@ body {
 }
 .msg-group.in .msg-bubble {
   background: var(--in-bg);
-  backdrop-filter: blur(14px) saturate(1.1);
-  -webkit-backdrop-filter: blur(14px) saturate(1.1);
   border: 1px solid var(--glass-border);
-  border-top-left-radius: 7px;
-  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.28), var(--glass-inset);
+  border-top-left-radius: 5px;
 }
 .msg-group.out .msg-bubble {
   background: var(--out-bg);
   border: 1px solid var(--out-border);
-  border-top-right-radius: 7px;
-  box-shadow: 0 4px 18px rgba(79, 124, 255, 0.16), var(--glass-inset);
+  border-top-right-radius: 5px;
 }
 .msg-group.out .msg-bubble a { color: #eaf6ff; }
-.msg-bubble:hover {
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
-}
+.msg-bubble:hover { border-color: rgba(148, 178, 226, 0.28); }
 
-/* Reply quote block inside a bubble */
+/* Reply quote block inside bubble — hairline perimeter (no thick left stripe) */
 .reply-quote {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   width: 100%;
   max-width: 420px;
-  padding: 5px 10px 6px;
-  margin: -1px 0 7px;
-  border: 0;
-  border-left: 3px solid var(--accent);
+  padding: 6px 10px;
+  margin: 0 0 7px;
+  border: 1px solid rgba(148, 178, 226, 0.16);
   border-radius: 8px;
-  background: rgba(0, 0, 0, 0.26);
+  background: rgba(4, 7, 14, 0.32);
   color: inherit;
   cursor: pointer;
-  transition: background 0.15s, transform 0.15s;
+  transition: background 0.15s, border-color 0.15s;
   text-align: left;
 }
-.msg-group.out .reply-quote { border-left-color: rgba(255, 255, 255, 0.75); }
-.reply-quote:hover { background: rgba(0, 0, 0, 0.4); transform: translateX(2px); }
+.msg-group.out .reply-quote {
+  background: rgba(4, 12, 26, 0.28);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.reply-quote:hover {
+  background: rgba(4, 7, 14, 0.5);
+  border-color: rgba(63, 208, 245, 0.45);
+}
 .reply-quote .rq-sender {
   font-size: 11.5px;
-  font-weight: 700;
+  font-weight: 650;
   color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
-.msg-group.out .reply-quote .rq-sender { color: #dff0ff; }
+.msg-group.out .reply-quote .rq-sender { color: #dff3ff; }
 .reply-quote .rq-body {
   font-size: 12px;
   color: var(--text2);
@@ -6260,14 +6485,13 @@ body {
   text-overflow: ellipsis;
   max-width: 380px;
 }
-.msg-group.out .reply-quote .rq-body { color: rgba(234, 242, 250, 0.75); }
+.msg-group.out .reply-quote .rq-body { color: rgba(234, 242, 250, 0.8); }
 .reply-quote .rq-missing { font-size: 12px; color: var(--text3); font-style: italic; }
 
-/* Edited label */
 .edited-label {
   display: inline-block;
   font-size: 10.5px;
-  color: rgba(255, 255, 255, 0.55);
+  color: rgba(255, 255, 255, 0.62);
   margin-left: 7px;
   font-style: italic;
   vertical-align: baseline;
@@ -6276,90 +6500,86 @@ body {
 }
 .msg-group.in .edited-label { color: var(--text3); }
 
-/* Tombstone (deleted for everyone) */
 .msg-bubble.tombstone {
-  background: rgba(255, 255, 255, 0.03) !important;
+  background: rgba(255, 255, 255, 0.025) !important;
   border: 1px dashed rgba(255, 255, 255, 0.16) !important;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
   box-shadow: none !important;
   color: var(--text3);
   font-style: italic;
   font-size: 13.5px;
 }
-.msg-bubble.tombstone .tombstone-icon { margin-right: 6px; opacity: 0.8; }
+.msg-bubble.tombstone .tombstone-icon { margin-right: 6px; opacity: 0.85; }
 
 .msg-meta {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
-  font-size: 10.5px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
   color: var(--text3);
-  margin: 4px 8px 0;
+  margin: 4px 6px 0;
   min-height: 16px;
   white-space: nowrap;
+}
+.msg-group.out .msg-meta {
+  flex-direction: row-reverse;
+  justify-content: flex-start;
 }
 .msg-status { display: inline-flex; }
 .check { color: var(--text3); font-size: 11px; letter-spacing: -1.5px; }
 .check.delivered { color: var(--accent2); }
-.check.read { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
+.check.read { color: var(--accent); }
 
-/* ── Hover toolbar (reply / edit / copy / delete) ───────────────────────── */
+/* ── Message hover toolbar ─────────────────────────────────────────────── */
 .msg-tools {
   display: flex;
   align-items: center;
   gap: 2px;
   position: absolute;
-  bottom: calc(100% + 6px);
-  background: rgba(16, 23, 37, 0.92);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  bottom: calc(100% + 5px);
+  background: rgba(13, 19, 32, 0.96);
   border: 1px solid var(--glass-border-hover);
-  border-radius: 12px;
+  border-radius: 10px;
   padding: 3px;
   z-index: 12;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
   opacity: 0;
   visibility: hidden;
-  transform: translateY(6px) scale(0.96);
-  transition: opacity 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
-              transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
-              visibility 0.18s;
+  transform: translateY(4px);
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
 }
-.msg-group.out .msg-tools { right: 6px; }
-.msg-group.in .msg-tools { left: 6px; }
+.msg-group.out .msg-tools { right: 4px; }
+.msg-group.in .msg-tools { left: 4px; }
 .msg-bubble:hover .msg-tools,
 .msg-bubble:focus-within .msg-tools,
 .msg-tools:hover,
 .msg-tools:focus-within {
   opacity: 1;
   visibility: visible;
-  transform: translateY(0) scale(1);
+  transform: translateY(0);
 }
 .msg-tool-btn {
-  width: 30px; height: 30px;
-  border-radius: 8px;
+  width: 29px; height: 29px;
+  border-radius: 7px;
   border: none;
   background: transparent;
   color: var(--text2);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13.5px;
   display: flex; align-items: center; justify-content: center;
-  transition: all 0.15s;
+  transition: background 0.12s, color 0.12s;
 }
 .msg-tool-btn:hover, .msg-tool-btn:focus-visible {
   background: var(--accent-soft);
   color: var(--accent);
-  transform: translateY(-1px);
 }
 .msg-tool-btn.danger:hover, .msg-tool-btn.danger:focus-visible {
   background: var(--danger-soft);
   color: var(--danger);
 }
 .tools-sep {
-  width: 1px;
-  height: 18px;
+  width: 1px; height: 16px;
   background: var(--glass-border);
   margin: 0 3px;
   flex-shrink: 0;
@@ -6374,7 +6594,7 @@ body {
     flex-wrap: wrap;
     width: fit-content;
     max-width: 100%;
-    background: rgba(7, 12, 22, 0.55);
+    background: rgba(7, 12, 22, 0.7);
     box-shadow: none;
     align-self: flex-start;
   }
@@ -6385,21 +6605,16 @@ body {
   .msg-group.out .msg-tools { align-self: flex-end; }
   .msg-tools .reaction-btn,
   .msg-tools .msg-tool-btn {
-    width: 28px;
-    height: 28px;
+    width: 30px; height: 30px;
     font-size: 14px;
   }
 }
 
-/* Legacy meta-row actions kept for keyboard/hover reachability */
 .msg-actions {
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 0.2s;
-  margin-left: 6px;
+  display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s; margin-left: 6px;
 }
-.msg-group.in .msg-actions { margin-left: 0; margin-right: 6px; }
+.msg-group.out .msg-actions { margin-left: 0; margin-right: 6px; }
+.msg-group.in .msg-actions { margin-left: 6px; margin-right: 0; }
 .msg-bubble:hover ~ .msg-meta .msg-actions,
 .msg-meta:hover .msg-actions,
 .msg-meta:focus-within .msg-actions { opacity: 1; }
@@ -6409,7 +6624,7 @@ body {
 .msg-action-btn {
   background: none; border: none; cursor: pointer;
   color: var(--text3); font-size: 11px; padding: 2px 6px;
-  border-radius: 5px; transition: all 0.15s;
+  border-radius: 5px; transition: background 0.12s, color 0.12s;
 }
 .msg-action-btn:hover, .msg-action-btn:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--text1); }
 
@@ -6420,25 +6635,35 @@ body {
   gap: 8px;
   width: min(340px, 100%);
   padding: 8px;
-  border-radius: 14px;
-  background: rgba(0, 0, 0, 0.26);
+  border-radius: 12px;
+  background: rgba(4, 7, 14, 0.36);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 .msg-image {
   max-width: 100%;
   max-height: 320px;
-  border-radius: 9px;
+  border-radius: 8px;
   display: block;
   cursor: zoom-in;
-  transition: filter 0.2s;
+  transition: filter 0.15s;
 }
 .msg-image:hover { filter: brightness(1.06); }
-.attachment-preview-link { display: block; }
+.attachment-preview-btn {
+  display: block;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: zoom-in;
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+  text-align: center;
+}
 .attachment-head {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 2px 6px 4px;
+  padding: 2px 4px;
 }
 .attachment-name {
   font-size: 13px;
@@ -6447,8 +6672,14 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 200px;
+  display: block;
 }
-.attachment-meta { font-size: 11px; color: var(--text3); font-family: var(--mono); }
+.attachment-meta {
+  font-size: 11px;
+  color: var(--text3);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
 .attachment-download {
   margin-left: auto;
   width: 30px; height: 30px;
@@ -6456,24 +6687,29 @@ body {
   display: flex; align-items: center; justify-content: center;
   color: var(--accent);
   text-decoration: none;
-  font-size: 16px;
   border: 1px solid var(--glass-border);
-  transition: all 0.2s;
+  transition: background 0.15s, border-color 0.15s;
   flex-shrink: 0;
 }
 .attachment-download:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
-  box-shadow: 0 0 12px var(--accent-soft);
 }
 .attachment-audio { width: 100%; height: 36px; }
 .attachment-video {
   width: 100%;
   max-height: 320px;
-  border-radius: 9px;
+  border-radius: 8px;
   background: #000;
 }
-.file-msg-icon { font-size: 22px; flex-shrink: 0; }
+.file-msg-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--accent);
+  flex-shrink: 0;
+}
 
 .file-msg-chip {
   display: flex;
@@ -6481,88 +6717,81 @@ body {
   gap: 12px;
   min-width: 220px;
   max-width: 300px;
-  padding: 10px 14px;
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.26);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(4, 7, 14, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   color: var(--text1);
   text-decoration: none;
-  transition: all 0.2s;
+  transition: background 0.15s, border-color 0.15s;
 }
 .file-msg-chip:hover {
-  background: rgba(0, 0, 0, 0.42);
+  background: rgba(4, 7, 14, 0.52);
   border-color: var(--glass-border-hover);
-  transform: translateY(-1px);
 }
-.msg-group.out .file-msg-chip { background: rgba(0, 0, 0, 0.24); color: #fff; }
+.msg-group.out .file-msg-chip { color: #fff; }
 .file-msg-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .file-msg-name {
   font-size: 13px; font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.file-msg-size { font-size: 11px; color: var(--text3); font-family: var(--mono); }
-.file-msg-dl { font-size: 18px; color: var(--accent); flex-shrink: 0; }
+.file-msg-size {
+  font-size: 11px; color: var(--text3);
+  font-family: var(--mono); font-variant-numeric: tabular-nums;
+}
+.file-msg-dl { color: var(--accent); flex-shrink: 0; display: inline-flex; }
 
-/* Inline link inside a message bubble */
 .inline-link {
   color: var(--accent);
   text-decoration: none;
-  border-bottom: 1px solid rgba(69, 216, 255, 0.4);
+  border-bottom: 1px solid rgba(63, 208, 245, 0.45);
   word-break: break-all;
-  transition: all 0.15s;
 }
-.inline-link:hover { border-bottom-color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
-.msg-group.out .inline-link { color: #eaf6ff; border-bottom-color: rgba(255, 255, 255, 0.5); }
-.msg-group.out .inline-link:hover { border-bottom-color: #fff; }
+.inline-link:hover { border-bottom-color: var(--accent); }
+.msg-group.out .inline-link { color: #eaf6ff; border-bottom-color: rgba(255, 255, 255, 0.55); }
 
-/* ── Reactions ─────────────────────────────────────────────────────────── */
+/* ── Reactions (interactive controls) ──────────────────────────────────── */
 .reactions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin: 5px 8px 2px;
+  margin: 5px 6px 2px;
   z-index: 2;
   position: relative;
 }
 .reaction-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  background: rgba(20, 28, 44, 0.85);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: rgba(18, 26, 42, 0.9);
   border: 1px solid var(--glass-border);
   color: var(--text1);
-  font-size: 13px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
-  transition: all 0.2s;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  transition: border-color 0.15s, background 0.15s;
 }
-.reaction-chip:hover {
-  border-color: var(--accent);
-  transform: translateY(-2px);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
-}
+.reaction-chip:hover { border-color: var(--accent); }
 .reaction-chip.mine {
-  border-color: var(--accent);
+  border-color: rgba(63, 208, 245, 0.6);
   background: var(--accent-soft);
-  box-shadow: 0 0 12px var(--accent-soft);
 }
 
 .reaction-btn {
-  width: 34px; height: 34px;
-  border-radius: 9px;
+  width: 30px; height: 30px;
+  border-radius: 7px;
   background: none;
   border: 1px solid transparent;
   cursor: pointer;
-  font-size: 17px;
+  font-size: 15px;
   display: flex; align-items: center; justify-content: center;
-  transition: all 0.2s;
+  transition: background 0.12s;
 }
-.reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255, 255, 255, 0.09); transform: scale(1.12); }
-.reaction-btn.mine { background: var(--accent-soft); border-color: rgba(69, 216, 255, 0.45); }
+.reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255, 255, 255, 0.08); }
+.reaction-btn.mine { background: var(--accent-soft); border-color: rgba(63, 208, 245, 0.45); }
+
 .friend-picker {
   display: flex;
   flex-direction: column;
@@ -6570,9 +6799,9 @@ body {
   max-height: 120px;
   overflow-y: auto;
   padding: 8px 10px;
-  border-radius: 10px;
+  border-radius: 9px;
   border: 1px solid var(--glass-border);
-  background: rgba(0, 0, 0, 0.22);
+  background: rgba(4, 7, 14, 0.35);
 }
 .friend-picker-row {
   display: flex;
@@ -6586,12 +6815,12 @@ body {
 
 /* ── Typing indicator ──────────────────────────────────────────────────── */
 #typing-indicator {
-  padding: 0 26px 10px;
-  min-height: 30px;
+  padding: 0 26px 8px;
+  min-height: 26px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 13px;
+  gap: 8px;
+  font-size: 12.5px;
   color: var(--text2);
 }
 .typing-dots {
@@ -6599,83 +6828,67 @@ body {
   gap: 4px;
   align-items: center;
   background: var(--in-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  padding: 7px 12px;
-  border-radius: 16px;
+  padding: 6px 10px;
+  border-radius: 10px;
   border: 1px solid var(--glass-border);
-  border-bottom-left-radius: 5px;
 }
 .typing-dot {
-  width: 6px; height: 6px;
+  width: 5px; height: 5px;
   border-radius: 50%;
   background: var(--accent);
   animation: bounce 1.4s infinite ease-in-out;
-  box-shadow: 0 0 5px var(--accent-glow);
 }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
 @keyframes bounce {
   0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
-  40% { transform: translateY(-4px); opacity: 1; }
+  40% { transform: translateY(-3px); opacity: 1; }
 }
 
-/* ── Composer context bar (reply / edit) ───────────────────────────────── */
-.composer-context {
-  padding: 0 26px 8px;
-}
+/* ── Composer context bar ──────────────────────────────────────────────── */
+.composer-context { padding: 0 26px 8px; }
 .composer-context[hidden] { display: none; }
 .ctx-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 9px 12px;
-  border-radius: 14px 14px 6px 6px;
-  background: linear-gradient(150deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
-  border: 1px solid var(--glass-border);
-  border-bottom: 2px solid var(--accent);
-  animation: ctxIn 0.22s cubic-bezier(0.2, 0.8, 0.25, 1);
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(15, 23, 38, 0.9);
+  border: 1px solid rgba(63, 208, 245, 0.35);
+  animation: ctxIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.ctx-bar.editing { border-bottom-color: var(--warn); }
+.ctx-bar.editing { border-color: rgba(246, 196, 83, 0.45); }
 @keyframes ctxIn {
-  from { opacity: 0; transform: translateY(8px); }
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
 .ctx-icon {
-  width: 30px; height: 30px;
+  width: 28px; height: 28px;
   flex-shrink: 0;
-  border-radius: 9px;
+  border-radius: 7px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 15px;
   background: var(--accent-soft);
   color: var(--accent);
 }
-.ctx-bar.editing .ctx-icon { background: rgba(255, 200, 87, 0.14); color: var(--warn); }
+.ctx-bar.editing .ctx-icon { background: var(--warn-soft); color: var(--warn); }
 .ctx-body { flex: 1; min-width: 0; }
-.ctx-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--accent);
-}
+.ctx-title { font-size: 12px; font-weight: 650; color: var(--accent); }
 .ctx-bar.editing .ctx-title { color: var(--warn); }
 .ctx-snippet {
-  font-size: 12px;
-  color: var(--text2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 1px;
+  font-size: 12px; color: var(--text2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ctx-cancel {
   width: 28px; height: 28px;
-  border-radius: 8px;
+  border-radius: 7px;
   border: 1px solid var(--glass-border);
   background: transparent;
   color: var(--text3);
   cursor: pointer;
-  font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
-  transition: all 0.15s;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 .ctx-cancel:hover {
   color: var(--danger);
@@ -6685,29 +6898,25 @@ body {
 
 /* ── Composer ──────────────────────────────────────────────────────────── */
 .composer {
-  padding: 12px 26px 16px;
+  padding: 12px 26px 14px;
   border-top: 1px solid var(--glass-border);
   background: var(--glass-panel);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.15);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   z-index: 5;
-  box-shadow: var(--glass-inset);
 }
 .composer-inner {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: flex-end;
-  background: rgba(4, 8, 15, 0.55);
+  background: rgba(4, 7, 14, 0.62);
   border: 1px solid var(--glass-border);
-  border-radius: 18px;
-  padding: 9px 12px;
-  transition: border-color 0.25s, box-shadow 0.25s;
-  box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.3);
+  border-radius: 13px;
+  padding: 8px 10px;
+  transition: border-color 0.18s;
 }
 .composer-inner:focus-within {
-  border-color: rgba(69, 216, 255, 0.55);
-  box-shadow: 0 0 0 3px var(--accent-soft), 0 0 24px rgba(69, 216, 255, 0.08),
-              inset 0 2px 10px rgba(0, 0, 0, 0.3);
+  border-color: rgba(63, 208, 245, 0.55);
 }
 #text {
   flex: 1;
@@ -6716,89 +6925,79 @@ body {
   outline: none;
   color: var(--text1);
   font-family: var(--font);
-  font-size: 15px;
+  font-size: 14.5px;
   resize: none;
   max-height: 140px;
   min-height: 24px;
   line-height: 1.5;
-  padding-bottom: 4px;
+  padding: 3px 4px;
 }
 #text::placeholder { color: var(--text3); }
-.composer-actions { display: flex; align-items: center; gap: 5px; }
+.composer-actions { display: flex; align-items: center; gap: 4px; }
 .icon-btn {
-  width: 38px; height: 38px;
+  width: 36px; height: 36px;
   display: flex; align-items: center; justify-content: center;
   background: none; border: none; cursor: pointer;
   color: var(--text2);
-  border-radius: 11px;
-  font-size: 19px;
-  transition: all 0.2s;
+  border-radius: 9px;
+  transition: background 0.15s, color 0.15s;
 }
 .icon-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.07);
   color: var(--accent);
-  transform: translateY(-1px);
 }
 .send-btn {
-  width: 40px; height: 40px;
+  width: 38px; height: 38px;
   display: flex; align-items: center; justify-content: center;
   background: linear-gradient(135deg, var(--accent2), var(--accent));
   border: none; cursor: pointer;
   color: #04121f;
-  font-weight: 800;
-  border-radius: 12px;
-  font-size: 17px;
-  transition: all 0.2s;
+  font-weight: 700;
+  border-radius: 9px;
+  transition: filter 0.15s, transform 0.12s;
   flex-shrink: 0;
-  box-shadow: 0 4px 16px var(--accent-glow);
 }
-.send-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 22px var(--accent-glow);
-  filter: brightness(1.08);
-}
-.send-btn:active { transform: scale(0.94); }
+.send-btn:hover { filter: brightness(1.08); }
+.send-btn:active { transform: scale(0.95); }
 .send-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
   background: var(--s4);
   color: var(--text3);
-  box-shadow: none;
-  transform: none;
 }
-.send-btn.saving { background: linear-gradient(135deg, #f5b642, var(--warn)); color: #1c1206; box-shadow: 0 4px 16px rgba(255, 200, 87, 0.3); }
+.send-btn.saving { background: linear-gradient(135deg, #eab308, var(--warn)); color: #1c1206; }
 
 .char-hint {
   font-size: 11px;
   color: var(--text3);
   text-align: right;
-  margin-top: 6px;
+  margin-top: 5px;
   font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
 }
 .char-hint.danger { color: var(--danger); font-weight: 700; }
 .transfer-status {
-  min-height: 20px; margin-top: 7px; display: flex; align-items: center; gap: 8px;
-  color: var(--text2); font-size: 11px;
+  min-height: 18px; margin-top: 6px; display: flex; align-items: center; gap: 8px;
+  color: var(--text2); font-size: 11.5px;
 }
 .transfer-status:empty { min-height: 0; margin-top: 0; }
 .transfer-status .progress-track {
   width: 96px; height: 4px; overflow: hidden; background: rgba(255, 255, 255, 0.1); border-radius: 2px;
 }
-.transfer-status .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); transition: width 0.15s linear; }
+.transfer-status .progress-fill { height: 100%; background: var(--accent); transition: width 0.15s linear; }
 .icon-btn.busy { opacity: 0.45; pointer-events: none; }
 
 /* ── Right panel ───────────────────────────────────────────────────────── */
 .panel-section {
-  padding: 16px 20px;
+  padding: 14px 16px;
   border-bottom: 1px solid var(--glass-border);
 }
 .panel-title {
   font-size: 11.5px;
-  font-weight: 750;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+  font-weight: 650;
+  letter-spacing: 0.04em;
   color: var(--text3);
-  margin-bottom: 13px;
+  margin-bottom: 10px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -6807,123 +7006,126 @@ body {
   content: '';
   flex: 1;
   height: 1px;
-  background: linear-gradient(90deg, var(--glass-border-hover), transparent);
+  background: var(--glass-border);
+}
+
+.inspector-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.inspector-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.inspector-label { color: var(--text3); font-size: 12px; }
+.inspector-val {
+  color: var(--text1);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  text-align: right;
+  word-break: break-all;
+}
+.inspector-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
 }
 
 .stat-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 8px;
 }
 .stat-box {
-  background: rgba(0, 0, 0, 0.24);
+  background: rgba(4, 7, 14, 0.36);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
-  padding: 12px;
+  border-radius: 10px;
+  padding: 10px 8px;
   text-align: center;
-  transition: all 0.2s;
-  box-shadow: var(--glass-inset);
-}
-.stat-box:hover {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: var(--glass-border-hover);
-  transform: translateY(-2px);
 }
 .stat-box b {
   display: block;
-  font-size: 23px;
-  font-weight: 750;
-  margin-bottom: 3px;
-  background: linear-gradient(135deg, #9fc6ff, var(--accent));
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text1);
+  margin-bottom: 2px;
 }
-.stat-box span { font-size: 10.5px; color: var(--text2); text-transform: uppercase; font-weight: 650; letter-spacing: 0.06em; }
+.stat-box span { font-size: 11px; color: var(--text3); }
 
 .session-item {
-  padding: 11px 12px;
-  background: rgba(0, 0, 0, 0.24);
+  padding: 10px 12px;
+  background: rgba(4, 7, 14, 0.36);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
+  border-radius: 10px;
   margin-bottom: 8px;
-  font-size: 13px;
-  transition: all 0.2s;
+  font-size: 12.5px;
 }
-.session-item:hover {
-  border-color: var(--glass-border-hover);
-  background: rgba(255, 255, 255, 0.03);
-}
-.session-item-name { font-weight: 650; margin-bottom: 4px; font-size: 13.5px; }
-.session-item-meta { color: var(--text2); font-family: var(--mono); font-size: 11px; }
+.session-item-name { font-weight: 600; margin-bottom: 3px; font-size: 13px; color: var(--text1); }
+.session-item-meta { color: var(--text3); font-family: var(--mono); font-size: 11px; }
 .session-age {
   font-size: 11px;
-  margin-top: 8px;
+  margin-top: 7px;
   display: flex;
   align-items: center;
   gap: 8px;
+  font-variant-numeric: tabular-nums;
 }
 .session-age .bar {
   flex: 1;
   height: 4px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.08);
   border-radius: 2px;
   overflow: hidden;
 }
-.session-age .fill {
-  height: 100%;
-  background: linear-gradient(90deg, #3ddc97, #10b981);
-  border-radius: 2px;
-  transition: width 0.3s;
-  box-shadow: 0 0 8px rgba(61, 220, 151, 0.4);
-}
-.session-age .fill.warn { background: linear-gradient(90deg, #ffd57e, #f5a623); box-shadow: 0 0 8px rgba(245, 166, 35, 0.4); }
-.session-age .fill.danger { background: linear-gradient(90deg, #ff8ba0, #e5484d); box-shadow: 0 0 8px rgba(229, 72, 77, 0.4); }
+.session-age .fill { height: 100%; background: var(--ok); border-radius: 2px; transition: width 0.3s; }
+.session-age .fill.warn { background: var(--warn); }
+.session-age .fill.danger { background: var(--danger); }
 
 .file-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  background: rgba(0, 0, 0, 0.24);
+  gap: 10px;
+  padding: 9px 10px;
+  background: rgba(4, 7, 14, 0.36);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
+  border-radius: 10px;
   margin-bottom: 8px;
-  transition: all 0.2s;
-}
-.file-item:hover {
-  transform: translateY(-2px);
-  border-color: var(--glass-border-hover);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
 }
 .file-icon {
-  font-size: 22px;
   flex-shrink: 0;
   background: rgba(255, 255, 255, 0.05);
-  width: 40px; height: 40px;
+  color: var(--accent);
+  width: 34px; height: 34px;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .file-info { flex: 1; min-width: 0; }
 .file-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   margin-bottom: 2px;
 }
-.file-meta { font-size: 11px; color: var(--text2); }
+.file-meta { font-size: 11px; color: var(--text3); font-variant-numeric: tabular-nums; }
 .file-dl {
-  font-size: 18px;
-  color: var(--text3);
+  color: var(--text2);
   text-decoration: none;
-  transition: all 0.2s;
   flex-shrink: 0;
-  width: 32px; height: 32px;
+  width: 30px; height: 30px;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 9px;
+  border-radius: 8px;
   border: 1px solid var(--glass-border);
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 .file-dl:hover {
   color: var(--accent);
@@ -6931,74 +7133,70 @@ body {
   border-color: var(--accent);
 }
 .file-audio { width: 100%; height: 32px; margin-top: 6px; }
-.file-audio::-webkit-media-controls-panel { background: var(--s3); }
 
 /* ── Storage quota ─────────────────────────────────────────────────────── */
-.quota-row { font-size: 11px; margin-top: 8px; }
+.quota-row { font-size: 11.5px; margin-top: 6px; font-variant-numeric: tabular-nums; }
 .quota-row .bar {
-  height: 5px; background: rgba(255, 255, 255, 0.1); border-radius: 3px; overflow: hidden; margin-top: 6px;
+  height: 5px; background: rgba(255, 255, 255, 0.09); border-radius: 3px; overflow: hidden; margin-top: 6px;
 }
 .quota-row .fill {
   height: 100%; border-radius: 3px; transition: width 0.3s;
   background: linear-gradient(90deg, var(--accent2), var(--accent));
-  box-shadow: 0 0 8px var(--accent-glow);
 }
-.quota-row .fill.warn { background: linear-gradient(90deg, #ffd57e, #f5a623); box-shadow: 0 0 8px rgba(245, 166, 35, 0.4); }
-.quota-row .fill.danger { background: linear-gradient(90deg, #ff8ba0, #e5484d); box-shadow: 0 0 8px rgba(229, 72, 77, 0.4); }
-.quota-label { display: flex; justify-content: space-between; color: var(--text2); }
+.quota-row .fill.warn { background: var(--warn); }
+.quota-row .fill.danger { background: var(--danger); }
+.quota-label { display: flex; justify-content: space-between; color: var(--text2); font-family: var(--mono); font-size: 11.5px; }
 
 /* ── Group member management ───────────────────────────────────────────── */
 .member-row {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px; border-radius: 10px;
-  background: rgba(0, 0, 0, 0.24); border: 1px solid var(--glass-border);
-  margin-bottom: 6px; font-size: 12px;
+  padding: 7px 10px; border-radius: 8px;
+  background: rgba(4, 7, 14, 0.36); border: 1px solid var(--glass-border);
+  margin-bottom: 6px; font-size: 12.5px;
 }
-.member-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); }
+.member-row .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text1); }
 .member-row .role-tag {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
-  color: var(--text3); background: rgba(255, 255, 255, 0.05); padding: 2px 7px; border-radius: 999px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text3);
 }
 .member-row .rm-btn {
   background: none; border: none; color: var(--text3); cursor: pointer; font-size: 14px;
-  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+  width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .member-row .rm-btn:hover { color: var(--danger); background: var(--danger-soft); }
 
 /* ── Load more history ─────────────────────────────────────────────────── */
 .load-more-row { display: flex; justify-content: center; padding: 4px 0 14px; }
 .load-more-btn {
-  font-size: 12px; color: var(--text2); background: rgba(20, 28, 44, 0.8);
-  border: 1px solid var(--glass-border); border-radius: 999px; padding: 7px 18px; cursor: pointer;
-  transition: all 0.2s;
+  font-size: 12px; color: var(--text2); background: rgba(18, 26, 42, 0.88);
+  border: 1px solid var(--glass-border); border-radius: 8px; padding: 6px 14px; cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
 }
-.load-more-btn:hover { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 14px var(--accent-soft); }
+.load-more-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ── Recording ─────────────────────────────────────────────────────────── */
-.icon-btn.recording {
-  color: var(--danger);
-  animation: recPulse 1.2s infinite;
-}
-@keyframes recPulse {
-  0%, 100% { opacity: 1; } 50% { opacity: 0.45; }
-}
+.icon-btn.recording { color: var(--danger); animation: recPulse 1.2s infinite; }
+@keyframes recPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 .rec-indicator {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: center; gap: 7px;
   font-size: 12px; color: var(--danger); font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   padding: 0 26px 8px;
 }
 .rec-indicator .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--danger);
-  box-shadow: 0 0 8px var(--danger); animation: pulse 1s infinite;
+  animation: recPulse 1s infinite;
 }
 .rec-cancel {
-  margin-left: 8px; padding: 3px 9px; border: 1px solid rgba(255, 93, 125, 0.45);
+  margin-left: 8px; padding: 3px 9px; border: 1px solid rgba(255, 100, 130, 0.45);
   border-radius: 6px; background: transparent; color: var(--danger); cursor: pointer;
 }
 
-/* ── Modals ────────────────────────────────────────────────────────────── */
+/* ── Modals & Lightbox ─────────────────────────────────────────────────── */
 .modal-overlay {
-  display: none; position: fixed; inset: 0; background: rgba(2, 5, 10, 0.66);
+  display: none; position: fixed; inset: 0; background: rgba(2, 5, 10, 0.72);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   z-index: 100;
@@ -7006,54 +7204,100 @@ body {
 }
 .modal-overlay.open { display: flex; }
 .modal {
-  width: 440px; max-width: 92vw; max-height: 84vh; overflow-y: auto;
-  background: rgba(15, 21, 33, 0.96);
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  width: 450px; max-width: 92vw; max-height: 85vh; overflow-y: auto;
+  background: var(--glass-bg-strong);
   border: 1px solid var(--glass-border-hover); border-radius: var(--rad-lg);
-  box-shadow: var(--glass-shadow), var(--glass-inset); padding: 24px;
-  animation: modalIn 0.24s cubic-bezier(0.2, 0.8, 0.25, 1);
+  box-shadow: var(--glass-shadow); padding: 22px;
+  animation: modalIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes modalIn {
-  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
-.modal h2 { font-size: 17px; margin-bottom: 6px; font-weight: 700; }
-.modal p.hint { font-size: 12px; color: var(--text2); margin-bottom: 14px; line-height: 1.55; }
+.modal h2 { font-size: 17px; margin-bottom: 6px; font-weight: 700; color: var(--text1); }
+.modal p.hint { font-size: 12.5px; color: var(--text2); margin-bottom: 14px; line-height: 1.55; }
 .modal .field { margin-bottom: 10px; }
-.modal textarea.field { min-height: 90px; font-family: var(--mono); font-size: 11px; resize: vertical; }
-.modal-tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+.modal textarea.field { min-height: 90px; font-family: var(--mono); font-size: 11.5px; resize: vertical; }
+.modal-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
 .modal-tabs button {
-  flex: 1; padding: 8px; font-size: 12px; border-radius: 9px; border: 1px solid var(--glass-border);
-  background: rgba(0, 0, 0, 0.25); color: var(--text2); cursor: pointer; transition: all 0.2s;
+  flex: 1; padding: 8px; font-size: 12.5px; font-weight: 600; border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(4, 7, 14, 0.38); color: var(--text2); cursor: pointer; transition: all 0.15s;
 }
-.modal-tabs button.active { color: #fff; border-color: rgba(79, 124, 255, 0.55); background: var(--accent2-soft); }
+.modal-tabs button.active { color: var(--text1); border-color: rgba(78, 123, 255, 0.55); background: var(--accent2-soft); }
 .modal-actions { display: flex; gap: 8px; margin-top: 14px; }
+
+.lightbox-modal {
+  width: min(880px, 94vw);
+  max-height: 90vh;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.lightbox-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.lightbox-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lightbox-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 7, 14, 0.72);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  padding: 10px;
+  min-height: 200px;
+  max-height: 68vh;
+  overflow: hidden;
+}
+.lightbox-stage img {
+  max-width: 100%;
+  max-height: 64vh;
+  object-fit: contain;
+  border-radius: 6px;
+  display: block;
+}
 
 /* ── Message search ────────────────────────────────────────────────────── */
 .search-results { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .search-result-item {
-  text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px;
-  border: 1px solid var(--glass-border); background: rgba(0, 0, 0, 0.24); color: var(--text1);
-  cursor: pointer; font-size: 13px; line-height: 1.45; transition: all 0.15s;
+  text-align: left; width: 100%; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--glass-border); background: rgba(4, 7, 14, 0.36); color: var(--text1);
+  cursor: pointer; font-size: 13px; line-height: 1.45; transition: border-color 0.15s, background 0.15s;
 }
 .search-result-item:hover, .search-result-item:focus-visible { border-color: var(--accent); background: var(--accent-soft); }
-.search-result-meta { font-size: 11px; color: var(--text3); margin-bottom: 4px; }
-.search-empty { font-size: 12px; color: var(--text3); text-align: center; padding: 18px 0; }
+.search-result-meta { font-size: 11px; color: var(--text3); margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+.search-empty { font-size: 12.5px; color: var(--text3); text-align: center; padding: 18px 0; }
+mark.search-hit {
+  background: rgba(63, 208, 245, 0.24);
+  color: #ffffff;
+  border-radius: 3px;
+  padding: 0 2px;
+}
 
 /* ── Calls ─────────────────────────────────────────────────────────────── */
 .call-modal { text-align: center; }
 .call-modal-avatar {
-  width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 14px;
+  width: 68px; height: 68px; border-radius: 16px; margin: 0 auto 14px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 30px;
-  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.4), transparent 45%),
-              linear-gradient(135deg, var(--accent2), var(--accent));
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
   animation: call-pulse 1.4s ease-in-out infinite;
 }
 @keyframes call-pulse {
   0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
-  50% { box-shadow: 0 0 0 16px rgba(69, 216, 255, 0); }
+  50% { box-shadow: 0 0 0 14px rgba(63, 208, 245, 0); }
 }
 .call-overlay {
   position: fixed; inset: 0; z-index: 200; background: #04070d;
@@ -7061,12 +7305,10 @@ body {
 }
 .call-overlay[hidden] { display: none; }
 .call-overlay-inner { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
-#remoteVideo {
-  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #0a0b0d;
-}
+#remoteVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #0a0b0d; }
 #localVideo {
   position: absolute; bottom: 96px; right: 20px; width: 140px; height: 100px;
-  object-fit: cover; border-radius: 12px; border: 1px solid var(--glass-border-hover);
+  object-fit: cover; border-radius: 10px; border: 1px solid var(--glass-border-hover);
   box-shadow: var(--glass-shadow); background: #111; z-index: 2;
 }
 .call-overlay-info {
@@ -7074,140 +7316,128 @@ body {
   gap: 8px; color: #fff; text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
 }
 .call-overlay-avatar {
-  width: 88px; height: 88px; border-radius: 50%; display: flex; align-items: center;
-  justify-content: center; font-size: 34px;
-  background: radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.4), transparent 45%),
-              linear-gradient(135deg, var(--accent2), var(--accent));
+  width: 84px; height: 84px; border-radius: 18px; display: flex; align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
 }
 .call-overlay-name { font-size: 20px; font-weight: 700; }
 .call-overlay-status { font-size: 13px; opacity: 0.85; }
 .call-overlay-controls {
   position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
-  display: flex; gap: 16px; z-index: 3;
+  display: flex; gap: 14px; z-index: 3;
 }
 .call-btn {
-  width: 56px; height: 56px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.14); cursor: pointer;
-  background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  color: #fff; font-size: 22px;
-  display: flex; align-items: center; justify-content: center; transition: all 0.15s;
+  width: 52px; height: 52px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.16); cursor: pointer;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  display: flex; align-items: center; justify-content: center; transition: background 0.15s;
 }
-.call-btn:hover { background: rgba(255, 255, 255, 0.2); }
-.call-btn:active { transform: scale(0.94); }
-.call-btn.call-btn-muted { background: rgba(255, 255, 255, 0.32); }
-.call-btn-end { background: rgba(229, 72, 77, 0.85); border-color: transparent; }
-.call-btn-end:hover { filter: brightness(1.1); background: rgba(229, 72, 77, 0.95); }
+.call-btn:hover { background: rgba(255, 255, 255, 0.22); }
+.call-btn:active { transform: scale(0.95); }
+.call-btn.call-btn-muted { background: rgba(255, 255, 255, 0.34); }
+.call-btn-end { background: rgba(229, 72, 77, 0.88); border-color: transparent; }
+.call-btn-end:hover { background: rgba(229, 72, 77, 1); }
 
 /* ── Buttons ───────────────────────────────────────────────────────────── */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 10px 18px;
-  border-radius: 12px;
+  gap: 7px;
+  padding: 9px 16px;
+  border-radius: 9px;
   font-family: var(--font);
-  font-size: 14px;
-  font-weight: 620;
-  border: none;
+  font-size: 13.5px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  text-decoration: none;
   cursor: pointer;
-  transition: all 0.2s;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s, filter 0.15s;
 }
-.btn:active { transform: scale(0.96); }
+.btn:active { transform: scale(0.97); }
 .btn-primary {
   background: linear-gradient(135deg, var(--accent2), var(--accent));
   color: #04121f;
-  box-shadow: 0 4px 16px var(--accent-glow);
+  font-weight: 650;
 }
-.btn-primary:hover {
-  box-shadow: 0 6px 22px var(--accent-glow);
-  filter: brightness(1.07);
-}
+.btn-primary:hover { filter: brightness(1.07); }
 .btn-secondary {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text1);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-inset);
+  border-color: var(--glass-border);
 }
 .btn-secondary:hover {
   border-color: var(--glass-border-hover);
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.09);
 }
 .btn-danger {
   background: var(--danger-soft);
   color: var(--danger);
-  border: 1px solid rgba(255, 93, 125, 0.28);
+  border-color: rgba(255, 100, 130, 0.3);
 }
-.btn-danger:hover {
-  background: rgba(255, 93, 125, 0.2);
-  box-shadow: 0 4px 14px rgba(255, 93, 125, 0.2);
-}
-.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 9px; line-height: 1.25; min-height: 32px; }
+.btn-danger:hover { background: rgba(255, 100, 130, 0.2); }
+.btn-sm { padding: 6px 11px; font-size: 12.5px; border-radius: 8px; line-height: 1.25; min-height: 32px; }
 
 /* ── Inputs ────────────────────────────────────────────────────────────── */
 .field {
   width: 100%;
-  background: rgba(0, 0, 0, 0.26);
+  background: rgba(4, 7, 14, 0.45);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
-  padding: 12px 16px;
+  border-radius: 9px;
+  padding: 10px 13px;
   color: var(--text1);
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 13.5px;
   outline: none;
-  transition: all 0.2s;
+  transition: border-color 0.15s, background 0.15s;
 }
 .field:focus {
   border-color: var(--accent);
-  background: rgba(0, 0, 0, 0.42);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  background: rgba(4, 7, 14, 0.68);
 }
 .field::placeholder { color: var(--text3); }
 
-/* ── Toasts ────────────────────────────────────────────────────────────── */
+/* ── Toasts (all-around subtle border, no thick left bar) ──────────────── */
 #toasts {
   position: fixed;
-  top: 20px;
-  right: 20px;
+  top: 18px;
+  right: 18px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  z-index: 100;
-  max-width: 380px;
+  gap: 8px;
+  z-index: 120;
+  max-width: 360px;
   pointer-events: none;
 }
 .toast {
   pointer-events: auto;
-  padding: 14px 18px;
-  border-radius: 14px;
-  background: rgba(15, 21, 33, 0.94);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border: 1px solid var(--glass-border);
-  font-size: 13.5px;
-  animation: slideIn 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.2);
-  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.5), var(--glass-inset);
+  padding: 12px 15px;
+  border-radius: 10px;
+  background: rgba(13, 19, 32, 0.96);
+  border: 1px solid var(--glass-border-hover);
+  font-size: 13px;
+  animation: slideIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: var(--glass-shadow);
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
+  align-items: center;
+  gap: 10px;
 }
-.toast.info { border-left: 3px solid var(--accent); }
-.toast.success { border-left: 3px solid var(--ok); }
-.toast.error { border-left: 3px solid var(--danger); }
-.toast.warning { border-left: 3px solid var(--warn); }
-.toast-icon { flex-shrink: 0; font-size: 17px; margin-top: 1px; }
+.toast.info { border-color: rgba(63, 208, 245, 0.4); }
+.toast.success { border-color: rgba(54, 217, 148, 0.45); }
+.toast.error { border-color: rgba(255, 100, 130, 0.48); }
+.toast.warning { border-color: rgba(246, 196, 83, 0.48); }
+.toast-icon { flex-shrink: 0; display: inline-flex; }
+.toast.info .toast-icon { color: var(--accent); }
+.toast.success .toast-icon { color: var(--ok); }
+.toast.error .toast-icon { color: var(--danger); }
+.toast.warning .toast-icon { color: var(--warn); }
 @keyframes slideIn {
-  from { transform: translateX(120%); opacity: 0; }
+  from { transform: translateX(110%); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
 }
-@keyframes fadeOut {
-  from { opacity: 1; transform: scale(1); }
-  to { opacity: 0; transform: scale(0.9); }
-}
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── Empty states ──────────────────────────────────────────────────────── */
 .empty-state {
@@ -7216,18 +7446,21 @@ body {
   align-items: center;
   justify-content: center;
   flex: 1;
-  gap: 14px;
+  gap: 12px;
   color: var(--text3);
   text-align: center;
-  padding: 40px;
+  padding: 36px;
 }
 .empty-state .emo {
-  font-size: 52px;
-  margin-bottom: 6px;
-  filter: drop-shadow(0 10px 22px rgba(69, 216, 255, 0.22));
+  width: 52px; height: 52px;
+  border-radius: 13px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border);
+  color: var(--accent);
 }
-.empty-state h3 { font-size: 18px; color: var(--text1); font-weight: 650; }
-.empty-state p { font-size: 13.5px; max-width: 300px; line-height: 1.65; }
+.empty-state h3 { font-size: 17px; color: var(--text1); font-weight: 650; }
+.empty-state p { font-size: 13.5px; max-width: 320px; line-height: 1.6; color: var(--text2); }
 
 /* ── Drop overlay ──────────────────────────────────────────────────────── */
 .drop-overlay {
@@ -7235,9 +7468,7 @@ body {
   inset: 14px;
   border: 2px dashed var(--accent);
   border-radius: var(--rad-lg);
-  background: rgba(69, 216, 255, 0.06);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  background: rgba(63, 208, 245, 0.07);
   display: none;
   align-items: center;
   justify-content: center;
@@ -7248,131 +7479,83 @@ body {
   font-size: 15px;
   font-weight: 600;
   pointer-events: none;
-  box-shadow: inset 0 0 40px var(--accent-soft);
 }
-.drop-overlay.active { display: flex; animation: fadeIn 0.2s; }
+.drop-overlay.active { display: flex; animation: fadeIn 0.15s; }
 
 /* ── Header menu ───────────────────────────────────────────────────────── */
-.chat-header-actions { min-width: 0; flex-wrap: nowrap; flex-shrink: 0; }
 .header-menu { position: relative; display: inline-flex; align-items: center; }
 .header-menu > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
 .header-menu > summary::-webkit-details-marker { display: none; }
 .header-menu-items {
-  position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 200px; padding: 6px;
-  border: 1px solid var(--glass-border-hover); border-radius: 12px;
-  background: rgba(15, 21, 33, 0.97);
-  backdrop-filter: blur(20px) saturate(1.2);
-  -webkit-backdrop-filter: blur(20px) saturate(1.2);
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 204px; padding: 6px;
+  border: 1px solid var(--glass-border-hover); border-radius: 11px;
+  background: rgba(12, 18, 30, 0.98);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
 }
-.header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 7px; padding: 9px 10px; }
+.header-menu-items .btn { display: flex; width: 100%; justify-content: flex-start; border: 0; border-radius: 7px; padding: 8px 10px; }
 
 /* ── Scrollbars ────────────────────────────────────────────────────────── */
-::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: rgba(148, 178, 226, 0.14);
-  border-radius: 7px;
-  border: 1px solid transparent;
-}
-::-webkit-scrollbar-thumb:hover { background: rgba(148, 178, 226, 0.28); }
+::-webkit-scrollbar-thumb { background: rgba(148, 178, 226, 0.16); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(148, 178, 226, 0.3); }
 
 /* ── Misc ──────────────────────────────────────────────────────────────── */
 .muted { color: var(--text2); }
 .mono { font-family: var(--mono); }
 button, input, textarea, select, summary { font: inherit; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
 
 .mobile-back { display: none; }
 .mobile-info-btn { display: none; }
 .panel-overlay {
-  display: none;
-  position: fixed;
-  inset: 0;
-  background: rgba(2, 5, 10, 0.6);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  z-index: 140;
+  display: none; position: fixed; inset: 0; background: rgba(2, 5, 10, 0.65); z-index: 140;
 }
 .panel-overlay.open { display: block; }
 .panel-close-btn { display: none; }
-.connection-hint { display: none; }
 
-/* Flash highlight for jump-to-message */
-.msg-group.flash .msg-bubble {
-  animation: flashBg 1.6s ease-out;
-}
+.msg-group.flash .msg-bubble { animation: flashBg 1.6s ease-out; }
 @keyframes flashBg {
-  0% { box-shadow: 0 0 0 2px var(--accent), 0 0 24px var(--accent-glow); }
-  100% { box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38); }
+  0% { box-shadow: 0 0 0 2px var(--accent), 0 0 22px var(--accent-glow); }
+  100% { box-shadow: none; }
 }
 
-/* Scroll-to-bottom button, search scope & safety comparison */
-#main { position: relative; }
 .scroll-bottom-btn {
   position: fixed;
-  right: 326px;
-  bottom: 108px;
-  width: 38px;
-  height: 38px;
+  right: 322px;
+  bottom: 102px;
+  width: 36px; height: 36px;
   border-radius: 50%;
   border: 1px solid var(--glass-border-hover);
-  background: rgba(15, 21, 33, 0.92);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  background: rgba(13, 19, 32, 0.94);
   color: var(--accent);
-  font-size: 16px;
-  font-weight: 700;
   cursor: pointer;
   z-index: 20;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color 0.15s, background 0.15s;
 }
-.scroll-bottom-btn:hover {
-  border-color: var(--accent);
-  background: var(--s3);
-  transform: translateY(-2px);
-}
+.scroll-bottom-btn:hover { border-color: var(--accent); background: var(--s3); }
 .scroll-bottom-btn[hidden] { display: none; }
-@media (max-width: 1080px) {
-  .scroll-bottom-btn { right: 20px; }
-}
+@media (max-width: 1080px) { .scroll-bottom-btn { right: 18px; } }
+
 .search-scope-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  color: var(--text2);
-  margin-bottom: 10px;
-  cursor: pointer;
-  user-select: none;
+  display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text2);
+  margin-bottom: 10px; cursor: pointer; user-select: none;
 }
 .search-scope-row input { accent-color: var(--accent); cursor: pointer; }
+
 .safety-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .safety-box {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid var(--glass-border);
+  padding: 12px 14px; border-radius: 10px;
+  background: rgba(4, 7, 14, 0.4); border: 1px solid var(--glass-border);
 }
-.safety-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text3);
-  margin-bottom: 4px;
-}
+.safety-label { font-size: 11px; color: var(--text3); margin-bottom: 4px; }
 .safety-fp {
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--accent);
-  word-break: break-all;
-  line-height: 1.5;
+  font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: 12.5px; color: var(--accent); word-break: break-all; line-height: 1.5;
 }
 
 /* ── Responsive ────────────────────────────────────────────────────────── */
@@ -7382,27 +7565,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 @media (max-width: 1080px) {
   .mobile-info-btn { display: inline-flex !important; }
   #panel {
-    position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 320px;
-    max-width: 85vw;
-    z-index: 150;
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: 310px; max-width: 86vw; z-index: 150;
     transform: translateX(100%);
-    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     box-shadow: -14px 0 44px rgba(0, 0, 0, 0.55);
-    background: rgba(10, 15, 24, 0.97);
-    backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
-    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+    background: rgba(10, 15, 24, 0.98);
     overflow-y: auto;
     display: flex !important;
   }
   #panel.drawer-open { transform: translateX(0); }
-  .panel-close-btn { display: inline-flex !important; }
+  .panel-close-btn { display: block !important; }
 }
 @media (max-width: 768px) {
-  #sidebar { width: 300px; min-width: 300px; }
+  #sidebar { width: 290px; min-width: 290px; }
+  .welcome-specs { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
   body { overflow: hidden; }
@@ -7411,10 +7588,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   #main { display: none; width: 100%; min-width: 0; overflow: hidden; }
   #app.mobile-chat-open #sidebar { display: none; }
   #app.mobile-chat-open #main { display: flex; }
-  .sidebar-head { padding: 16px; }
-  .id-card { margin: 12px 16px; }
+  .sidebar-head { padding: 14px 16px; }
+  .id-card { margin: 10px 14px; }
   .list-section { padding-bottom: 24px; }
-  .friend-item { margin: 3px 8px; padding: 12px 12px; }
+  .friend-item { margin: 3px 8px; padding: 11px 12px; }
   .friend-avatar { margin: 0; }
   .friend-info { display: block; }
   .friend-name, .search-wrap { display: block; }
@@ -7422,23 +7599,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   .section-label { justify-content: space-between; padding-left: 16px; padding-right: 16px; }
   .mode-tabs { display: flex; }
   .unread-badge { display: flex; }
-  .chat-header { padding: 10px 10px; gap: 6px; min-height: 58px; max-width: 100%; }
+  .chat-header { padding: 10px 12px; gap: 8px; min-height: 58px; max-width: 100%; }
   .chat-header-avatar { width: 34px; height: 34px; font-size: 14px; }
-  .mobile-back { display: inline-flex; flex: 0 0 auto; padding: 4px 6px; }
-  .chat-header-actions { gap: 4px; flex-shrink: 0; }
-  .chat-header-actions > .btn, .chat-header-actions .header-menu > summary { padding: 5px 8px; font-size: 12px; min-height: 30px; }
+  .mobile-back { display: inline-flex; flex: 0 0 auto; width: 34px; height: 34px; }
+  .chat-header-actions { gap: 5px; flex-shrink: 0; }
+  .chat-header-actions > .btn, .chat-header-actions .header-menu > summary { padding: 6px 9px; font-size: 12px; min-height: 32px; }
   .chat-header-actions > .btn:not(.mobile-primary):not(.mobile-info-btn) { display: none; }
   .header-menu { display: inline-flex; }
   .chat-header-actions .header-menu > summary { display: inline-flex !important; }
   .chat-header-actions .header-menu-items .btn { display: flex; }
-  .messages-wrap { padding: 16px 12px; }
+  .messages-wrap { padding: 14px 12px; }
   .msg-bubble { max-width: 88%; }
   .composer { padding: 10px 12px 12px; }
   .composer-context { padding: 0 12px 6px; }
-  .composer-inner { padding: 8px 10px; }
+  .composer-inner { padding: 7px 9px; }
   #text { font-size: 16px; }
   .drop-overlay { border-radius: 12px; }
-  .scroll-bottom-btn { right: 14px; bottom: 98px; }
+  .scroll-bottom-btn { right: 14px; bottom: 96px; }
   #toasts { left: 12px; right: 12px; top: 12px; bottom: auto; max-width: none; }
 }
 @media (max-width: 640px) {
@@ -7463,7 +7640,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   <aside id="sidebar">
     <div class="sidebar-head">
       <div class="app-logo">
-        <span class="icon">⚛</span>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2.5 20.5 7.4v9.2L12 21.5 3.5 16.6V7.4L12 2.5z"/>
+            <path d="M12 7.2 16.2 9.6v4.8L12 16.8l-4.2-2.4V9.6L12 7.2z" opacity="0.7"/>
+            <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+          </svg>
+        </div>
         <div>
           <h1>Quantum Chat</h1>
           <div class="ver">v__VERSION__</div>
@@ -7479,38 +7662,47 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <div class="id-card" id="idCard" role="button" tabindex="0" aria-expanded="false" aria-controls="myKey"
       onclick="toggleId()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleId()}">
       <div class="id-card-head">
-        <div class="id-avatar">⚛</div>
-        <div>
-          <div class="id-name">Your Identity</div>
+        <div class="id-avatar" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="10" width="16" height="10" rx="2.5"/>
+            <path d="M8 10V7a4 4 0 0 1 8 0v3"/>
+            <circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none"/>
+          </svg>
+        </div>
+        <div class="id-meta">
+          <div class="id-name">Local Identity</div>
           <div class="id-fp mono" id="myFp">loading…</div>
         </div>
+        <svg class="svg-ico id-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
       </div>
       <div class="id-key" id="myKey" onclick="event.stopPropagation()">loading…</div>
       <div class="id-actions" id="idActions" style="display:none">
-        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();copyKey()">Copy key</button>
-        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();openBackupModal()">Backup / restore</button>
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="event.stopPropagation();copyKey()">Copy key</button>
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="event.stopPropagation();openBackupModal()">Backup / restore</button>
       </div>
     </div>
 
     <!-- Mode tabs -->
     <div class="mode-tabs">
-      <button class="mode-tab active" id="tabFriends" onclick="setMode('friends')">Friends</button>
-      <button class="mode-tab" id="tabGroups" onclick="setMode('groups')">Groups</button>
+      <button type="button" class="mode-tab active" id="tabFriends" onclick="setMode('friends')">Contacts</button>
+      <button type="button" class="mode-tab" id="tabGroups" onclick="setMode('groups')">Groups</button>
     </div>
 
     <!-- Search -->
     <div class="search-wrap">
-      <input class="search-input" id="sideSearch" placeholder="Search…" oninput="renderSidebar()">
+      <input class="search-input" id="sideSearch" placeholder="Filter conversations…" aria-label="Filter conversations" oninput="renderSidebar()">
     </div>
 
     <!-- Add Friend panel -->
     <div class="slide-panel" id="addPanel">
       <div class="slide-panel-inner">
-        <input class="field" id="friendKey" placeholder="Friend public key">
-        <input class="field" id="friendName" placeholder="Nickname (optional)">
+        <input class="field" id="friendKey" placeholder="Contact public key" aria-label="Contact public key">
+        <input class="field" id="friendName" placeholder="Nickname (optional)" aria-label="Nickname">
         <div style="display:flex;gap:8px">
-          <button class="btn btn-primary" style="flex:1" onclick="addFriend()">Add friend</button>
-          <button class="btn btn-secondary" onclick="toggleAdd()">Cancel</button>
+          <button type="button" class="btn btn-primary" style="flex:1" onclick="addFriend()">Add contact</button>
+          <button type="button" class="btn btn-secondary" onclick="toggleAdd()">Cancel</button>
         </div>
       </div>
     </div>
@@ -7518,9 +7710,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <!-- Add Group panel -->
     <div class="slide-panel" id="groupPanel">
       <div class="slide-panel-inner">
-        <input class="field" id="groupName" placeholder="Group name">
+        <input class="field" id="groupName" placeholder="Group name" aria-label="Group name">
         <div class="friend-picker" id="groupFriendPicker" hidden></div>
-        <input class="field" id="groupMembers" placeholder="Member keys, comma-separated (or select above)">
+        <input class="field" id="groupMembers" placeholder="Member keys, comma-separated (or select above)" aria-label="Member keys">
         <div style="display:flex;gap:8px">
           <button type="button" class="btn btn-primary" style="flex:1" onclick="createGroup()">Create</button>
           <button type="button" class="btn btn-secondary" onclick="toggleGroup()">Cancel</button>
@@ -7535,8 +7727,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   <main id="main">
     <!-- Chat header -->
     <div class="chat-header" id="chatHeader">
-      <div class="empty-state" style="flex-direction:row;padding:0;flex:1">
-        <span style="color:var(--text3);font-size:13px">← Select a friend or group to start chatting</span>
+      <div style="flex:1;display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <span style="color:var(--text3);font-size:13px">Select a contact or group to begin</span>
+        <div class="chat-header-actions">
+          <button type="button" class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search all conversations" aria-label="Search all conversations">Search</button>
+          <button type="button" class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Node inspector" aria-label="Toggle node inspector">Info</button>
+        </div>
       </div>
     </div>
 
@@ -7545,55 +7741,69 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
       <div class="slide-panel-inner" id="groupManageBody"></div>
     </div>
 
-    <!-- Messages -->
-    <div class="messages-wrap" id="messages">
-      <div class="empty-state">
-        <div class="emo">🔐</div>
-        <h3>Post-quantum encrypted</h3>
-        <p>All messages are encrypted with Kyber-512 + AES-256-GCM. Select a contact to start.</p>
-      </div>
-    </div>
+    <!-- Messages / Welcome Hero -->
+    <div class="messages-wrap" id="messages"></div>
 
-    <!-- Typing indicator -->
+    <!-- Typing & Recording indicator -->
     <div id="typing-indicator"></div>
     <div id="recIndicator"></div>
 
     <button type="button" class="scroll-bottom-btn" id="scrollBottomBtn" hidden
       title="Scroll to latest messages" aria-label="Scroll to latest messages"
-      onclick="scrollBottom(true)">↓</button>
+      onclick="scrollBottom(true)">
+      <svg class="svg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>
+      </svg>
+    </button>
 
     <!-- Drop overlay -->
     <div class="drop-overlay" id="dropOverlay">
-      <div style="font-size:36px">📎</div>
+      <svg style="width:36px;height:36px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
       <div>Drop file to send encrypted</div>
     </div>
 
     <!-- Reply / edit context bar -->
     <div class="composer-context" id="composerContext" hidden>
       <div class="ctx-bar" id="ctxBar">
-        <span class="ctx-icon" id="ctxIcon">↩</span>
+        <span class="ctx-icon" id="ctxIcon" aria-hidden="true"></span>
         <div class="ctx-body">
           <div class="ctx-title" id="ctxTitle">Replying</div>
           <div class="ctx-snippet" id="ctxSnippet"></div>
         </div>
-        <button class="ctx-cancel" id="ctxCancel" title="Cancel (Esc)" aria-label="Cancel reply or edit"
-          onclick="cancelComposerContext()">✕</button>
+        <button type="button" class="ctx-cancel" id="ctxCancel" title="Cancel (Esc)" aria-label="Cancel reply or edit"
+          onclick="cancelComposerContext()">
+          <svg class="svg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
       </div>
     </div>
 
     <!-- Composer -->
     <div class="composer">
       <div class="composer-inner">
-        <textarea id="text" rows="1" placeholder="Type an encrypted message…"
+        <textarea id="text" rows="1" placeholder="Encrypted message…"
           aria-label="Message text" oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
         <div class="composer-actions">
           <label class="icon-btn" id="attachBtn" title="Attach file" aria-label="Attach file" role="button" tabindex="0"
             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();$('fileInput').click()}">
-            📎
+            <svg class="svg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
             <input id="fileInput" type="file" hidden onchange="sendFile()" aria-label="Choose a file to send">
           </label>
-          <button class="icon-btn" id="micBtn" title="Record voice message" aria-label="Record voice message" onclick="toggleVoiceRecording()">🎙️</button>
-          <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send" aria-label="Send message">➤</button>
+          <button type="button" class="icon-btn" id="micBtn" title="Record voice message" aria-label="Record voice message" onclick="toggleVoiceRecording()">
+            <svg class="svg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+          <button type="button" class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send" aria-label="Send message">
+            <svg class="svg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
         </div>
       </div>
       <div class="transfer-status" id="transferStatus"></div>
@@ -7603,67 +7813,87 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 
   <div class="panel-overlay" id="panelOverlay" onclick="toggleInfoPanel(false)"></div>
 
-  <!-- ── Right panel ─────────────────────── -->
+  <!-- ── Right inspector panel ───────────── -->
   <aside id="panel">
-    <div style="padding:14px 20px 0;display:none" class="panel-close-btn">
-      <button class="btn btn-secondary btn-sm" style="width:100%" onclick="toggleInfoPanel(false)">✕ Close Info Panel</button>
+    <div style="padding:12px 16px 0;display:none" class="panel-close-btn">
+      <button type="button" class="btn btn-secondary btn-sm" style="width:100%" onclick="toggleInfoPanel(false)">Close Inspector</button>
+    </div>
+    <div class="panel-section" id="activeInspector" hidden>
+      <div class="panel-title">Active Conversation</div>
+      <div id="activeInspectorBody"></div>
     </div>
     <div class="panel-section">
-      <div class="panel-title">Overview</div>
+      <div class="panel-title">Node Overview</div>
       <div class="stat-row">
-        <div class="stat-box"><b id="statFriends">0</b><span>friends</span></div>
-        <div class="stat-box"><b id="statOnline">0</b><span>online</span></div>
-        <div class="stat-box"><b id="statSessions">0</b><span>sessions</span></div>
-        <div class="stat-box"><b id="statFiles">0</b><span>files</span></div>
+        <div class="stat-box"><b id="statFriends">0</b><span>Contacts</span></div>
+        <div class="stat-box"><b id="statOnline">0</b><span>Online</span></div>
+        <div class="stat-box"><b id="statSessions">0</b><span>Sessions</span></div>
+        <div class="stat-box"><b id="statFiles">0</b><span>Files</span></div>
       </div>
     </div>
     <div class="panel-section" id="panelSessions">
-      <div class="panel-title">Secure sessions</div>
-      <div id="sessionList"><span class="muted" style="font-size:12px">No sessions yet</span></div>
+      <div class="panel-title">Secure Sessions</div>
+      <div id="sessionList"><span class="muted" style="font-size:12px">No active sessions</span></div>
     </div>
     <div class="panel-section" id="panelFiles">
-      <div class="panel-title">Recent files</div>
+      <div class="panel-title">Recent Files</div>
       <div id="fileList"><span class="muted" style="font-size:12px">No files yet</span></div>
     </div>
     <div class="panel-section" id="panelStorage">
-      <div class="panel-title">Storage</div>
+      <div class="panel-title">Local Storage</div>
       <div id="storageQuota"></div>
     </div>
   </aside>
 </div>
 
+<!-- Image attachment lightbox modal -->
+<div class="modal-overlay" id="lightboxModal" role="dialog" aria-modal="true" aria-labelledby="lightboxTitle" onclick="if(event.target===this)closeLightbox()">
+  <div class="modal lightbox-modal">
+    <div class="lightbox-head">
+      <div class="lightbox-title" id="lightboxTitle">Attachment preview</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <a class="btn btn-secondary btn-sm" id="lightboxDownload" href="#" download>Download</a>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeLightbox()" aria-label="Close preview">Close</button>
+      </div>
+    </div>
+    <div class="lightbox-stage">
+      <img id="lightboxImg" src="" alt="Preview">
+    </div>
+  </div>
+</div>
+
 <!-- Backup / restore identity modal -->
-<div class="modal-overlay" id="backupModal" role="dialog" aria-modal="true" aria-labelledby="backupModalTitle">
+<div class="modal-overlay" id="backupModal" role="dialog" aria-modal="true" aria-labelledby="backupModalTitle" onclick="if(event.target===this)closeBackupModal()">
   <div class="modal">
     <h2 id="backupModalTitle">Identity backup &amp; restore</h2>
     <p class="hint">
       Carry your identity (public key / fingerprint) to a second device. This does
-      <b>not</b> copy friends, sessions, or message history — only your signing keypair,
+      <b>not</b> copy contacts, sessions, or message history — only your signing keypair,
       protected by the passphrase you choose. Import only into a brand-new install.
     </p>
     <div class="modal-tabs">
-      <button id="backupTabExport" class="active" onclick="setBackupTab('export')">Export</button>
-      <button id="backupTabImport" onclick="setBackupTab('import')">Import</button>
+      <button type="button" id="backupTabExport" class="active" onclick="setBackupTab('export')">Export</button>
+      <button type="button" id="backupTabImport" onclick="setBackupTab('import')">Import</button>
     </div>
     <div id="backupExportPane">
-      <input class="field" id="backupExportPass" type="password" placeholder="Choose a backup passphrase (min 8 chars)">
-      <button class="btn btn-primary" style="width:100%" onclick="exportBackup()">Generate backup</button>
-      <textarea class="field" id="backupExportResult" readonly placeholder="Your encrypted backup will appear here…"></textarea>
-      <button class="btn btn-secondary btn-sm" onclick="copyBackupResult()">Copy to clipboard</button>
+      <input class="field" id="backupExportPass" type="password" placeholder="Choose a backup passphrase (min 8 chars)" aria-label="Export passphrase">
+      <button type="button" class="btn btn-primary" style="width:100%" onclick="exportBackup()">Generate backup</button>
+      <textarea class="field" id="backupExportResult" readonly placeholder="Your encrypted backup will appear here…" aria-label="Encrypted backup output" style="margin-top:10px"></textarea>
+      <button type="button" class="btn btn-secondary btn-sm" onclick="copyBackupResult()">Copy to clipboard</button>
     </div>
     <div id="backupImportPane" style="display:none">
-      <textarea class="field" id="backupImportBlob" placeholder="Paste an identity backup string (starts with QCID1:)"></textarea>
-      <input class="field" id="backupImportPass" type="password" placeholder="Backup passphrase">
-      <button class="btn btn-primary" style="width:100%" onclick="importBackup()">Import identity</button>
+      <textarea class="field" id="backupImportBlob" placeholder="Paste an identity backup string (starts with QCID1:)" aria-label="Identity backup string"></textarea>
+      <input class="field" id="backupImportPass" type="password" placeholder="Backup passphrase" aria-label="Backup passphrase">
+      <button type="button" class="btn btn-primary" style="width:100%" onclick="importBackup()">Import identity</button>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" style="flex:1" onclick="closeBackupModal()">Close</button>
+      <button type="button" class="btn btn-secondary" style="flex:1" onclick="closeBackupModal()">Close</button>
     </div>
   </div>
 </div>
 
 <!-- Message search -->
-<div class="modal-overlay" id="searchModal" role="dialog" aria-modal="true" aria-labelledby="searchModalTitle">
+<div class="modal-overlay" id="searchModal" role="dialog" aria-modal="true" aria-labelledby="searchModalTitle" onclick="if(event.target===this)closeSearchModal()">
   <div class="modal">
     <h2 id="searchModalTitle">Search messages</h2>
     <p class="hint" id="searchScopeHint">Searching this conversation.</p>
@@ -7676,13 +7906,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
            onkeydown="if(event.key==='Enter') runSearch()">
     <div id="searchResults" class="search-results" aria-live="polite"></div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" style="flex:1" onclick="closeSearchModal()">Close</button>
+      <button type="button" class="btn btn-secondary" style="flex:1" onclick="closeSearchModal()">Close</button>
     </div>
   </div>
 </div>
 
 <!-- Safety fingerprint comparison modal -->
-<div class="modal-overlay" id="safetyModal" role="dialog" aria-modal="true" aria-labelledby="safetyModalTitle">
+<div class="modal-overlay" id="safetyModal" role="dialog" aria-modal="true" aria-labelledby="safetyModalTitle" onclick="if(event.target===this)closeSafetyModal()">
   <div class="modal">
     <h2 id="safetyModalTitle">Safety number verification</h2>
     <p class="hint">
@@ -7694,13 +7924,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
         <div class="safety-fp" id="safetyMyFp">—</div>
       </div>
       <div class="safety-box">
-        <div class="safety-label" id="safetyPeerLabel">Friend fingerprint</div>
+        <div class="safety-label" id="safetyPeerLabel">Contact fingerprint</div>
         <div class="safety-fp" id="safetyPeerFp">—</div>
       </div>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" style="flex:1" onclick="closeSafetyModal()">Cancel</button>
-      <button class="btn btn-primary" style="flex:1" id="safetyVerifyBtn" onclick="confirmSafetyVerify()">Mark Verified</button>
+      <button type="button" class="btn btn-secondary" style="flex:1" onclick="closeSafetyModal()">Cancel</button>
+      <button type="button" class="btn btn-primary" style="flex:1" id="safetyVerifyBtn" onclick="confirmSafetyVerify()">Mark Verified</button>
     </div>
   </div>
 </div>
@@ -7711,8 +7941,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <h2 id="confirmModalTitle">Confirm</h2>
     <p class="hint" id="confirmModalText"></p>
     <div class="modal-actions">
-      <button class="btn btn-secondary" style="flex:1" id="confirmModalCancel" onclick="resolveConfirmModal(false)">Cancel</button>
-      <button class="btn btn-primary" style="flex:1" id="confirmModalOk" onclick="resolveConfirmModal(true)">Confirm</button>
+      <button type="button" class="btn btn-secondary" style="flex:1" id="confirmModalCancel" onclick="resolveConfirmModal(false)">Cancel</button>
+      <button type="button" class="btn btn-primary" style="flex:1" id="confirmModalOk" onclick="resolveConfirmModal(true)">Confirm</button>
     </div>
   </div>
 </div>
@@ -7725,8 +7955,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <input class="field" id="promptModalInput" type="text"
       onkeydown="if(event.key==='Enter'){event.preventDefault();resolvePromptModal(true);}">
     <div class="modal-actions">
-      <button class="btn btn-secondary" style="flex:1" onclick="resolvePromptModal(false)">Cancel</button>
-      <button class="btn btn-primary" style="flex:1" id="promptModalOk" onclick="resolvePromptModal(true)">Save</button>
+      <button type="button" class="btn btn-secondary" style="flex:1" onclick="resolvePromptModal(false)">Cancel</button>
+      <button type="button" class="btn btn-primary" style="flex:1" id="promptModalOk" onclick="resolvePromptModal(true)">Save</button>
     </div>
   </div>
 </div>
@@ -7734,12 +7964,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 <!-- Incoming call -->
 <div class="modal-overlay" id="incomingCallModal" role="dialog" aria-modal="true" aria-labelledby="incomingCallTitle">
   <div class="modal call-modal">
-    <div class="call-modal-avatar" id="incomingCallAvatar">📞</div>
+    <div class="call-modal-avatar" id="incomingCallAvatar" aria-hidden="true"></div>
     <h2 id="incomingCallTitle">Incoming call</h2>
     <p class="hint" id="incomingCallSub">someone is calling…</p>
     <div class="modal-actions">
-      <button class="btn btn-danger" style="flex:1" onclick="declineCall()" aria-label="Decline call">Decline</button>
-      <button class="btn btn-primary" style="flex:1" onclick="acceptCall()" aria-label="Accept call">Accept</button>
+      <button type="button" class="btn btn-danger" style="flex:1" onclick="declineCall()" aria-label="Decline call">Decline</button>
+      <button type="button" class="btn btn-primary" style="flex:1" onclick="acceptCall()" aria-label="Accept call">Accept</button>
     </div>
   </div>
 </div>
@@ -7750,14 +7980,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <video id="remoteVideo" autoplay playsinline></video>
     <video id="localVideo" autoplay playsinline muted></video>
     <div class="call-overlay-info">
-      <div class="call-overlay-avatar" id="callOverlayAvatar">📞</div>
+      <div class="call-overlay-avatar" id="callOverlayAvatar" aria-hidden="true"></div>
       <div class="call-overlay-name" id="callOverlayName">—</div>
       <div class="call-overlay-status" id="callOverlayStatus" aria-live="polite">Calling…</div>
     </div>
     <div class="call-overlay-controls">
-      <button class="call-btn" id="callMuteBtn" onclick="toggleCallMute()" aria-label="Mute microphone" title="Mute microphone">🎙️</button>
-      <button class="call-btn" id="callCameraBtn" onclick="toggleCallCamera()" aria-label="Turn camera off" title="Turn camera off">🎥</button>
-      <button class="call-btn call-btn-end" onclick="hangupCall()" aria-label="End call" title="End call">📵</button>
+      <button type="button" class="call-btn" id="callMuteBtn" onclick="toggleCallMute()" aria-label="Mute microphone" title="Mute microphone"></button>
+      <button type="button" class="call-btn" id="callCameraBtn" onclick="toggleCallCamera()" aria-label="Turn camera off" title="Turn camera off"></button>
+      <button type="button" class="call-btn call-btn-end" onclick="hangupCall()" aria-label="End call" title="End call"></button>
     </div>
   </div>
 </div>
@@ -7774,6 +8004,7 @@ const MAX_TEXT_BYTES_UI = 64*1024;
 
 let state = {
   public_key: '', fingerprint: '', signaling_url: '', signaling_connected: false,
+  crypto_suite: '',
   online: [], friends: [], groups: [], messages: [],
   files: [], sessions: {}, has_more_messages: false,
   storage_bytes: 0, max_storage_bytes: 0,
@@ -7786,8 +8017,6 @@ let selectedTarget = null;     // {type:'friend'|'group', id:string}
 let typing = {};               // peer_pubkey -> timestamp
 let typingClearTimers = {};    // peer_pubkey -> timeout id for the clear timer
 // Per-group unread counts, persisted locally so badges survive a reload.
-// Group traffic never touches the server-side per-friend unread counter —
-// that badge belongs to the 1:1 conversation.
 let groupUnread = (() => { try { return JSON.parse(localStorage.getItem('qc_group_unread')||'{}') || {}; } catch(_) { return {}; } })();
 function saveGroupUnread() { try { localStorage.setItem('qc_group_unread', JSON.stringify(groupUnread)); } catch(_){} }
 function bumpGroupUnread(group_id) {
@@ -7812,7 +8041,6 @@ let uploadWatchdog = null;
 let loadingMore = false;
 let searchDebounceTimer = null;
 // Composer context: null, or {mode:'reply', msgId, peer} / {mode:'edit', msgId, peer, draftBeforeEdit}
-// for the bar shown above the composer while composing a reply or an edit.
 let composerCtx = null;
 // Call state: at most one call in flight at a time in this UI.
 let pc = null;                 // RTCPeerConnection
@@ -7820,13 +8048,52 @@ let localStream = null;
 let currentCall = null;        // {peer, call_id, role, media, state}
 let pendingIceQueue = [];      // candidates that arrived before setRemoteDescription
 
+// ─── Unified SVG Iconography ────────────────────────────────────────────────
+const ICONS = {
+  brand: '<path d="M12 2.5 20.5 7.4v9.2L12 21.5 3.5 16.6V7.4L12 2.5z"/><path d="M12 7.2 16.2 9.6v4.8L12 16.8l-4.2-2.4V9.6L12 7.2z" opacity="0.7"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  lockOpen: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.4-2"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  checkDouble: '<polyline points="17 6 7 16 2 11"/><polyline points="22 6 12 16 9.5 13.5"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>',
+  warn: '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+  info: '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+  globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+  reply: '<polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>',
+  trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  ban: '<circle cx="12" cy="12" r="9"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+  video: '<polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  audio: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  code: '<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>',
+  archive: '<path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><line x1="10" y1="12" x2="14" y2="12"/>',
+  clip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+  send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+  phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.37 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.33 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
+  phoneOff: '<path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91"/><line x1="23" y1="1" x2="1" y2="23"/>',
+  mic: '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>',
+  micOff: '<line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.12 1.5-.34 2.18"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>',
+  cam: '<polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  camOff: '<path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><line x1="1" y1="1" x2="23" y2="23"/>',
+  search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  dots: '<circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none"/>',
+  back: '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
+};
+const icon = (name, cls='') =>
+  `<svg class="svg-ico ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]||ICONS.info}</svg>`;
+
 // ─── Utils ──────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 const esc = s => String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const short = k => k ? k.slice(0,10)+'…'+k.slice(-6) : '';
-// Auto-link bare URLs in already-escaped text. Returns HTML. We deliberately
-// only match http(s):// to avoid mangling code samples or local paths, and we
-// add target=_blank + rel="noopener" so the new tab can't reach back into the app.
 const linkify = escapedHtml => {
   return escapedHtml.replace(/(https?:\/\/[^\s<]+)/g, url => {
     const safe = url.replace(/"/g,'&quot;');
@@ -7849,8 +8116,6 @@ const relTime = ts => {
   return new Date(ts*1000).toLocaleDateString();
 };
 const fullTime = ts => ts ? new Date(ts*1000).toLocaleString() : '';
-// edited_at/deleted_at use millisecond resolution server-side (they are
-// ordering guards, not display timestamps); convert for rendering.
 const tsToSec = ts => ts > 1e12 ? Math.round(ts/1000) : ts;
 const dateLabel = ts => {
   if(!ts) return '';
@@ -7862,14 +8127,14 @@ const dateLabel = ts => {
 };
 const fileIcon = name => {
   const ext = (name||'').split('.').pop().toLowerCase();
-  const map = {png:'🖼️',jpg:'🖼️',jpeg:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',
-               mp4:'🎬',mov:'🎬',avi:'🎬',webm:'🎬',mkv:'🎬',
-               mp3:'🎵',wav:'🎵',ogg:'🎵',flac:'🎵',aac:'🎵',
-               pdf:'📄',doc:'📄',docx:'📄',txt:'📄',md:'📄',
-               zip:'📦',tar:'📦',gz:'📦',rar:'📦',
-               py:'💻',js:'💻',ts:'💻',html:'💻',css:'💻',sh:'💻',
+  const map = {png:'image',jpg:'image',jpeg:'image',gif:'image',webp:'image',svg:'image',
+               mp4:'video',mov:'video',avi:'video',webm:'video',mkv:'video',
+               mp3:'audio',wav:'audio',ogg:'audio',flac:'audio',aac:'audio',m4a:'audio',opus:'audio',
+               pdf:'file',doc:'file',docx:'file',txt:'file',md:'file',
+               zip:'archive',tar:'archive',gz:'archive',rar:'archive',
+               py:'code',js:'code',ts:'code',html:'code',css:'code',sh:'code',json:'code',
   };
-  return map[ext] || '📎';
+  return icon(map[ext] || 'file');
 };
 const isImage = name => /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(name||'');
 const isAudio = (name, type='') => String(type).startsWith('audio/') ||
@@ -7904,23 +8169,35 @@ const fileMessage = raw => {
     _isFile: true, _file: f,
   };
 };
-// A whitespace-only nickname trims to '' and [0] is undefined — guard the
-// toUpperCase so one bad row can't throw inside renderSidebar.
 const avatarLetter = name => (((name||'?').trim()[0]) || '?').toUpperCase();
 const avatarColor = key => {
   let h = 0;
   for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
-  const colors = ['#1a3a8f','#2a1a8f','#1a6a5f','#5a1a6f','#8f3a1a','#1a5a8f'];
+  const colors = ['#1b4299','#2c2294','#16655c','#582270','#8a3d1e','#1b5e8f'];
   return colors[Math.abs(h) % colors.length];
 };
-// Brighter variant for group sender labels, so different members read apart
-// at a glance without introducing a second visual system.
 const senderColor = key => {
   let h = 0;
   for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
-  const colors = ['#45d8ff','#4f7cff','#7ee0a3','#ffb86c','#ff8ba0','#c792ea','#89e6d8','#f5d76e'];
+  const colors = ['#3fd0f5','#78a6ff','#5ae0a8','#f6c453','#ff8ba0','#c792ea','#89e6d8','#f5d76e'];
   return colors[Math.abs(h) % colors.length];
 };
+function hasActiveMediaPlayback() {
+  const nodes = document.querySelectorAll('#messages audio, #messages video');
+  for(const m of nodes) {
+    if(!m.paused && !m.ended) return true;
+  }
+  return false;
+}
+
+// Initialize static overlay SVG controls on startup
+(() => {
+  if($('callMuteBtn')) $('callMuteBtn').innerHTML = icon('mic');
+  if($('callCameraBtn')) $('callCameraBtn').innerHTML = icon('cam');
+  const endBtn = document.querySelector('.call-btn-end');
+  if(endBtn) endBtn.innerHTML = icon('phoneOff');
+  if($('ctxIcon')) $('ctxIcon').innerHTML = icon('reply');
+})();
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 let wsUseBridgedPort = false;
@@ -7932,15 +8209,12 @@ function wsConnect() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const pagePort = location.port || (location.protocol === 'https:' ? '443' : '80');
   const useBridge = wsUseBridgedPort || (pagePort !== String(UI_WS_PORT));
-  // location.hostname strips the brackets an IPv6 literal needs in a URL.
   const host = location.hostname.includes(':') ? `[${location.hostname}]` : location.hostname;
   const portStr = useBridge ? (location.port ? `:${location.port}` : '') : `:${UI_WS_PORT}`;
   const token = encodeURIComponent(UI_TOKEN);
   try {
     ws = new WebSocket(`${scheme}://${host}${portStr}/?token=${token}`);
   } catch(err) {
-    // Invalid/constructor failure never fires onclose, so schedule the
-    // bridged-port retry explicitly instead of silently going dead.
     console.warn('Direct UI socket failed, retrying through the HTTP bridge', err);
     wsUseBridgedPort = true;
     try {
@@ -7969,8 +8243,6 @@ function wsConnect() {
     wsRetryTimer = setTimeout(wsConnect, wsRetryDelay);
     wsRetryDelay = Math.min(30000, Math.round(wsRetryDelay * 1.8));
   };
-  // onclose always follows onerror and owns the reconnect/UI state, so this
-  // handler only exists to keep the failure visible in the console.
   ws.onerror = ev => console.warn('UI socket error', ev);
   ws.onmessage = e => {
     try { handle(JSON.parse(e.data)); }
@@ -7990,11 +8262,11 @@ function toggleInfoPanel(force) {
 function setConn(connected, retrySeconds=0) {
   const b = $('connBadge'), t = $('connText');
   const relayUp = state.signaling_connected !== false;
-  b.className = 'conn-badge' + (connected ? ' connected' : '');
+  b.className = 'conn-badge' + (connected ? (relayUp ? ' connected' : ' reconnecting') : '');
   if(!connected) {
-    t.textContent = retrySeconds ? `retrying in ${retrySeconds}s` : 'disconnected';
+    t.textContent = retrySeconds ? `Retrying ${retrySeconds}s` : 'Disconnected';
   } else {
-    t.textContent = relayUp ? 'connected' : 'relay reconnecting…';
+    t.textContent = relayUp ? 'Connected' : 'Relay reconnecting';
   }
   updateSendBtn();
 }
@@ -8014,56 +8286,52 @@ function handle(d) {
   if(d.type === 'state') {
     const prior = state;
     const priorMessages = (prior && prior.messages) || [];
-    // A state push only carries the server's recent window. Merge it with
-    // anything already paged in locally instead of discarding older history
-    // (and losing the user's scroll position) on every group/state update.
     const mergedMessages = dedupeMessages([...((d.messages)||[]), ...priorMessages]);
     state = d;
     state.friends = state.friends || [];
     state.groups = state.groups || [];
     state.messages = mergedMessages;
     state.files = (state.files||[]).map(normalizeFile);
-    // The server's has_more flag describes its recent window; if we already
-    // paged past that window, keep our own boundary.
     const incomingOldest = (d.messages||[])[0];
     const priorOldest = priorMessages[0];
     if (priorOldest && incomingOldest && priorOldest.id < incomingOldest.id) {
       state.has_more_messages = !!(prior && prior.has_more_messages);
     }
     loadingMore = false;
-    // Drop unread badges for groups that no longer exist so the
-    // localStorage blob can't grow without bound across deletions.
     const liveGroups = new Set(state.groups.map(g => g.group_id));
     Object.keys(groupUnread).forEach(gid => {
       if(!liveGroups.has(gid)) { delete groupUnread[gid]; }
     });
     saveGroupUnread();
+    const prevTargetId = selectedTarget?.id;
     reconcileSelection();
-    render();
+    render(prevTargetId !== selectedTarget?.id);
     setConn(ws?.readyState === WebSocket.OPEN);
   } else if(d.type === 'signaling_status') {
     state.signaling_connected = !!d.connected;
     setConn(ws?.readyState === WebSocket.OPEN);
+    if(!selectedTarget) renderMessages();
   } else if(d.type === 'friends') {
     state.friends = d.friends || [];
-    // A removed/blocked friend must not stay selected in a now-orphaned chat.
+    const prevTargetId = selectedTarget?.id;
     reconcileSelection();
     renderSidebar();
     renderChatHeader();
-    renderMessages();
+    renderActiveInspector();
+    if(prevTargetId !== selectedTarget?.id || !hasActiveMediaPlayback()) renderMessages();
   } else if(d.type === 'history') {
     const el = $('messages');
     const prevHeight = el.scrollHeight, prevTop = el.scrollTop;
     state.messages = dedupeMessages([...(d.messages||[]), ...state.messages]);
     state.has_more_messages = d.has_more_messages;
     loadingMore = false;
-    renderMessages();
+    renderMessages(true);
     el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
   } else if(d.type === 'identity_backup') {
     $('backupExportResult').value = d.backup;
-    toast('Backup generated — copy it somewhere safe', 'success');
+    toast('Backup generated — store it securely', 'success');
   } else if(d.type === 'notice') {
-    if(d.level === 'error' && loadingMore) { loadingMore = false; renderMessages(); }
+    if(d.level === 'error' && loadingMore) { loadingMore = false; renderMessages(true); }
     if(d.level === 'error' && uploadInProgress) finishUpload();
     if(d.level === 'error' && pendingFailedDraft && (Date.now() - pendingFailedDraft.ts) < 3500 && !$('text').value.trim()) {
       $('text').value = pendingFailedDraft.text;
@@ -8093,17 +8361,12 @@ function handle(d) {
         if(friend) friend.unread = (friend.unread||0) + 1;
       }
     }
-    // Fast path: a live message for the open conversation appends one row to
-    // the DOM instead of re-rendering the whole timeline; anything out of
-    // order (device-sync replays, clock skew) falls back to the full render.
     const appended = (isSelected && (keepAtBottom || d.message.direction === 'out'))
       ? appendMessageLive(d.message)
       : false;
     if(!appended && isSelected) renderMessages();
     renderSidebar();
     if(isSelected && keepAtBottom) scrollBottom(false);
-    // Reading a group conversation must not clear the sender's 1:1 badge —
-    // group unread is tracked per group instead.
     if(isSelected && d.message.direction === 'in' && !d.message.group_id) {
       send({type:'clear_unread', pubkey: d.message.sender_pubkey});
     }
@@ -8114,15 +8377,9 @@ function handle(d) {
     $('statFiles').textContent = state.files.length;
     renderFiles();
     renderStorageQuota();
-    // Only clear the busy latch for an actual upload in flight: any outgoing
-    // file event (device-sync replays included) used to unlock the composer
-    // while the real upload was still running.
     if(uploadInProgress && file.direction === 'out' && (!pendingUploadName || pendingUploadName === file.filename)) finishUpload();
     renderMessages();
     const isSelected = selectedTarget && matchTarget(fileMessage(file));
-    // Scroll only when this file belongs to the open conversation AND the
-    // user is already reading near the bottom — a transfer in any other
-    // conversation used to yank the timeline down mid-read.
     if(isSelected && isNearBottom()) scrollBottom(false);
     if(isSelected && file.direction === 'in' && !file.group_id) {
       send({type:'clear_unread', pubkey:file.sender_pubkey});
@@ -8139,12 +8396,10 @@ function handle(d) {
       }
     }
     renderSidebar();
-    toast(`${file.direction === 'in' ? '📥 Received' : '📤 Sent'} ${file.filename}`, 'success');
+    toast(`${file.direction === 'in' ? 'Received' : 'Sent'} ${file.filename}`, 'success');
   } else if(d.type === 'typing') {
     if(d.active) {
       typing[d.peer] = Date.now();
-      // One clear timer per peer: overlapping timers meant a resumed typist's
-      // indicator was cleared early by the previous timer's expiry.
       clearTimeout(typingClearTimers[d.peer]);
       typingClearTimers[d.peer] = setTimeout(() => {
         delete typing[d.peer];
@@ -8213,7 +8468,7 @@ function handle(d) {
 }
 
 // ─── Render ──────────────────────────────────────────────────────────────────
-function render() {
+function render(forceMessages=false) {
   $('myKey').textContent = state.public_key || '';
   $('myFp').textContent = state.fingerprint || '';
   $('statFriends').textContent = state.friends.length;
@@ -8222,7 +8477,8 @@ function render() {
   $('statFiles').textContent = (state.files||[]).length;
   renderSidebar();
   renderChatHeader();
-  renderMessages();
+  renderActiveInspector();
+  renderMessages(forceMessages);
   renderTyping();
   renderSessions();
   renderFiles();
@@ -8259,13 +8515,13 @@ function renderSidebar() {
     const friends = state.friends.filter(f =>
       !q || (f.nickname||'').toLowerCase().includes(q) || f.pubkey.toLowerCase().includes(q)
     );
-    const addBtn = `<button onclick="toggleAdd()" title="Add friend" aria-label="Add friend">＋</button>`;
+    const addBtn = `<button type="button" onclick="toggleAdd()" title="Add contact" aria-label="Add contact">${icon('plus')}</button>`;
     const label = document.createElement('div');
     label.className = 'section-label';
-    label.innerHTML = `<span>Friends (${friends.length})</span>${addBtn}`;
+    label.innerHTML = `<span>Contacts (${friends.length})</span>${addBtn}`;
     el.appendChild(label);
     if(!friends.length) {
-      el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No friends yet — add one above</div>';
+      el.innerHTML += '<div style="padding:18px 14px;color:var(--text3);font-size:12px;text-align:center">No contacts yet — add one above</div>';
       return;
     }
     const allTimeline = [
@@ -8280,9 +8536,9 @@ function renderSidebar() {
         !m.group_id && (m.sender_pubkey === f.pubkey || m.recipient_pubkey === f.pubkey)
       );
       const lastPreview = lastMsg
-        ? (lastMsg.deleted_at ? '🚫 Message deleted'
-          : lastMsg._isFile ? `📎 ${lastMsg.body.slice(0,36)}`
-          : (lastMsg.edited_at && lastMsg.body ? lastMsg.body.slice(0,40) + ' ✎' : lastMsg.body.slice(0,40)))
+        ? (lastMsg.deleted_at ? 'Message deleted'
+          : lastMsg._isFile ? `File: ${lastMsg.body.slice(0,32)}`
+          : (lastMsg.edited_at && lastMsg.body ? lastMsg.body.slice(0,38) + ' (edited)' : lastMsg.body.slice(0,40)))
         : null;
       const unread = f.unread || 0;
       const btn = document.createElement('button');
@@ -8297,11 +8553,14 @@ function renderSidebar() {
         </div>
         <div class="friend-info">
           <div class="friend-name">${esc(f.nickname||short(f.pubkey))}</div>
-          <div class="friend-preview">${lastPreview ? esc(lastPreview) : secure?'🔒 secure session':(f.verified?'✅ verified':'⚠️ unverified')}</div>
+          <div class="friend-preview">${lastPreview ? esc(lastPreview) : (secure ? 'PQ session active' : (f.verified ? 'Verified contact' : 'Unverified contact'))}</div>
         </div>
         <div class="friend-meta">
           ${unread ? `<div class="unread-badge">${unread}</div>` : ''}
-          ${f.verified ? '<div class="secure-tag">✅</div>' : '<div class="secure-tag">⚠️</div>'} ${secure ? '<div class="secure-tag">🔒</div>' : ''}
+          <div class="meta-icons">
+            ${f.verified ? `<span class="ico-ok" title="Verified">${icon('check')}</span>` : `<span class="ico-warn" title="Unverified">${icon('warn')}</span>`}
+            ${secure ? `<span class="ico-lock" title="Active PQ session">${icon('lock')}</span>` : ''}
+          </div>
           ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
         </div>
       `;
@@ -8311,13 +8570,13 @@ function renderSidebar() {
     const groups = state.groups.filter(g =>
       !q || (g.name||'').toLowerCase().includes(q)
     );
-    const addBtn = `<button type="button" onclick="toggleGroup()" title="Create group" aria-label="Create group">＋</button>`;
+    const addBtn = `<button type="button" onclick="toggleGroup()" title="Create group" aria-label="Create group">${icon('plus')}</button>`;
     const label = document.createElement('div');
     label.className = 'section-label';
     label.innerHTML = `<span>Groups (${groups.length})</span>${addBtn}`;
     el.appendChild(label);
     if(!groups.length) {
-      el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No groups yet</div>';
+      el.innerHTML += '<div style="padding:18px 14px;color:var(--text3);font-size:12px;text-align:center">No groups yet</div>';
       return;
     }
     const allTimeline = [
@@ -8329,9 +8588,9 @@ function renderSidebar() {
       const unread = groupUnread[g.group_id] || 0;
       const lastMsg = [...allTimeline].reverse().find(m => m.group_id === g.group_id);
       const lastPreview = lastMsg
-        ? (lastMsg.deleted_at ? '🚫 Message deleted'
-          : lastMsg._isFile ? `${displayName(lastMsg.sender_pubkey)}: 📎 ${lastMsg.body.slice(0,28)}`
-          : `${displayName(lastMsg.sender_pubkey)}: ${lastMsg.body.slice(0,32)}${lastMsg.edited_at ? ' ✎' : ''}`)
+        ? (lastMsg.deleted_at ? 'Message deleted'
+          : lastMsg._isFile ? `${displayName(lastMsg.sender_pubkey)}: File ${lastMsg.body.slice(0,26)}`
+          : `${displayName(lastMsg.sender_pubkey)}: ${lastMsg.body.slice(0,32)}${lastMsg.edited_at ? ' (edited)' : ''}`)
         : `${(g.members||[]).length} members`;
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -8339,7 +8598,7 @@ function renderSidebar() {
       btn.onclick = () => selectGroup(g.group_id);
       btn.innerHTML = `
         <div class="friend-avatar">
-          <div class="avatar-circle" style="background:#1a3a8f">👥</div>
+          <div class="avatar-circle" style="background:#1b4299">${icon('users')}</div>
         </div>
         <div class="friend-info">
           <div class="friend-name">${esc(g.name)}</div>
@@ -8365,16 +8624,14 @@ function renderAttachment(m) {
       <span class="attachment-name" title="${esc(f.filename)}">${esc(f.filename)}</span>
       <span class="attachment-meta">${fmt(f.size)}</span>
     </span>
-    <a class="attachment-download" href="${downloadUrl}" download title="Download ${esc(f.filename)}" onclick="event.stopPropagation()">↓</a>
+    <a class="attachment-download" href="${downloadUrl}" download title="Download ${esc(f.filename)}" aria-label="Download ${esc(f.filename)}" onclick="event.stopPropagation()">${icon('download')}</a>
   </div>`;
-  // A zero-byte "image"/audio/video can't render (the browser shows a broken
-  // element); fall through to the plain download chip instead.
   const hasBytes = (Number(f.size) || 0) > 0;
   if(hasBytes && isImage(f.filename)) {
     return `<div class="attachment-card">
-      <a class="attachment-preview-link" href="${viewUrl}" target="_blank" rel="noopener noreferrer">
+      <button type="button" class="attachment-preview-btn" onclick="openLightbox('${esc(viewUrl)}','${esc(downloadUrl)}','${esc(f.filename)}')" aria-label="Preview ${esc(f.filename)}">
         <img class="msg-image" src="${viewUrl}" alt="${esc(f.filename)}" loading="lazy">
-      </a>${head}</div>`;
+      </button>${head}</div>`;
   }
   if(hasBytes && isAudio(f.filename, f.mime_type)) {
     return `<div class="attachment-card">${head}
@@ -8390,14 +8647,12 @@ function renderAttachment(m) {
     <span class="file-msg-icon">${fileIcon(f.filename)}</span>
     <span class="file-msg-text">
       <span class="file-msg-name">${esc(f.filename)}</span>
-      <span class="file-msg-size">${fmt(f.size)} · encrypted attachment</span>
+      <span class="file-msg-size">${fmt(f.size)} · encrypted file</span>
     </span>
-    <span class="file-msg-dl">↓</span>
+    <span class="file-msg-dl">${icon('download')}</span>
   </a>`;
 }
 
-// Find a loaded message by id across both real messages and synthesized
-// file-message rows (file transfers render as messages but live in files).
 function findMessageAny(id) {
   if(!id) return null;
   const m = state.messages.find(x => x.msg_id === id);
@@ -8406,7 +8661,6 @@ function findMessageAny(id) {
   return f ? fileMessage(f) : null;
 }
 
-// Quoted-preview block rendered inside a bubble for a reply.
 function replyQuoteHtml(m) {
   if(!m.reply_to) return '';
   const quoted = findMessageAny(m.reply_to);
@@ -8416,7 +8670,7 @@ function replyQuoteHtml(m) {
     </button>`;
   }
   const isFile = !!quoted._isFile;
-  const body = isFile ? `📎 ${quoted._file?.filename || 'Attachment'}` : (quoted.body || '');
+  const body = isFile ? `File: ${quoted._file?.filename || 'Attachment'}` : (quoted.body || '');
   const snippet = body.length > 140 ? body.slice(0, 140) + '…' : body;
   const deleted = quoted.deleted_at;
   return `<button type="button" class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
@@ -8425,16 +8679,11 @@ function replyQuoteHtml(m) {
   </button>`;
 }
 
-// One message row. Used by the full timeline render AND the live-append fast
-// path, so the two can never drift apart.
 function messageRowHtml(m, opts) {
   const {showSender, lastSender, live} = opts || {};
   const isOut = m.direction === 'out';
   const tombstone = !!m.deleted_at;
 
-  // In 1:1 conversations, the remote peer is whichever side is NOT the local
-  // identity — both sender and receiver can react to either party's messages.
-  // In groups, reactions fan out to all group members (including for own messages).
   const isGroupMsg = !!m.group_id;
   const reactionPeer = isGroupMsg
     ? ''
@@ -8463,20 +8712,17 @@ function messageRowHtml(m, opts) {
 
   const statusIcon = isOut ? msgStatus(m) : '';
 
-  // Hover toolbar: quick reactions plus reply / edit / copy / delete. The
-  // meta-row .msg-actions fallback below keeps everything reachable without
-  // a hover device (touch) and from the keyboard.
   const canReply = !m._isFile && !tombstone;
   const canEdit = canReply && isOut;
   const canDeleteEverywhere = canReply && isOut;
   const toolsHtml = (m._isFile || (!canReact && !canReply)) ? '' : `<div class="msg-tools">
     ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button type="button" class="reaction-btn${reactMap[e]?.mine?' mine':''}" title="React ${e}" aria-label="React ${e}" aria-pressed="${reactMap[e]?.mine?'true':'false'}" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('') : ''}
     ${(canReact && canReply) ? '<span class="tools-sep"></span>' : ''}
-    ${canReply ? `<button type="button" class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">↩</button>` : ''}
-    ${canReply ? `<button type="button" class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">⧉</button>` : ''}
-    ${canEdit ? `<button type="button" class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">✏</button>` : ''}
-    ${canDeleteEverywhere ? `<button type="button" class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑</button>` : ''}
-    ${!m._isFile && !tombstone ? `<button type="button" class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">✕</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">${icon('reply')}</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">${icon('copy')}</button>` : ''}
+    ${canEdit ? `<button type="button" class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">${icon('edit')}</button>` : ''}
+    ${canDeleteEverywhere ? `<button type="button" class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">${icon('trash')}</button>` : ''}
+    ${!m._isFile && !tombstone ? `<button type="button" class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">${icon('x')}</button>` : ''}
   </div>`;
 
   const editedLabel = (!m._isFile && m.edited_at && !tombstone)
@@ -8484,7 +8730,7 @@ function messageRowHtml(m, opts) {
 
   let bodyHtml;
   if(tombstone) {
-    bodyHtml = `<span class="tombstone-icon">🚫</span><span>Message deleted</span>`;
+    bodyHtml = `<span class="tombstone-icon" style="display:inline-flex;vertical-align:middle">${icon('ban')}</span><span>Message deleted</span>`;
   } else if(m._isFile) {
     bodyHtml = renderAttachment(m);
   } else {
@@ -8494,11 +8740,11 @@ function messageRowHtml(m, opts) {
   const sameGroup = m.sender_pubkey === lastSender;
 
   const metaActions = (m._isFile || tombstone) ? '' : `<div class="msg-actions">
-    ${canReply ? `<button class="msg-action-btn" title="Reply to this message" onclick="startReply('${esc(m.msg_id)}')">↩ Reply</button>` : ''}
-    ${canReply ? `<button class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">⧉ Copy</button>` : ''}
-    ${canEdit ? `<button class="msg-action-btn" title="Edit this message" onclick="startEdit('${esc(m.msg_id)}')">✏ Edit</button>` : ''}
-    ${canDeleteEverywhere ? `<button class="msg-action-btn" title="Delete for everyone" onclick="deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑 Delete all</button>` : ''}
-    <button class="msg-action-btn" title="Delete from this device only" onclick="deleteMessageLocally('${esc(m.msg_id)}')">✕ Local</button>
+    ${canReply ? `<button type="button" class="msg-action-btn" title="Reply to this message" onclick="startReply('${esc(m.msg_id)}')">Reply</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">Copy</button>` : ''}
+    ${canEdit ? `<button type="button" class="msg-action-btn" title="Edit this message" onclick="startEdit('${esc(m.msg_id)}')">Edit</button>` : ''}
+    ${canDeleteEverywhere ? `<button type="button" class="msg-action-btn" title="Delete for everyone" onclick="deleteMessageEverywhereUi('${esc(m.msg_id)}')">Delete all</button>` : ''}
+    <button type="button" class="msg-action-btn" title="Delete from this device only" onclick="deleteMessageLocally('${esc(m.msg_id)}')">Local</button>
   </div>`;
 
   return `
@@ -8513,7 +8759,7 @@ function messageRowHtml(m, opts) {
       <div class="msg-meta">
         <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
         ${statusIcon}
-        ${!isOut && !m.read_at && !tombstone ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}','${esc(m.group_id||'')}')">mark read</button>` : ''}
+        ${!isOut && !m.read_at && !tombstone ? `<button type="button" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}','${esc(m.group_id||'')}')">mark read</button>` : ''}
         ${metaActions}
       </div>
     </div>
@@ -8530,15 +8776,17 @@ function toggleMsgTools(bubbleEl, ev) {
   if(!wasOpen) grp.classList.add('tools-open');
 }
 
-function renderMessages() {
+function renderMessages(forceRender=false) {
   const el = $('messages');
-  // innerHTML replacement resets scrollTop to 0; without save/restore any
-  // re-render (incoming message, reaction, delivery tick) yanked a user
-  // reading scrolled-up history back to the top of the conversation.
+  $('app')?.classList.toggle('has-selection', !!selectedTarget);
   const sameConversation = selectedTarget && el.dataset.target === selectedTarget.id;
+  if(sameConversation && !forceRender && hasActiveMediaPlayback() && el.querySelector('.msg-group, .attachment-card')) {
+    return;
+  }
   const prevHeight = el.scrollHeight;
   const prevTop = el.scrollTop;
   if(selectedTarget) el.dataset.target = selectedTarget.id;
+  else delete el.dataset.target;
   const restoreScroll = () => {
     if(sameConversation && el.scrollHeight !== prevHeight)
       el.scrollTop = Math.max(0, prevTop + (el.scrollHeight - prevHeight));
@@ -8546,7 +8794,34 @@ function renderMessages() {
       el.scrollTop = prevTop;
   };
   if(!selectedTarget) {
-    el.innerHTML = '<div class="empty-state"><div class="emo" aria-hidden="true">&#9883;</div><h3>Quantum Chat</h3><p>Select a conversation to view your encrypted history.</p></div>';
+    const suite = state.crypto_suite || 'Kyber-512 + X25519 · AES-256-GCM';
+    const fp = state.fingerprint || short(state.public_key) || 'Initializing…';
+    const relay = state.signaling_connected === false ? 'Reconnecting' : (state.signaling_url || 'Signaling connected');
+    el.innerHTML = `<div class="welcome-hero">
+      <div class="welcome-emblem" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS.brand}</svg>
+      </div>
+      <h2>Post-Quantum Private Messaging</h2>
+      <p class="welcome-copy">End-to-end encrypted peer-to-peer chat, forward-secret group channels, verified safety numbers, and encrypted media transfers.</p>
+      <div class="welcome-cta-row">
+        <button type="button" class="btn btn-primary" onclick="toggleAdd()">Add contact</button>
+        <button type="button" class="btn btn-secondary" onclick="setMode('groups');toggleGroup()">Create group</button>
+      </div>
+      <div class="welcome-specs">
+        <div class="welcome-spec">
+          <div class="welcome-spec-label">Key Exchange &amp; Cipher</div>
+          <div class="welcome-spec-val">${esc(suite)}</div>
+        </div>
+        <div class="welcome-spec">
+          <div class="welcome-spec-label">Local Fingerprint</div>
+          <div class="welcome-spec-val">${esc(fp)}</div>
+        </div>
+        <div class="welcome-spec">
+          <div class="welcome-spec-label">Relay Transport</div>
+          <div class="welcome-spec-val">${esc(relay)}</div>
+        </div>
+      </div>
+    </div>`;
     return;
   }
 
@@ -8555,10 +8830,10 @@ function renderMessages() {
     ...(state.files||[]).map(fileMessage),
   ].filter(m => matchTarget(m)).sort((a,b) => (a.timestamp-b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
   const loadMoreHtml = state.has_more_messages
-    ? `<div class="load-more-row"><button class="load-more-btn" onclick="loadMore()" ${loadingMore?'disabled':''}>${loadingMore?'Loading…':'Load older messages'}</button></div>`
+    ? `<div class="load-more-row"><button type="button" class="load-more-btn" onclick="loadMore()" ${loadingMore?'disabled':''}>${loadingMore?'Loading…':'Load older messages'}</button></div>`
     : '';
   if(!msgs.length) {
-    el.innerHTML = loadMoreHtml + '<div class="empty-state"><div class="emo">🔒</div><h3>No messages yet</h3><p>Send the first encrypted message!</p></div>';
+    el.innerHTML = loadMoreHtml + `<div class="empty-state"><div class="emo" aria-hidden="true">${icon('lock')}</div><h3>No messages yet</h3><p>Send the first post-quantum encrypted message in this conversation.</p></div>`;
     restoreScroll();
     return;
   }
@@ -8577,8 +8852,6 @@ function renderMessages() {
 
     const isOut = m.direction === 'out';
     const sameGroup = m.sender_pubkey === lastSender && idx > 0;
-    // Group chats must show who sent each incoming message; consecutive
-    // messages from the same sender are labeled once, like mainstream UIs.
     const showSender = selectedTarget.type === 'group' && !isOut && !sameGroup;
 
     html += messageRowHtml(m, {showSender, lastSender, live:false});
@@ -8589,11 +8862,6 @@ function renderMessages() {
   restoreScroll();
 }
 
-// Live-append fast path: one new message for the OPEN conversation, arriving
-// in order at the end of the timeline, becomes one DOM row instead of a full
-// re-render. Returns false whenever anything is uncertain (out-of-order
-// timestamp, empty container, mismatched conversation) — the caller then
-// falls back to renderMessages().
 function appendMessageLive(m) {
   const el = $('messages');
   if(!selectedTarget || !matchTarget(m)) return false;
@@ -8602,19 +8870,15 @@ function appendMessageLive(m) {
   const rows = el.querySelectorAll('.msg-group');
   if(!rows.length) return false;
   const last = rows[rows.length - 1];
-  if(last.dataset.msgId === m.msg_id) return true;  // already appended
+  if(last.dataset.msgId === m.msg_id) return true;
   const lastTs = parseInt(last.dataset.ts || '0', 10);
-  if(!(m.timestamp >= lastTs)) return false;        // out of order → full render
-  // A conversation switch can leave a stale DOM; only append into the
-  // container that actually belongs to the current selection.
+  if(!(m.timestamp >= lastTs)) return false;
   if(el.dataset.target !== selectedTarget.id) return false;
 
   const lastSender = last.dataset.sender || '';
   const isOut = m.direction === 'out';
-  // Date divider when the day rolls over between the last row and this one.
   const lastDate = dateLabel(lastTs);
   const thisDate = dateLabel(m.timestamp);
-  // A new day starts a fresh sender run, matching the full render.
   const showSender = selectedTarget.type === 'group' && !isOut &&
     (thisDate !== lastDate || lastSender !== m.sender_pubkey);
   const divider = thisDate !== lastDate ? `<div class="date-divider"><span>${thisDate}</span></div>` : '';
@@ -8624,10 +8888,6 @@ function appendMessageLive(m) {
   return true;
 }
 
-// Targeted in-place patch for status ticks, read receipts, reactions, edits
-// and tombstones: rewrites only the affected row's bubble and meta instead
-// of rebuilding the whole timeline. Returns false if the row isn't in the
-// DOM (e.g. it belongs to an unloaded page) so the caller can fall back.
 function patchMessageDom(msgId, m) {
   if(!selectedTarget || !matchTarget(m)) return false;
   const row = document.querySelector(`#messages .msg-group[data-msg-id="${CSS.escape(msgId)}"]`);
@@ -8637,8 +8897,6 @@ function patchMessageDom(msgId, m) {
   let lastSender = '';
   if(prev && prev.classList.contains('msg-group')) lastSender = prev.dataset.sender || '';
   else if(prev && prev.classList.contains('date-divider')) {
-    // First row after a date divider starts a fresh run, even if the same
-    // person sent the last message on the previous day.
     lastSender = '';
   }
   const showSender = selectedTarget.type === 'group' && !isOut && lastSender !== m.sender_pubkey;
@@ -8652,10 +8910,10 @@ function patchMessageDom(msgId, m) {
 
 function msgStatus(m) {
   const s = m.status || '';
-  if(s === 'read') return `<span class="check read" title="Read">✓✓</span>`;
-  if(s === 'delivered_to_peer' || s === 'delivered') return `<span class="check delivered" title="Delivered">✓✓</span>`;
-  if(s === 'sent_to_relay') return `<span class="check" title="Sent">✓</span>`;
-  return `<span style="font-size:10px;color:var(--text3)" title="Sending">🕐</span>`;
+  if(s === 'read') return `<span class="msg-status check read" title="Read">${icon('checkDouble')}</span>`;
+  if(s === 'delivered_to_peer' || s === 'delivered') return `<span class="msg-status check delivered" title="Delivered">${icon('checkDouble')}</span>`;
+  if(s === 'sent_to_relay') return `<span class="msg-status check" title="Sent">${icon('check')}</span>`;
+  return `<span class="msg-status" style="color:var(--text3)" title="Sending">${icon('clock')}</span>`;
 }
 
 function renderTyping() {
@@ -8675,7 +8933,7 @@ function renderSessions() {
   const el = $('sessionList');
   const entries = Object.entries(state.sessions||{});
   if(!entries.length) {
-    el.innerHTML = '<span class="muted" style="font-size:12px">No sessions yet</span>';
+    el.innerHTML = '<span class="muted" style="font-size:12px">No active sessions</span>';
     return;
   }
   const SESSION_TTL = state.session_ttl || 86400;
@@ -8713,13 +8971,13 @@ function renderFiles() {
     const direction = f.direction === 'out' ? 'Sent' : 'Received';
     return `
     <div class="file-item" style="flex-direction:column;align-items:stretch">
-      <div style="display:flex;align-items:center;gap:12px">
+      <div style="display:flex;align-items:center;gap:10px">
         <div class="file-icon">${fileIcon(f.filename)}</div>
         <div class="file-info">
           <div class="file-name" title="${esc(f.filename)}">${esc(f.filename)}</div>
           <div class="file-meta">${direction} · ${fmt(f.size)} · ${relTime(f.uploaded_at)}</div>
         </div>
-        <a class="file-dl" href="${downloadUrl}" download title="Download">↓</a>
+        <a class="file-dl" href="${downloadUrl}" download title="Download ${esc(f.filename)}" aria-label="Download ${esc(f.filename)}">${icon('download')}</a>
       </div>
       ${isAudio(f.filename, f.mime_type) ? `<audio class="file-audio" controls preload="metadata" src="${viewUrl}"></audio>` : ''}
     </div>
@@ -8747,7 +9005,13 @@ function renderStorageQuota() {
 function renderChatHeader() {
   const el = $('chatHeader');
   if(!selectedTarget) {
-    el.innerHTML = '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:13px">← Select a friend or group to start chatting</div>';
+    el.innerHTML = `<div style="flex:1;display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <span style="color:var(--text3);font-size:13px">Select a contact or group to begin</span>
+      <div class="chat-header-actions">
+        <button type="button" class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search all conversations" aria-label="Search all conversations">Search</button>
+        <button type="button" class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Node inspector" aria-label="Toggle node inspector">${icon('info')}</button>
+      </div>
+    </div>`;
     return;
   }
   if(selectedTarget.type === 'friend') {
@@ -8757,31 +9021,30 @@ function renderChatHeader() {
     const secure = !!(state.sessions&&state.sessions[selectedTarget.id]);
     const bgColor = avatarColor(selectedTarget.id);
     el.innerHTML = `
-      <button class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">&#8592;</button>
+      <button type="button" class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">${icon('back')}</button>
       <div class="chat-header-avatar" style="background:${bgColor}">${esc(avatarLetter(f?.nickname||selectedTarget.id))}</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
         <div class="chat-header-sub">
-          ${online?'🟢 Online':'⚫ Offline'} · ${secure?'🔒 Secure session':'🔓 No session'} · ${f?.verified?'✅ Verified':'⚠️ Unverified'} · ${f?.direct_url?'🌐 Direct-capable':'relay'}
-          ${f?.fingerprint?` · Safety ${esc(f.fingerprint)}`:''}${f?.last_seen?` · Last seen ${relTime(f.last_seen)}`:''}
+          <span class="${online?'status-ok':''}">${online?'Online':'Offline'}</span> · <span class="${secure?'status-accent':''}">${secure?'PQ session':'No session'}</span> · <span class="${f?.verified?'status-ok':'status-warn'}">${f?.verified?'Verified':'Unverified'}</span> · ${f?.direct_url?'Direct':'Relay'}
         </div>
       </div>
       <div class="chat-header-actions">
-        ${!secure?`<button class="btn btn-primary btn-sm mobile-primary" onclick="connectPeer()">Connect</button>`:''}
-        <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">Search</button>
-        ${secure?`<button class="btn btn-secondary btn-sm mobile-primary" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">Call</button>
-        <button class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">Video</button>`:''}
-        <button class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Info & Security details" aria-label="Toggle Info & Security Details">ℹ️</button>
+        ${!secure?`<button type="button" class="btn btn-primary btn-sm mobile-primary" onclick="connectPeer()">Connect</button>`:''}
+        <button type="button" class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">Search</button>
+        ${secure?`<button type="button" class="btn btn-secondary btn-sm mobile-primary" onclick="startCall('audio')" title="Voice call" aria-label="Start voice call">Call</button>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="startCall('video')" title="Video call" aria-label="Start video call">Video</button>`:''}
+        <button type="button" class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Inspector & Security details" aria-label="Toggle Info & Security Details">${icon('info')}</button>
         <details class="header-menu">
-          <summary class="btn btn-secondary btn-sm" title="Conversation actions" aria-label="Conversation actions">&#8943;</summary>
+          <summary class="btn btn-secondary btn-sm" title="Conversation actions" aria-label="Conversation actions">${icon('dots')}</summary>
           <div class="header-menu-items">
-            <button class="btn btn-secondary btn-sm" onclick="connectPeer()">Rekey session</button>
-            <button class="btn btn-secondary btn-sm" onclick="renameFriend()">Rename</button>
-            ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Remove verification</button>`:`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(true)">Verify safety number</button>`}
+            <button type="button" class="btn btn-secondary btn-sm" onclick="connectPeer()">Rekey session</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="renameFriend()">Rename</button>
+            ${f?.verified?`<button type="button" class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Remove verification</button>`:`<button type="button" class="btn btn-secondary btn-sm" onclick="verifyFriend(true)">Verify safety number</button>`}
             ${f?.blocked
-              ? `<button class="btn btn-secondary btn-sm" onclick="blockFriend(false)">Unblock</button>`
-              : `<button class="btn btn-danger btn-sm" onclick="blockFriend(true)">Block</button>`}
-            <button class="btn btn-danger btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove friend</button>
+              ? `<button type="button" class="btn btn-secondary btn-sm" onclick="blockFriend(false)">Unblock</button>`
+              : `<button type="button" class="btn btn-danger btn-sm" onclick="blockFriend(true)">Block</button>`}
+            <button type="button" class="btn btn-danger btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove contact</button>
           </div>
         </details>
       </div>
@@ -8791,25 +9054,76 @@ function renderChatHeader() {
     const name = g?.name || 'Group';
     const isOwner = g && g.owner_pubkey === state.public_key;
     el.innerHTML = `
-      <button class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">&#8592;</button>
-      <div class="chat-header-avatar" style="background:#1a3a8f">👥</div>
+      <button type="button" class="icon-btn mobile-back" onclick="closeMobileChat()" title="Back to conversations" aria-label="Back to conversations">${icon('back')}</button>
+      <div class="chat-header-avatar" style="background:#1b4299">${icon('users')}</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
-        <div class="chat-header-sub">${(g?.members||[]).length} members · epoch ${g?.epoch??0} · ${esc(g?.fingerprint||'')}</div>
+        <div class="chat-header-sub">${(g?.members||[]).length} members · epoch ${g?.epoch??0}${g?.fingerprint?` · ${esc(g.fingerprint)}`:''}</div>
       </div>
       <div class="chat-header-actions">
-        <button class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation">Search</button>
-        <button class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Info & Security details" aria-label="Toggle Info & Security Details">ℹ️</button>
-        ${isOwner ? `<details class="header-menu">
-          <summary class="btn btn-secondary btn-sm" title="Group actions" aria-label="Group actions">&#8943;</summary>
+        <button type="button" class="btn btn-secondary btn-sm mobile-primary" onclick="openSearchModal()" title="Search this conversation" aria-label="Search this conversation">Search</button>
+        <button type="button" class="btn btn-secondary btn-sm mobile-info-btn" onclick="toggleInfoPanel()" title="Inspector & Security details" aria-label="Toggle Info & Security Details">${icon('info')}</button>
+        ${g ? `<details class="header-menu">
+          <summary class="btn btn-secondary btn-sm" title="Group actions" aria-label="Group actions">${icon('dots')}</summary>
           <div class="header-menu-items">
-            <button class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
-            <button class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate group key</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
+            ${isOwner ? `<button type="button" class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate group key</button>` : ''}
+            ${!isOwner ? `<button type="button" class="btn btn-danger btn-sm" onclick="leaveGroup('${esc(g.group_id)}')">Leave group</button>` : ''}
           </div>
         </details>` : ''}
       </div>
     `;
     if($('groupManagePanel').classList.contains('open')) renderGroupManage();
+  }
+}
+
+function renderActiveInspector() {
+  const section = $('activeInspector');
+  const body = $('activeInspectorBody');
+  if(!section || !body) return;
+  if(!selectedTarget) {
+    section.hidden = true;
+    body.innerHTML = '';
+    return;
+  }
+  section.hidden = false;
+  if(selectedTarget.type === 'friend') {
+    const f = state.friends.find(x => x.pubkey === selectedTarget.id);
+    const online = state.online.includes(selectedTarget.id);
+    const secure = !!(state.sessions && state.sessions[selectedTarget.id]);
+    body.innerHTML = `
+      <div class="inspector-kv">
+        <div class="inspector-row"><span class="inspector-label">Contact</span><span class="inspector-val">${esc(f?.nickname || short(selectedTarget.id))}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Reachability</span><span class="inspector-val">${online?'Online':'Offline'}</span></div>
+        <div class="inspector-row"><span class="inspector-label">PQ Session</span><span class="inspector-val">${secure?'Established':'Pending'}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Trust</span><span class="inspector-val">${f?.verified?'Verified':'Unverified'}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Route</span><span class="inspector-val">${f?.direct_url?'Direct / Relay':'Signaling Relay'}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Safety #</span><span class="inspector-val">${esc(f?.fingerprint || short(selectedTarget.id))}</span></div>
+      </div>
+      <div class="inspector-actions">
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="connectPeer()">${secure?'Rekey':'Connect'}</button>
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="openSafetyModal('${esc(selectedTarget.id)}')">Safety #</button>
+      </div>
+    `;
+  } else {
+    const g = state.groups.find(x => x.group_id === selectedTarget.id);
+    if(!g) { section.hidden = true; body.innerHTML = ''; return; }
+    const isOwner = g.owner_pubkey === state.public_key;
+    body.innerHTML = `
+      <div class="inspector-kv">
+        <div class="inspector-row"><span class="inspector-label">Channel</span><span class="inspector-val">${esc(g.name)}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Role</span><span class="inspector-val">${isOwner?'Owner':'Member'}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Members</span><span class="inspector-val">${(g.members||[]).length}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Key Epoch</span><span class="inspector-val">${g.epoch??0}</span></div>
+        <div class="inspector-row"><span class="inspector-label">Group Key</span><span class="inspector-val">${esc(g.fingerprint || short(g.group_id))}</span></div>
+      </div>
+      <div class="inspector-actions">
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="toggleGroupManage()">Members</button>
+        ${isOwner
+          ? `<button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate key</button>`
+          : `<button type="button" class="btn btn-danger btn-sm" style="flex:1" onclick="leaveGroup('${esc(g.group_id)}')">Leave</button>`}
+      </div>
+    `;
   }
 }
 
@@ -8819,9 +9133,6 @@ function toggleGroupManage() {
 }
 
 function closeGroupManage() {
-  // Leaving the panel expanded across a selection change used to strand a
-  // blank padded strip above the conversation: renderGroupManage blanks its
-  // body when no group is selected but nothing ever removed .open.
   const panel = $('groupManagePanel');
   if(panel.classList.contains('open')) panel.classList.remove('open');
 }
@@ -8830,8 +9141,6 @@ function renderGroupManage() {
   const g = state.groups.find(x=>x.group_id===selectedTarget?.id);
   const el = $('groupManageBody');
   if(!g) { el.innerHTML = ''; return; }
-  // A state push can re-render this panel while the user is picking a friend
-  // or typing a key; keep their in-progress input instead of wiping it.
   const prevSel = $('addMemberSelect')?.value || '';
   const prevKey = $('addMemberKey')?.value || '';
   const isOwner = g.owner_pubkey === state.public_key;
@@ -8843,21 +9152,21 @@ function renderGroupManage() {
     return `<div class="member-row">
       <span class="role-tag">${role}</span>
       <span class="mono" title="${esc(pubkey)}">${esc(label)}</span>
-      ${canRemove ? `<button class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">✕</button>` : ''}
+      ${canRemove ? `<button type="button" class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">${icon('x')}</button>` : ''}
     </div>`;
   }).join('');
   if(isOwner) {
     const candidates = (state.friends||[]).filter(f => !(g.members||[]).includes(f.pubkey) && !f.blocked);
     const selectHtml = candidates.length
       ? `<select class="field" id="addMemberSelect" aria-label="Choose a friend to add" style="flex:1">
-          <option value="">Select a friend to add…</option>
+          <option value="">Select a contact to add…</option>
           ${candidates.map(f => `<option value="${esc(f.pubkey)}">${esc(f.nickname || short(f.pubkey))}</option>`).join('')}
         </select>`
       : '';
     html += `
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
         ${selectHtml}
-        <input class="field" id="addMemberKey" placeholder="Or paste friend public key" style="flex:1;min-width:160px">
+        <input class="field" id="addMemberKey" placeholder="Or paste contact public key" style="flex:1;min-width:160px">
         <button type="button" class="btn btn-primary btn-sm" onclick="addGroupMember('${esc(g.group_id)}')">Add member</button>
       </div>
     `;
@@ -8875,7 +9184,7 @@ function addGroupMember(group_id) {
   const sel = $('addMemberSelect');
   const input = $('addMemberKey');
   const pk = ((sel?.value || '') || (input?.value || '')).trim();
-  if(!pk) { toast('Select a friend or paste a public key', 'warning'); return; }
+  if(!pk) { toast('Select a contact or paste a public key', 'warning'); return; }
   if(send({type:'add_group_member', group_id, pubkey:pk})) {
     if(input) input.value = '';
     if(sel) sel.value = '';
@@ -8892,26 +9201,36 @@ async function rotateGroupKey(group_id) {
   send({type:'rotate_group_key', group_id});
 }
 
+async function leaveGroup(group_id) {
+  if(!await showConfirm('Leave group', 'Leave this group channel? You will stop receiving new group messages.', {confirmText:'Leave group', danger:true})) return;
+  if(!send({type:'leave_group', group_id})) return;
+  cancelComposerContext();
+  closeGroupManage();
+  selectedTarget = null;
+  setMobileChat(false);
+  renderChatHeader();
+  renderActiveInspector();
+  renderMessages(true);
+}
+
 // ─── Selection ────────────────────────────────────────────────────────────────
 function selectFriend(pubkey) {
   stopTyping();
   closeGroupManage();
-  // A pending reply/edit belongs to the conversation it was started in —
-  // carrying it across a switch would silently retarget the message.
   cancelComposerContext();
   selectedTarget = {type:'friend', id:pubkey};
   delete typing[pubkey];
   renderTyping();
   renderSidebar();
   renderChatHeader();
-  renderMessages();
+  renderActiveInspector();
+  renderMessages(true);
   scrollBottom(true);
   send({type:'clear_unread', pubkey});
   unreadTitle = 0;
   updateTitle();
   updateSendBtn();
   setMobileChat(true);
-  // Request browser notification permission lazily
   if('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
 }
 
@@ -8925,7 +9244,8 @@ function selectGroup(group_id) {
   updateTitle();
   renderSidebar();
   renderChatHeader();
-  renderMessages();
+  renderActiveInspector();
+  renderMessages(true);
   scrollBottom(true);
   updateSendBtn();
   setMobileChat(true);
@@ -8958,7 +9278,8 @@ function setMode(m) {
   setMobileChat(false);
   renderSidebar();
   renderChatHeader();
-  renderMessages();
+  renderActiveInspector();
+  renderMessages(true);
   updateSendBtn();
 }
 
@@ -9025,6 +9346,22 @@ function confirmSafetyVerify() {
   if(peer) send({type:'verify_friend', pubkey:peer, verified:true});
 }
 
+function openLightbox(viewUrl, downloadUrl, filename) {
+  $('lightboxTitle').textContent = filename || 'Attachment preview';
+  $('lightboxImg').src = viewUrl || '';
+  $('lightboxImg').alt = filename || 'Attachment preview';
+  const dl = $('lightboxDownload');
+  if(dl) {
+    dl.href = downloadUrl || viewUrl || '#';
+    dl.setAttribute('download', filename || 'attachment');
+  }
+  $('lightboxModal').classList.add('open');
+}
+function closeLightbox() {
+  $('lightboxModal').classList.remove('open');
+  $('lightboxImg').src = '';
+}
+
 // ─── Actions ──────────────────────────────────────────────────────────────────
 function toggleId() {
   const k = $('myKey'), a = $('idActions'), card = $('idCard');
@@ -9067,8 +9404,10 @@ function copyKey() {
 
 function toggleAdd() {
   const p = $('addPanel');
-  p.classList.toggle('open');
-  if(p.classList.contains('open')) $('friendKey').focus();
+  const opening = !p.classList.contains('open');
+  if(opening) $('groupPanel')?.classList.remove('open');
+  p.classList.toggle('open', opening);
+  if(opening) $('friendKey').focus();
 }
 
 function renderGroupFriendPicker() {
@@ -9092,8 +9431,10 @@ function renderGroupFriendPicker() {
 
 function toggleGroup() {
   const p = $('groupPanel');
-  p.classList.toggle('open');
-  if(p.classList.contains('open')) {
+  const opening = !p.classList.contains('open');
+  if(opening) $('addPanel')?.classList.remove('open');
+  p.classList.toggle('open', opening);
+  if(opening) {
     renderGroupFriendPicker();
     $('groupName').focus();
   }
@@ -9117,13 +9458,14 @@ function addFriend() {
 }
 
 async function removeFriend(pubkey) {
-  if(!await showConfirm('Remove friend', 'Remove this friend and their local session?', {confirmText:'Remove', danger:true})) return;
+  if(!await showConfirm('Remove contact', 'Remove this contact and their local session?', {confirmText:'Remove', danger:true})) return;
   if(!send({type:'remove_friend', pubkey})) return;
   cancelComposerContext();
   selectedTarget = null;
   setMobileChat(false);
   renderChatHeader();
-  renderMessages();
+  renderActiveInspector();
+  renderMessages(true);
 }
 
 function connectPeer() {
@@ -9181,15 +9523,16 @@ function setComposerContext(ctx) {
   if(!ctx) {
     wrap.hidden = true;
     sendBtn.classList.remove('saving');
-    sendBtn.textContent = '➤';
+    sendBtn.innerHTML = icon('send');
     sendBtn.title = 'Send';
+    sendBtn.setAttribute('aria-label', 'Send message');
     updateSendBtn();
     return;
   }
   const m = findMessageAny(ctx.msgId);
-  const quoted = m ? (m._isFile ? `📎 ${m._file?.filename || 'Attachment'}` : (m.body || '')) : '';
+  const quoted = m ? (m._isFile ? `File: ${m._file?.filename || 'Attachment'}` : (m.body || '')) : '';
   const snippet = quoted.length > 120 ? quoted.slice(0, 120) + '…' : quoted;
-  $('ctxIcon').textContent = ctx.mode === 'edit' ? '✏' : '↩';
+  $('ctxIcon').innerHTML = icon(ctx.mode === 'edit' ? 'edit' : 'reply');
   $('ctxTitle').textContent = ctx.mode === 'edit'
     ? 'Editing message'
     : `Replying to ${displayName(ctx.peer)}`;
@@ -9200,8 +9543,9 @@ function setComposerContext(ctx) {
     text.value = m.body || '';
     onTextInput(true);
     sendBtn.classList.add('saving');
-    sendBtn.textContent = '✓';
+    sendBtn.innerHTML = icon('check');
     sendBtn.title = 'Save edit';
+    sendBtn.setAttribute('aria-label', 'Save message edit');
   }
   updateSendBtn();
   text.focus();
@@ -9297,8 +9641,22 @@ function runSearch() {
   }
   send(payload);
 }
+function highlightQuery(text, query) {
+  if(!query) return esc(text);
+  const qLower = query.toLowerCase();
+  const textLower = text.toLowerCase();
+  let out = '', pos = 0;
+  while(pos < text.length) {
+    const idx = textLower.indexOf(qLower, pos);
+    if(idx < 0) { out += esc(text.slice(pos)); break; }
+    if(idx > pos) out += esc(text.slice(pos, idx));
+    out += `<mark class="search-hit">${esc(text.slice(idx, idx + query.length))}</mark>`;
+    pos = idx + query.length;
+  }
+  return out;
+}
 function renderSearchResults(query, results, seq) {
-  if(seq !== undefined && seq !== searchSeq) return; // stale reply
+  if(seq !== undefined && seq !== searchSeq) return;
   const currentQuery = $('searchInput').value.trim();
   if(query !== currentQuery) return;
   const el = $('searchResults');
@@ -9314,9 +9672,9 @@ function renderSearchResults(query, results, seq) {
     const convId = m.group_id || (m.sender_pubkey === state.public_key ? m.recipient_pubkey : m.sender_pubkey) || '';
     const convLabel = m.group_id ? (state.groups.find(g=>g.group_id===m.group_id)?.name || 'Group') : friendName(convId);
     const showScope = $('searchAllScope')?.checked && convLabel;
-    return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}','${esc(convType)}','${esc(convId)}')">
+    return `<button type="button" class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}','${esc(convType)}','${esc(convId)}')">
       <div class="search-result-meta">${esc(who)}${showScope ? ` · in ${esc(convLabel)}` : ''} · ${relTime(m.timestamp)}</div>
-      ${esc(snippet)}
+      <div>${highlightQuery(snippet, query)}</div>
     </button>`;
   }).join('');
 }
@@ -9418,20 +9776,22 @@ function setupPeerConnection(peer, media) {
 function showCallOverlay(peer, media, status) {
   $('callOverlayName').textContent = friendName(peer);
   $('callOverlayStatus').textContent = status;
-  $('callOverlayAvatar').textContent = media === 'video' ? '🎥' : '📞';
+  $('callOverlayAvatar').innerHTML = icon(media === 'video' ? 'cam' : 'phone');
   $('callOverlay').hidden = false;
   $('callMuteBtn').classList.remove('call-btn-muted');
-  $('callCameraBtn').textContent = '🎥';
+  $('callMuteBtn').innerHTML = icon('mic');
+  $('callCameraBtn').classList.remove('call-btn-muted');
+  $('callCameraBtn').innerHTML = icon('cam');
+  $('callCameraBtn').style.display = media === 'video' ? '' : 'none';
 }
 
 function handleCallIncoming(d) {
   if(currentCall) {
-    // Already busy — mirror the server-side busy handling for defense in depth.
     send({type:'call_end', pubkey: d.peer, reason:'busy'});
     return;
   }
   currentCall = {peer:d.peer, call_id:d.call_id, role:'callee', media:d.media, state:'ringing', offerSdp:d.sdp};
-  $('incomingCallAvatar').textContent = d.media === 'video' ? '🎥' : '📞';
+  $('incomingCallAvatar').innerHTML = icon(d.media === 'video' ? 'cam' : 'phone');
   $('incomingCallSub').textContent = `${friendName(d.peer)} is ${d.media === 'video' ? 'video ' : ''}calling…`;
   $('incomingCallModal').classList.add('open');
   playRingtone();
@@ -9563,6 +9923,7 @@ function toggleCallMute() {
   if(!track) return;
   track.enabled = !track.enabled;
   $('callMuteBtn').classList.toggle('call-btn-muted', !track.enabled);
+  $('callMuteBtn').innerHTML = icon(track.enabled ? 'mic' : 'micOff');
   $('callMuteBtn').setAttribute('aria-label', track.enabled ? 'Mute microphone' : 'Unmute microphone');
 }
 
@@ -9572,7 +9933,7 @@ function toggleCallCamera() {
   if(!track) return;
   track.enabled = !track.enabled;
   $('callCameraBtn').classList.toggle('call-btn-muted', !track.enabled);
-  $('callCameraBtn').textContent = track.enabled ? '🎥' : '🚫';
+  $('callCameraBtn').innerHTML = icon(track.enabled ? 'cam' : 'camOff');
   $('callCameraBtn').setAttribute('aria-label', track.enabled ? 'Turn camera off' : 'Turn camera on');
 }
 
@@ -10014,26 +10375,41 @@ function bumpUnread() {
 }
 
 function updateTitle() {
-  document.title = unreadTitle > 0 ? `(${unreadTitle}) ⚛ Quantum Chat` : '⚛ Quantum Chat';
+  document.title = unreadTitle > 0 ? `(${unreadTitle}) Quantum Chat` : 'Quantum Chat';
 }
 
 // ─── Notifications ────────────────────────────────────────────────────────────
 function notify(title, body) {
   if('Notification' in window && Notification.permission === 'granted') {
     try {
-      new Notification(`⚛ ${title}`, {body: body.slice(0,120), icon: ''});
+      new Notification(title, {body: body.slice(0,120), icon: ''});
     } catch(err) { console.warn('Desktop notification suppressed', err); }
   }
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
 function toast(text, level='info') {
-  const icons = {info:'ℹ️', success:'✅', error:'❌', warning:'⚠️'};
+  const iconMap = {info:'info', success:'check', error:'warn', warning:'warn'};
+  const wrap = $('toasts');
+  if(!wrap) return;
+  const msg = String(text || '');
+  const existing = Array.from(wrap.children).find(el => el.dataset.msg === msg);
+  if(existing) {
+    clearTimeout(existing._timer);
+    existing._timer = setTimeout(() => existing.remove(), 4500);
+    return;
+  }
+  while(wrap.children.length >= 4) {
+    const oldest = wrap.firstElementChild;
+    if(oldest) { clearTimeout(oldest._timer); oldest.remove(); }
+    else break;
+  }
   const div = document.createElement('div');
   div.className = `toast ${level}`;
-  div.innerHTML = `<span class="toast-icon">${icons[level]||'ℹ️'}</span><span>${esc(text)}</span>`;
-  $('toasts').appendChild(div);
-  setTimeout(() => div.remove(), 4500);
+  div.dataset.msg = msg;
+  div.innerHTML = `<span class="toast-icon">${icon(iconMap[level]||'info')}</span><span>${esc(msg)}</span>`;
+  wrap.appendChild(div);
+  div._timer = setTimeout(() => div.remove(), 4500);
 }
 
 // ─── Drag & Drop ─────────────────────────────────────────────────────────────
@@ -10102,13 +10478,9 @@ document.addEventListener('keydown', event => {
   if(event.key !== 'Escape') return;
   if($('confirmModal').classList.contains('open')) { resolveConfirmModal(false); return; }
   if($('promptModal').classList.contains('open')) { resolvePromptModal(false); return; }
+  if($('lightboxModal')?.classList.contains('open')) { closeLightbox(); return; }
   if($('safetyModal').classList.contains('open')) { closeSafetyModal(); return; }
-  // Canceling an in-flight reply or edit takes precedence over everything
-  // else Escape does — it is the primary affordance of the context bar.
   if(composerCtx) { cancelComposerContext(); return; }
-  // The incoming-call modal is the one dialog Escape MUST dismiss — it's a
-  // full-screen interruption and it used to be the only one the handler
-  // ignored (declineCall below is the same operation as its Decline button).
   if($('incomingCallModal').classList.contains('open')) { declineCall(); return; }
   if($('backupModal').classList.contains('open')) closeBackupModal();
   else if($('searchModal').classList.contains('open')) closeSearchModal();
