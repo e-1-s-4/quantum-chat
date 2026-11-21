@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+quantum_chat.db
+*.db-shm
+*.db-wal
+files/
+*.db
+*.db.key
+*.key.tmp
+scripts/*-run/
+scripts/demo/
+.coverage
+.pytest_cache/
+.ruff_cache/
+# Stale v2.0.0 snapshot that can appear inside an extracted download.
+Quantum-Chat-main/
