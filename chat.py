@@ -1407,6 +1407,13 @@ class Database:
             self.conn.commit()
             return cur.rowcount > 0
 
+    def get_message_row_id(self, msg_id: str) -> int | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM messages WHERE msg_id=?", (str(msg_id or ""),)
+            ).fetchone()
+            return int(row["id"]) if row is not None else None
+
     def get_message(self, msg_id: str) -> dict[str, Any] | None:
         """Fetch and hydrate one message row by id (or None).
 
@@ -2598,6 +2605,7 @@ class QuantumNode:
             recipient=peer_pubkey, group_id=group_id,
             delivered=False, status="sent_to_relay", reply_to=reply_to
         )
+        row_id = self.db.get_message_row_id(msg_id) if hasattr(self.db, "get_message_row_id") else None
         try:
             await self.send_relay(
                 peer_pubkey,
@@ -2614,6 +2622,7 @@ class QuantumNode:
         await self.broadcast_ui({
             "type": "message",
             "message": {
+                "id": row_id,
                 "msg_id": msg_id, "sender_pubkey": self.public_key,
                 "recipient_pubkey": peer_pubkey, "group_id": group_id,
                 "body": text, "direction": "out",
@@ -2671,6 +2680,7 @@ class QuantumNode:
             delivered=True, status="delivered", reply_to=reply_to
         )
         if inserted:
+            row_id = self.db.get_message_row_id(msg_id) if hasattr(self.db, "get_message_row_id") else None
             if not group_id:
                 self.db.increment_unread(peer_pubkey)
             ack = self.signed_payload("delivery_ack", {
@@ -2681,6 +2691,7 @@ class QuantumNode:
             await self.broadcast_ui({
                 "type": "message",
                 "message": {
+                    "id": row_id,
                     "msg_id": msg_id, "sender_pubkey": peer_pubkey,
                     "recipient_pubkey": self.public_key,
                     "group_id": group_id,
@@ -2797,29 +2808,67 @@ class QuantumNode:
 
     # ── Reactions ─────────────────────────────────────────────────────────────
 
-    async def send_reaction(self, peer_pubkey: str, msg_id: str,
-                            emoji: str, action: str = "add") -> None:
-        peer_pubkey = self.validate_peer_key(peer_pubkey)
+    async def send_reaction(self, peer_pubkey: str | None, msg_id: str,
+                            emoji: str, action: str = "add",
+                            group_id: str | None = None) -> None:
         emoji = validate_emoji(emoji)
         if action not in ("add", "remove"):
             raise ValueError("Reaction action must be 'add' or 'remove'")
-        await self.require_fresh_session(peer_pubkey, outgoing=True)
-        await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
-            "from": self.public_key, "to": peer_pubkey,
-            "msg_id": msg_id, "emoji": emoji, "action": action,
-        }), queue_on_failure=True)
-        if action == "add":
-            self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
+        msg_id = str(msg_id or "").strip()
+        if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
+            raise ValueError("Invalid reaction message id")
+        row = self.db.get_message(msg_id) if hasattr(self.db, "get_message") else None
+        if row is not None and row.get("deleted_at"):
+            raise ValueError("Cannot react to a deleted message")
+        if group_id is not None:
+            group_id = validate_file_id(str(group_id))
+            members = set(self.db.group_members(group_id))
+            if self.public_key not in members:
+                raise ValueError("You are not a member of this group")
+            if row is not None and row.get("group_id") != group_id:
+                raise ValueError("Message does not belong to this group")
+            if action == "add":
+                self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
+            else:
+                self.db.remove_reaction(msg_id, self.public_key, emoji)
+            recipients = [peer for peer in members - {self.public_key} if self.db.is_friend(peer)]
+
+            async def deliver_group_reaction(peer: str) -> None:
+                try:
+                    frame = self.signed_payload("reaction", {
+                        "from": self.public_key, "to": peer,
+                        "group_id": group_id, "msg_id": msg_id,
+                        "emoji": emoji, "action": action,
+                    })
+                    await self.send_relay(peer, frame, queue_on_failure=True)
+                except Exception as exc:
+                    LOG.warning("Group reaction fan-out to %s failed: %s", short_key(peer), exc)
+
+            if recipients:
+                await asyncio.gather(*(deliver_group_reaction(peer) for peer in recipients))
         else:
-            self.db.remove_reaction(msg_id, self.public_key, emoji)
+            peer_pubkey = self.validate_peer_key(peer_pubkey or "")
+            if peer_pubkey == self.public_key:
+                raise ValueError("Cannot send a 1:1 reaction to your own public key")
+            await self.require_fresh_session(peer_pubkey, outgoing=True)
+            await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
+                "from": self.public_key, "to": peer_pubkey,
+                "msg_id": msg_id, "emoji": emoji, "action": action,
+            }), queue_on_failure=True)
+            if action == "add":
+                self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
+            else:
+                self.db.remove_reaction(msg_id, self.public_key, emoji)
         await self.broadcast_ui({
             "type": "reaction",
             "msg_id": msg_id, "peer": self.public_key,
             "emoji": emoji, "action": action,
+            **({"group_id": group_id} if group_id else {}),
         })
         await self.sync_to_devices("reaction", {
             "msg_id": msg_id, "peer": self.public_key,
             "emoji": emoji, "action": action,
+            **({"group_id": group_id} if group_id else {}),
         })
 
     async def handle_reaction(self, peer_pubkey: str, data: dict[str, Any]) -> None:
@@ -2834,7 +2883,22 @@ class QuantumNode:
         action = payload.get("action", "add")
         if action not in ("add", "remove"):
             raise ValueError("Invalid reaction action")
-        msg_id = str(payload.get("msg_id", ""))
+        msg_id = str(payload.get("msg_id", "")).strip()
+        if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
+            raise ValueError("Invalid reaction message id")
+        group_id = payload.get("group_id")
+        row = self.db.get_message(msg_id) if hasattr(self.db, "get_message") else None
+        if group_id is not None:
+            group_id = validate_file_id(str(group_id))
+            members = set(self.db.group_members(group_id))
+            if self.public_key not in members or peer_pubkey not in members:
+                raise ValueError("Reaction for unknown or non-member group")
+            if row is not None and row.get("group_id") != group_id:
+                raise ValueError("Group reaction target mismatch")
+        elif row is not None and row.get("group_id") is not None:
+            raise ValueError("Cannot apply a 1:1 reaction to a group message")
+        if row is not None and row.get("deleted_at"):
+            return
         if action == "add":
             self.db.add_reaction(msg_id, peer_pubkey, emoji, direction="in")
         else:
@@ -2843,6 +2907,7 @@ class QuantumNode:
             "type": "reaction",
             "msg_id": msg_id, "peer": peer_pubkey,
             "emoji": emoji, "action": action,
+            **({"group_id": group_id} if group_id else {}),
         })
 
     # ── Message editing & delete-for-everyone ──────────────────────────────────
@@ -3128,9 +3193,11 @@ class QuantumNode:
                 reply_to=data.get("reply_to"),
             )
             if inserted:
+                row_id = self.db.get_message_row_id(msg_id) if hasattr(self.db, "get_message_row_id") else None
                 if direction == "in" and not data.get("group_id"):
                     self.db.increment_unread(sender)
                 await self.broadcast_ui({"type": "message", "message": {
+                    "id": row_id,
                     "msg_id": msg_id, "sender_pubkey": sender,
                     "recipient_pubkey": data.get("recipient_pubkey"), "group_id": data.get("group_id"),
                     "body": body_text, "direction": direction, "timestamp": utc_ts(),
@@ -3437,6 +3504,7 @@ class QuantumNode:
         self.db.save_message(msg_id, self.public_key, text, "out", group_id=group_id,
                              delivered=delivered > 0, status="sent_to_group",
                              reply_to=reply_to)
+        row_id = self.db.get_message_row_id(msg_id) if hasattr(self.db, "get_message_row_id") else None
 
         async def deliver(peer: str) -> bool:
             try:
@@ -3455,6 +3523,7 @@ class QuantumNode:
         if recipients and actually_sent == 0:
             self.db.update_message_status(msg_id, "sent_to_group", delivered=False)
         await self.broadcast_ui({"type": "message", "message": {
+            "id": row_id,
             "msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": None,
             "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
             "delivered": int(actually_sent > 0), "status": "sent_to_group", "reactions": [], "read_at": None,
@@ -3783,11 +3852,13 @@ class QuantumNode:
         inserted = self.db.save_message(msg_id, peer_pubkey, text, "in", group_id=group_id,
                                         delivered=True, status="delivered", reply_to=reply_to)
         if inserted:
+            row_id = self.db.get_message_row_id(msg_id) if hasattr(self.db, "get_message_row_id") else None
             # Group traffic deliberately does NOT bump the sender's 1:1 unread
             # counter: that badge belongs to the private conversation with
             # this friend, and a group message must not light it up (the UI
             # tracks per-group unread badges itself).
             await self.broadcast_ui({"type": "message", "message": {
+                "id": row_id,
                 "msg_id": msg_id, "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": None, "group_id": group_id, "body": text,
                 "direction": "in", "timestamp": utc_ts(), "delivered": 1,
@@ -4149,8 +4220,9 @@ class QuantumNode:
                 await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"], "msg_id": msg_id})
         elif typ == "reaction":
             await self.send_reaction(
-                msg["pubkey"], str(msg["msg_id"]),
-                str(msg["emoji"]), str(msg.get("action", "add"))
+                msg.get("pubkey"), str(msg["msg_id"]),
+                str(msg["emoji"]), str(msg.get("action", "add")),
+                group_id=msg.get("group_id"),
             )
         elif typ == "delete_message":
             msg_id = str(msg.get("msg_id") or "")
@@ -4165,9 +4237,17 @@ class QuantumNode:
         elif typ == "refresh":
             await self.broadcast_ui(self.state_payload())
         elif typ == "load_more_messages":
-            before_id = int(msg.get("before_id", 0))
-            older = self._with_message_metadata(self.db.messages_before(before_id, MESSAGE_PAGE_SIZE))
-            has_more = bool(older) and self.db.has_messages_before(older[0]["id"])
+            raw_before = msg.get("before_id")
+            try:
+                before_id = int(raw_before) if raw_before is not None else 0
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Valid message cursor required") from exc
+            if before_id <= 0:
+                older = []
+                has_more = False
+            else:
+                older = self._with_message_metadata(self.db.messages_before(before_id, MESSAGE_PAGE_SIZE))
+                has_more = bool(older) and self.db.has_messages_before(older[0]["id"])
             await ws.send(json.dumps({
                 "type": "history", "messages": older, "has_more_messages": has_more
             }))
@@ -4722,6 +4802,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
     node: QuantumNode = None  # type: ignore
     ui_ws_port: int = UI_WS_PORT
     require_http_auth: bool = False
+    allow_iframe: bool = False
 
     def __init__(self, request: Any, client_address: Any, server: Any) -> None:
         # BaseHTTPRequestHandler.__init__ runs the whole request lifecycle,
@@ -4732,6 +4813,8 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         self.ui_ws_port = getattr(server, "ui_ws_port", None) or type(self).ui_ws_port
         auth = getattr(server, "require_http_auth", None)
         self.require_http_auth = type(self).require_http_auth if auth is None else auth
+        allow_iframe = getattr(server, "allow_iframe", None)
+        self.allow_iframe = type(self).allow_iframe if allow_iframe is None else bool(allow_iframe)
         super().__init__(request, client_address, server)
 
     def do_GET(self) -> None:
@@ -4915,8 +4998,8 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         control of the local node. Requests without a Host header are allowed
         so non-browser probes (monitoring, HTTP/1.0 clients) still work; those
         cannot be driven by a rebinding attack."""
-        if self.require_http_auth:
-            return True  # remote UI is explicitly enabled and token-gated
+        if self.require_http_auth or getattr(getattr(self, "node", None), "allow_remote_ui", False):
+            return True  # remote UI is explicitly enabled
         host = (self.headers.get("Host", "") if self.headers else "") or ""
         host = host.strip()
         if not host:
@@ -5086,8 +5169,9 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         connect_src = ("connect-src 'self' stun: turn: stuns: turns: "
                        "ws://127.0.0.1:* ws://localhost:* "
                        "wss://127.0.0.1:* wss://localhost:*;")
-        if self.require_http_auth:
-            host = (self.headers.get("Host", "") or "").strip()
+        remote_ui = self.require_http_auth or getattr(getattr(self, "node", None), "allow_remote_ui", False)
+        if remote_ui:
+            host = (self.headers.get("Host", "") or "").strip() if self.headers else ""
             # Only interpolate a syntactically valid host[:port] into the CSP.
             # The Host header is client-controlled; a value containing ';'
             # would terminate connect-src early and let an injected directive
@@ -5102,13 +5186,15 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                     "ws://127.0.0.1:* ws://localhost:* "
                     "wss://127.0.0.1:* wss://localhost:*;"
                 )
+        allow_iframe = getattr(self, "allow_iframe", False)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
         # X-Frame-Options + frame-ancestors 'none' make clickjacking on the
         # local UI harder; modern browsers honor CSP frame-ancestors, but
         # X-Frame-Options is still a useful belt-and-braces for older ones.
-        self.send_header("X-Frame-Options", "DENY")
+        if not allow_iframe:
+            self.send_header("X-Frame-Options", "DENY")
         # X-XSS-Protection is largely deprecated in modern browsers but still
         # a useful defense-in-depth header for the legacy XSS filter in older
         # Safari/Chrome; setting it to 1; mode=block stops a detected XSS
@@ -5120,6 +5206,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         # 'none' above means this page is never embedded, so explicitly
         # allowing 'self' here only ever affects this same-origin UI itself.
         self.send_header("Permissions-Policy", "camera=(self), microphone=(self), display-capture=()")
+        frame_ancestors = "frame-ancestors 'self' https: http:" if allow_iframe else "frame-ancestors 'none'"
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -5128,7 +5215,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             "script-src 'unsafe-inline' 'self'; "
             "img-src 'self' data: blob:; "
             "media-src 'self' blob: data:; "
-            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            f"object-src 'none'; base-uri 'none'; {frame_ancestors}"
         )
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
@@ -5536,6 +5623,11 @@ body {
   gap: 12px;
   padding: 10px 14px;
   margin: 2px 10px;
+  width: calc(100% - 20px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   border-radius: 12px;
   cursor: pointer;
   transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
@@ -6105,13 +6197,34 @@ body {
   width: 34px; height: 34px;
   border-radius: 9px;
   background: none;
-  border: none;
+  border: 1px solid transparent;
   cursor: pointer;
   font-size: 17px;
   display: flex; align-items: center; justify-content: center;
   transition: all 0.2s;
 }
 .reaction-btn:hover, .reaction-btn:focus-visible { background: rgba(255, 255, 255, 0.09); transform: scale(1.12); }
+.reaction-btn.mine { background: var(--accent-soft); border-color: rgba(69, 216, 255, 0.45); }
+.friend-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: rgba(0, 0, 0, 0.22);
+}
+.friend-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text1);
+  cursor: pointer;
+}
+.friend-picker-row input { accent-color: var(--accent); cursor: pointer; }
 
 /* ── Typing indicator ──────────────────────────────────────────────────── */
 #typing-indicator {
@@ -6696,15 +6809,17 @@ body {
 /* ── Toasts ────────────────────────────────────────────────────────────── */
 #toasts {
   position: fixed;
-  bottom: 24px;
-  right: 24px;
+  top: 20px;
+  right: 20px;
   display: flex;
-  flex-direction: column-reverse;
-  gap: 12px;
+  flex-direction: column;
+  gap: 10px;
   z-index: 100;
   max-width: 380px;
+  pointer-events: none;
 }
 .toast {
+  pointer-events: auto;
   padding: 14px 18px;
   border-radius: 14px;
   background: rgba(15, 21, 33, 0.94);
@@ -6966,7 +7081,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   #text { font-size: 16px; }
   .drop-overlay { border-radius: 12px; }
   .scroll-bottom-btn { right: 14px; bottom: 98px; }
-  #toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+  #toasts { left: 12px; right: 12px; top: 12px; bottom: auto; max-width: none; }
 }
 @media (max-width: 640px) {
   .attachment-card { width: min(310px, 76vw); }
@@ -7046,10 +7161,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <div class="slide-panel" id="groupPanel">
       <div class="slide-panel-inner">
         <input class="field" id="groupName" placeholder="Group name">
-        <input class="field" id="groupMembers" placeholder="Member keys, comma-separated (or leave empty)">
+        <div class="friend-picker" id="groupFriendPicker" hidden></div>
+        <input class="field" id="groupMembers" placeholder="Member keys, comma-separated (or select above)">
         <div style="display:flex;gap:8px">
-          <button class="btn btn-primary" style="flex:1" onclick="createGroup()">Create</button>
-          <button class="btn btn-secondary" onclick="toggleGroup()">Cancel</button>
+          <button type="button" class="btn btn-primary" style="flex:1" onclick="createGroup()">Create</button>
+          <button type="button" class="btn btn-secondary" onclick="toggleGroup()">Cancel</button>
         </div>
       </div>
     </div>
@@ -7558,9 +7674,18 @@ function handle(d) {
   } else if(d.type === 'notice') {
     if(d.level === 'error' && loadingMore) { loadingMore = false; renderMessages(); }
     if(d.level === 'error' && uploadInProgress) finishUpload();
+    if(d.level === 'error' && pendingFailedDraft && (Date.now() - pendingFailedDraft.ts) < 3500 && !$('text').value.trim()) {
+      $('text').value = pendingFailedDraft.text;
+      if(pendingFailedDraft.replyTo && !composerCtx) {
+        startReply(pendingFailedDraft.replyTo);
+      }
+      pendingFailedDraft = null;
+      onTextInput(true);
+    }
     toast(d.text, d.level || 'info');
   } else if(d.type === 'message') {
     if(!d.message || state.messages.some(m => m.msg_id === d.message.msg_id)) return;
+    if(d.message.direction === 'out') pendingFailedDraft = null;
     const keepAtBottom = isNearBottom();
     state.messages.push(d.message);
     const isSelected = selectedTarget &&
@@ -7654,6 +7779,7 @@ function handle(d) {
       m.body = d.body;
       m.edited_at = d.edited_at;
       patchMessageDom(d.msg_id, m) || renderMessages();
+      state.messages.filter(x => x.reply_to === d.msg_id).forEach(r => patchMessageDom(r.msg_id, r));
       renderSidebar();
     }
   } else if(d.type === 'message_tombstoned') {
@@ -7663,6 +7789,7 @@ function handle(d) {
       m.body = '';
       m.reactions = [];
       patchMessageDom(d.msg_id, m) || renderMessages();
+      state.messages.filter(x => x.reply_to === d.msg_id).forEach(r => patchMessageDom(r.msg_id, r));
       renderSidebar();
     }
   } else if(d.type === 'message_deleted') {
@@ -7739,29 +7866,29 @@ function renderSidebar() {
       el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No friends yet — add one above</div>';
       return;
     }
+    const allTimeline = [
+      ...(state.messages||[]),
+      ...(state.files||[]).map(fileMessage),
+    ].sort((a,b) => (a.timestamp-b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
     friends.forEach(f => {
       const online = state.online.includes(f.pubkey);
       const secure = !!(state.sessions&&state.sessions[f.pubkey]);
       const isSelected = selectedTarget?.type === 'friend' && selectedTarget?.id === f.pubkey;
-      const lastMsg = [...state.messages].reverse().find(m =>
+      const lastMsg = [...allTimeline].reverse().find(m =>
         !m.group_id && (m.sender_pubkey === f.pubkey || m.recipient_pubkey === f.pubkey)
       );
       const lastPreview = lastMsg
         ? (lastMsg.deleted_at ? '🚫 Message deleted'
+          : lastMsg._isFile ? `📎 ${lastMsg.body.slice(0,36)}`
           : (lastMsg.edited_at && lastMsg.body ? lastMsg.body.slice(0,40) + ' ✎' : lastMsg.body.slice(0,40)))
         : null;
       const unread = f.unread || 0;
-      const div = document.createElement('div');
-      div.className = 'friend-item' + (isSelected ? ' active' : '');
-      // Keyboard-operable: a mouse-only onclick used to leave the entire
-      // conversation list unreachable for keyboard and switch users.
-      div.setAttribute('role', 'button');
-      div.tabIndex = 0;
-      const open = () => selectFriend(f.pubkey);
-      div.onclick = open;
-      div.onkeydown = e => { if(e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'friend-item' + (isSelected ? ' active' : '');
+      btn.onclick = () => selectFriend(f.pubkey);
       const bgColor = avatarColor(f.pubkey);
-      div.innerHTML = `
+      btn.innerHTML = `
         <div class="friend-avatar">
           <div class="avatar-circle" style="background:${bgColor}">${esc(avatarLetter(f.nickname||f.pubkey))}</div>
           <div class="online-dot ${online?'online':''}"></div>
@@ -7776,13 +7903,13 @@ function renderSidebar() {
           ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
         </div>
       `;
-      el.appendChild(div);
+      el.appendChild(btn);
     });
   } else {
     const groups = state.groups.filter(g =>
       !q || (g.name||'').toLowerCase().includes(q)
     );
-    const addBtn = `<button onclick="toggleGroup()" title="Create group" aria-label="Create group">＋</button>`;
+    const addBtn = `<button type="button" onclick="toggleGroup()" title="Create group" aria-label="Create group">＋</button>`;
     const label = document.createElement('div');
     label.className = 'section-label';
     label.innerHTML = `<span>Groups (${groups.length})</span>${addBtn}`;
@@ -7791,22 +7918,24 @@ function renderSidebar() {
       el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No groups yet</div>';
       return;
     }
+    const allTimeline = [
+      ...(state.messages||[]),
+      ...(state.files||[]).map(fileMessage),
+    ].sort((a,b) => (a.timestamp-b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
     groups.forEach(g => {
       const isSelected = selectedTarget?.type === 'group' && selectedTarget?.id === g.group_id;
       const unread = groupUnread[g.group_id] || 0;
-      const lastMsg = [...state.messages].reverse().find(m => m.group_id === g.group_id);
+      const lastMsg = [...allTimeline].reverse().find(m => m.group_id === g.group_id);
       const lastPreview = lastMsg
         ? (lastMsg.deleted_at ? '🚫 Message deleted'
+          : lastMsg._isFile ? `${displayName(lastMsg.sender_pubkey)}: 📎 ${lastMsg.body.slice(0,28)}`
           : `${displayName(lastMsg.sender_pubkey)}: ${lastMsg.body.slice(0,32)}${lastMsg.edited_at ? ' ✎' : ''}`)
         : `${(g.members||[]).length} members`;
-      const div = document.createElement('div');
-      div.className = 'friend-item' + (isSelected ? ' active' : '');
-      div.setAttribute('role', 'button');
-      div.tabIndex = 0;
-      const open = () => selectGroup(g.group_id);
-      div.onclick = open;
-      div.onkeydown = e => { if(e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
-      div.innerHTML = `
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'friend-item' + (isSelected ? ' active' : '');
+      btn.onclick = () => selectGroup(g.group_id);
+      btn.innerHTML = `
         <div class="friend-avatar">
           <div class="avatar-circle" style="background:#1a3a8f">👥</div>
         </div>
@@ -7819,7 +7948,7 @@ function renderSidebar() {
           ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
         </div>
       `;
-      el.appendChild(div);
+      el.appendChild(btn);
     });
   }
 }
@@ -7898,22 +8027,33 @@ function messageRowHtml(m, opts) {
   const isOut = m.direction === 'out';
   const tombstone = !!m.deleted_at;
 
-  // Reactions ride the pairwise session with the message's author, so the
-  // transport target is the author — except your OWN group messages, where
-  // the author is you and no reaction route exists.
-  const reactionPeer = m.recipient_pubkey || m.sender_pubkey;
-  const canReact = !!reactionPeer && reactionPeer !== state.public_key && !tombstone;
+  // In 1:1 conversations, the remote peer is whichever side is NOT the local
+  // identity — both sender and receiver can react to either party's messages.
+  // In groups, reactions fan out to all group members (including for own messages).
+  const isGroupMsg = !!m.group_id;
+  const reactionPeer = isGroupMsg
+    ? ''
+    : (m.sender_pubkey === state.public_key
+      ? (m.recipient_pubkey || (selectedTarget?.type === 'friend' ? selectedTarget.id : ''))
+      : m.sender_pubkey);
+  const canReact = !m._isFile && !tombstone && (
+    isGroupMsg
+      ? state.groups.some(g => g.group_id === m.group_id)
+      : (!!reactionPeer && reactionPeer !== state.public_key)
+  );
 
   const reactMap = {};
   (m.reactions||[]).forEach(r => {
-    if(!reactMap[r.emoji]) reactMap[r.emoji] = {count:0, mine:false};
+    if(!reactMap[r.emoji]) reactMap[r.emoji] = {count:0, mine:false, peers:[]};
     reactMap[r.emoji].count++;
     if(r.peer_pubkey === state.public_key) reactMap[r.emoji].mine = true;
+    const who = displayName(r.peer_pubkey);
+    if(who && !reactMap[r.emoji].peers.includes(who)) reactMap[r.emoji].peers.push(who);
   });
   const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
     canReact
-      ? `<button type="button" class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')" aria-label="Toggle reaction ${emoji} (${info.count})">${emoji} ${info.count}</button>`
-      : `<span class="reaction-chip ${info.mine?'mine':''}">${emoji} ${info.count}</span>`
+      ? `<button type="button" class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}" aria-pressed="${info.mine?'true':'false'}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')" aria-label="Toggle reaction ${emoji} (${info.count})">${emoji} ${info.count}</button>`
+      : `<span class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}">${emoji} ${info.count}</span>`
   ).join('');
 
   const statusIcon = isOut ? msgStatus(m) : '';
@@ -7925,13 +8065,13 @@ function messageRowHtml(m, opts) {
   const canEdit = canReply && isOut;
   const canDeleteEverywhere = canReply && isOut;
   const toolsHtml = (m._isFile || (!canReact && !canReply)) ? '' : `<div class="msg-tools">
-    ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" title="React ${e}" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('') : ''}
+    ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button type="button" class="reaction-btn${reactMap[e]?.mine?' mine':''}" title="React ${e}" aria-label="React ${e}" aria-pressed="${reactMap[e]?.mine?'true':'false'}" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('') : ''}
     ${(canReact && canReply) ? '<span class="tools-sep"></span>' : ''}
-    ${canReply ? `<button class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">↩</button>` : ''}
-    ${canReply ? `<button class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">⧉</button>` : ''}
-    ${canEdit ? `<button class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">✏</button>` : ''}
-    ${canDeleteEverywhere ? `<button class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑</button>` : ''}
-    ${!m._isFile && !tombstone ? `<button class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">✕</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">↩</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">⧉</button>` : ''}
+    ${canEdit ? `<button type="button" class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">✏</button>` : ''}
+    ${canDeleteEverywhere ? `<button type="button" class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">🗑</button>` : ''}
+    ${!m._isFile && !tombstone ? `<button type="button" class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">✕</button>` : ''}
   </div>`;
 
   const editedLabel = (!m._isFile && m.edited_at && !tombstone)
@@ -8295,10 +8435,18 @@ function renderGroupManage() {
     </div>`;
   }).join('');
   if(isOwner) {
+    const candidates = (state.friends||[]).filter(f => !(g.members||[]).includes(f.pubkey) && !f.blocked);
+    const selectHtml = candidates.length
+      ? `<select class="field" id="addMemberSelect" aria-label="Choose a friend to add" style="flex:1">
+          <option value="">Select a friend to add…</option>
+          ${candidates.map(f => `<option value="${esc(f.pubkey)}">${esc(f.nickname || short(f.pubkey))}</option>`).join('')}
+        </select>`
+      : '';
     html += `
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <input class="field" id="addMemberKey" placeholder="Friend public key to add">
-        <button class="btn btn-primary btn-sm" onclick="addGroupMember('${esc(g.group_id)}')">Add member</button>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        ${selectHtml}
+        <input class="field" id="addMemberKey" placeholder="Or paste friend public key" style="flex:1;min-width:160px">
+        <button type="button" class="btn btn-primary btn-sm" onclick="addGroupMember('${esc(g.group_id)}')">Add member</button>
       </div>
     `;
   }
@@ -8306,10 +8454,14 @@ function renderGroupManage() {
 }
 
 function addGroupMember(group_id) {
+  const sel = $('addMemberSelect');
   const input = $('addMemberKey');
-  const pk = (input?.value||'').trim();
-  if(!pk) return;
-  if(send({type:'add_group_member', group_id, pubkey:pk}) && input) input.value = '';
+  const pk = ((sel?.value || '') || (input?.value || '')).trim();
+  if(!pk) { toast('Select a friend or paste a public key', 'warning'); return; }
+  if(send({type:'add_group_member', group_id, pubkey:pk})) {
+    if(input) input.value = '';
+    if(sel) sel.value = '';
+  }
 }
 
 async function removeGroupMember(group_id, pubkey) {
@@ -8497,15 +8649,45 @@ function toggleAdd() {
   if(p.classList.contains('open')) $('friendKey').focus();
 }
 
+function renderGroupFriendPicker() {
+  const picker = $('groupFriendPicker');
+  if(!picker) return;
+  const friends = (state.friends||[]).filter(f => !f.blocked);
+  if(!friends.length) {
+    picker.hidden = true;
+    picker.innerHTML = '';
+    return;
+  }
+  picker.hidden = false;
+  picker.innerHTML = friends.map(f => {
+    const checked = selectedTarget?.type === 'friend' && selectedTarget?.id === f.pubkey;
+    return `<label class="friend-picker-row">
+      <input type="checkbox" value="${esc(f.pubkey)}" ${checked ? 'checked' : ''}>
+      <span>${esc(f.nickname || short(f.pubkey))}</span>
+    </label>`;
+  }).join('');
+}
+
 function toggleGroup() {
   const p = $('groupPanel');
   p.classList.toggle('open');
-  if(p.classList.contains('open')) $('groupName').focus();
+  if(p.classList.contains('open')) {
+    renderGroupFriendPicker();
+    $('groupName').focus();
+  }
 }
 
 function addFriend() {
   const pk = $('friendKey').value.trim(), nick = $('friendName').value.trim();
-  if(!pk) return;
+  if(!pk) { toast('Enter a friend public key', 'warning'); return; }
+  if(!/^[0-9a-fA-F]+$/.test(pk) || (state.public_key && pk.length !== state.public_key.length)) {
+    toast('Invalid friend public key format', 'error');
+    return;
+  }
+  if(pk.toLowerCase() === (state.public_key||'').toLowerCase()) {
+    toast('You cannot add your own public key as a friend', 'error');
+    return;
+  }
   if(!send({type:'add_friend', pubkey:pk, nickname:nick||undefined})) return;
   $('friendKey').value=''; $('friendName').value='';
   $('addPanel').classList.remove('open');
@@ -8993,6 +9175,7 @@ function stopRingtone() {
   }
 }
 
+let pendingFailedDraft = null;
 function sendMessage() {
   const text = $('text').value.trim();
   if(!text || !selectedTarget) return;
@@ -9011,12 +9194,13 @@ function sendMessage() {
     return;
   }
   const replyTo = composerCtx && composerCtx.mode === 'reply' ? composerCtx.msgId : undefined;
+  pendingFailedDraft = {text, replyTo: replyTo || null, ts: Date.now()};
   if(selectedTarget.type === 'group') {
     sent = send({type:'send_message', group_id:selectedTarget.id, text, reply_to:replyTo});
   } else {
     sent = send({type:'send_message', pubkey:selectedTarget.id, text, reply_to:replyTo});
   }
-  if(!sent) return;
+  if(!sent) { pendingFailedDraft = null; return; }
   if(replyTo) cancelComposerContext();
   $('text').value = '';
   onTextInput();
@@ -9208,10 +9392,13 @@ async function importBackup() {
 function createGroup() {
   const name = $('groupName').value.trim();
   const raw = $('groupMembers').value.trim();
-  const members = raw ? raw.split(',').map(s=>s.trim()).filter(Boolean)
-    : (selectedTarget?.type==='friend' ? [selectedTarget.id] : []);
+  const checked = Array.from(document.querySelectorAll('#groupFriendPicker input:checked')).map(el => el.value);
+  const typed = raw ? raw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+  let members = Array.from(new Set([...checked, ...typed]));
+  if(!members.length && selectedTarget?.type === 'friend') members = [selectedTarget.id];
   if(!send({type:'create_group', name, members})) return;
   $('groupName').value=''; $('groupMembers').value='';
+  document.querySelectorAll('#groupFriendPicker input:checked').forEach(el => { el.checked = false; });
   $('groupPanel').classList.remove('open');
   setMode('groups');
 }
@@ -9224,18 +9411,27 @@ function markRead(msg_id, peer_pubkey, group_id='') {
 
 function loadMore() {
   if(loadingMore || !state.messages.length) return;
+  const oldestWithId = state.messages.find(m => Number.isInteger(m.id) && m.id > 0);
+  if(!oldestWithId) { state.has_more_messages = false; renderMessages(); return; }
   loadingMore = true;
   renderMessages();
-  send({type:'load_more_messages', before_id: state.messages[0].id});
+  send({type:'load_more_messages', before_id: oldestWithId.id});
 }
 
 function toggleReaction(msg_id, peer_pubkey, emoji) {
-  if(!peer_pubkey || peer_pubkey === state.public_key) return;
   const m = state.messages.find(x=>x.msg_id===msg_id);
-  if(!m) return;
+  if(!m || m._isFile || m.deleted_at) return;
   const existing = (m.reactions||[]).find(r=>r.peer_pubkey===state.public_key&&r.emoji===emoji);
   const action = existing ? 'remove' : 'add';
-  send({type:'reaction', pubkey:peer_pubkey, msg_id, emoji, action});
+  if(m.group_id) {
+    send({type:'reaction', group_id:m.group_id, msg_id, emoji, action});
+    return;
+  }
+  const peer = peer_pubkey || (m.sender_pubkey === state.public_key
+    ? (m.recipient_pubkey || (selectedTarget?.type === 'friend' ? selectedTarget.id : ''))
+    : m.sender_pubkey);
+  if(!peer || peer === state.public_key) return;
+  send({type:'reaction', pubkey:peer, msg_id, emoji, action});
 }
 
 // ─── Typing ───────────────────────────────────────────────────────────────────
@@ -9450,7 +9646,8 @@ wsConnect();
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def start_http(node: QuantumNode, host: str, port: int,
-               ui_ws_port: int = UI_WS_PORT, require_http_auth: bool = False) -> ThreadedHTTPServer:
+               ui_ws_port: int = UI_WS_PORT, require_http_auth: bool = False,
+               allow_iframe: bool = False) -> ThreadedHTTPServer:
     httpd = ThreadedHTTPServer((host, port), ChatHTTPHandler)
     # State lives on the server instance, not on the handler class: class
     # attributes are process-global, so starting a second node used to
@@ -9458,6 +9655,7 @@ def start_http(node: QuantumNode, host: str, port: int,
     httpd.node = node  # type: ignore[attr-defined]
     httpd.ui_ws_port = ui_ws_port  # type: ignore[attr-defined]
     httpd.require_http_auth = require_http_auth  # type: ignore[attr-defined]
+    httpd.allow_iframe = allow_iframe  # type: ignore[attr-defined]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -9536,11 +9734,14 @@ async def run_node(args: argparse.Namespace) -> None:
     httpd = None
     try:
         node.allow_remote_ui = args.allow_remote_ui
+        require_http_auth = bool(args.allow_remote_ui and not getattr(args, "no_http_auth", False))
+        allow_iframe = bool(getattr(args, "allow_iframe", False))
         ui_url = f"http://{args.http_host}:{args.http_port}"
-        if args.allow_remote_ui:
+        if require_http_auth:
             ui_url = f"{ui_url}?token={quote(node.ui_token)}"
         httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
-                           require_http_auth=args.allow_remote_ui)
+                           require_http_auth=require_http_auth,
+                           allow_iframe=allow_iframe)
     except BaseException:
         # A failed bind (port already in use is the classic case) used to
         # propagate before the cleanup below ever ran, leaving the node's
@@ -9564,14 +9765,15 @@ async def run_node(args: argparse.Namespace) -> None:
             # Headless or no default browser — not fatal, but the user asked
             # for a browser, so say why one didn't appear.
             print(f"Could not open a browser automatically ({exc}). Open {ui_url} manually.")
-    tasks = [
-        asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
-        asyncio.create_task(node.connect_signaling_loop()),
-    ]
-    if args.enable_direct:
-        tasks.append(asyncio.create_task(start_direct_peer(node, args.direct_host, args.direct_port)))
+    tasks = []
     if args.with_signaling:
         tasks.append(asyncio.create_task(start_signaling(args.signaling_host, args.signaling_port)))
+    tasks.extend([
+        asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
+        asyncio.create_task(node.connect_signaling_loop()),
+    ])
+    if args.enable_direct:
+        tasks.append(asyncio.create_task(start_direct_peer(node, args.direct_host, args.direct_port)))
 
     # Install SIGINT/SIGTERM handlers so Ctrl+C and `kill <pid>` shut the
     # node down cleanly: set the cooperative shutdown flag, cancel the
@@ -9670,7 +9872,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     signal_cmd.add_argument("--port", type=int, default=SIGNALING_PORT)
 
     parser.add_argument("--db", default=DB_FILE)
-    parser.add_argument("--signaling-url", default=DEFAULT_SIGNALING_URL)
+    parser.add_argument("--signaling-url", default=None)
     parser.add_argument("--with-signaling", action="store_true",
                         help="also start a local signaling server")
     parser.add_argument("--signaling-host", default=SIGNALING_HOST)
@@ -9681,6 +9883,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ui-ws-port", type=int, default=UI_WS_PORT)
     parser.add_argument("--allow-remote-ui", action="store_true",
                         help="allow binding HTTP/UI WebSocket to non-local interfaces and require token auth for non-root HTTP routes")
+    parser.add_argument("--no-http-auth", action="store_true",
+                        help="serve the HTML UI without an HTTP URL ?token= gate while keeping the UI WebSocket token-authenticated")
+    parser.add_argument("--allow-iframe", action="store_true",
+                        help="allow embedding the web UI inside an iframe (omits X-Frame-Options: DENY)")
     parser.add_argument("--enable-direct", action="store_true", default=True,
                         help="enable direct peer WebSocket listener and direct delivery fallback")
     parser.add_argument("--no-direct", dest="enable_direct", action="store_false")
@@ -9708,7 +9914,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="logging verbosity (default: WARNING)"
     )
     parser.set_defaults(open_browser=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.signaling_url is None:
+        if args.with_signaling:
+            sig_host = "127.0.0.1" if args.signaling_host in {"0.0.0.0", "::"} else args.signaling_host
+            args.signaling_url = f"ws://{sig_host}:{args.signaling_port}"
+        else:
+            args.signaling_url = DEFAULT_SIGNALING_URL
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
