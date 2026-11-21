@@ -301,7 +301,8 @@ def validate_direct_url(value: Any) -> str | None:
 
 
 def safe_filename(filename: Any) -> str:
-    name = os.path.basename(str(filename or "").replace("\\", "/")).strip() or "download.bin"
+    cleaned = "".join(ch for ch in str(filename or "") if ord(ch) >= 32 and ord(ch) != 127)
+    name = os.path.basename(cleaned.replace("\\", "/")).strip() or "download.bin"
     name = name[:MAX_FILENAME_CHARS]
     return name or "download.bin"
 
@@ -2005,6 +2006,18 @@ class QuantumNode:
             "url": f"/files/{row['file_id']}",
         }
 
+    def cancel_typing_timers(self) -> None:
+        for handle in list(self._typing_timers.values()):
+            with contextlib.suppress(Exception):
+                handle.cancel()
+        self._typing_timers.clear()
+
+    async def close(self) -> None:
+        self._shutting_down = True
+        self.cancel_typing_timers()
+        await self.close_direct_pool()
+        self.db.close()
+
     def state_payload(self) -> dict[str, Any]:
         msgs = self._with_message_metadata(self.db.recent_messages())
         has_more = bool(msgs) and self.db.has_messages_before(msgs[0]["id"])
@@ -2013,6 +2026,7 @@ class QuantumNode:
             "public_key": self.public_key,
             "fingerprint": key_fingerprint(self.public_key),
             "signaling_url": self.signaling_url,
+            "signaling_connected": getattr(self, "signaling_ws", None) is not None,
             "online": sorted(self.online_peers),
             "relay_alias": self.relay_alias,
             "direct_url": self.direct_url,
@@ -2228,7 +2242,8 @@ class QuantumNode:
                 LOG.debug("Closing pooled direct connection to %s failed: %s", url, exc)
 
     async def flush_outbox(self, peer_pubkey: str) -> None:
-        if not self.signaling_ws:
+        ws = self.signaling_ws
+        if not ws:
             return
         current_session = self.db.get_session(peer_pubkey)
         current_sid = current_session["session_id"] if current_session else None
@@ -2242,7 +2257,12 @@ class QuantumNode:
                 self.db.mark_outbox_sent(item["id"], status="expired")
                 expired += 1
                 continue
-            await self.signaling_ws.send(item["payload"])
+            try:
+                await ws.send(item["payload"])
+            except Exception as exc:
+                LOG.warning("Stopping outbox flush for %s after relay send error: %s",
+                            short_key(peer_pubkey), exc)
+                break
             self.db.mark_outbox_sent(item["id"])
         if expired:
             LOG.warning("Retired %d queued message(s) for %s: their session rekeyed while offline",
@@ -2626,16 +2646,12 @@ class QuantumNode:
         # plaintext in our database just because it decrypts cleanly.
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Chat message is empty or too large")
+        msg_id = validate_msg_id(payload.get("msg_id", ""), "Message id")
         group_id = payload.get("group_id")
         if group_id is not None:
             group_id = validate_file_id(str(group_id))
             if self.public_key not in self.db.group_members(group_id):
                 raise ValueError("Chat message for unknown group")
-        # Consume the replay counter only after every validation above
-        # succeeded — burning it first made a corrupted/oversized message
-        # unrepairable (the identical retransmission would trip duplicate
-        # detection instead of being processed).
-        self.db.mark_recv_counter(peer_pubkey, counter)
         # Reply references are attacker-controlled input on the receive side:
         # shape-check them, but do NOT require the quoted row to exist locally
         # (history windows differ between peers) — the UI renders a graceful
@@ -2644,8 +2660,13 @@ class QuantumNode:
         reply_to = str(reply_to).strip() if reply_to else None
         if reply_to is not None:
             reply_to = validate_msg_id(reply_to, "Reply target")
+        # Consume the replay counter only after every validation above
+        # succeeded — burning it first made a corrupted/oversized message
+        # unrepairable (the identical retransmission would trip duplicate
+        # detection instead of being processed).
+        self.db.mark_recv_counter(peer_pubkey, counter)
         inserted = self.db.save_message(
-            payload["msg_id"], peer_pubkey, text, "in",
+            msg_id, peer_pubkey, text, "in",
             recipient=self.public_key, group_id=group_id,
             delivered=True, status="delivered", reply_to=reply_to
         )
@@ -2654,15 +2675,15 @@ class QuantumNode:
                 self.db.increment_unread(peer_pubkey)
             ack = self.signed_payload("delivery_ack", {
                 "from": self.public_key, "to": peer_pubkey,
-                "msg_id": payload["msg_id"], "delivered_at": utc_ts(),
+                "msg_id": msg_id, "delivered_at": utc_ts(),
             })
             await self.send_relay(peer_pubkey, ack, queue_on_failure=True)
             await self.broadcast_ui({
                 "type": "message",
                 "message": {
-                    "msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey,
+                    "msg_id": msg_id, "sender_pubkey": peer_pubkey,
                     "recipient_pubkey": self.public_key,
-                    "group_id": payload.get("group_id"),
+                    "group_id": group_id,
                     "body": text, "direction": "in",
                     "timestamp": utc_ts(), "delivered": 1,
                     "status": "delivered", "reactions": [], "read_at": None,
@@ -2670,8 +2691,8 @@ class QuantumNode:
                 }
             })
             await self.sync_to_devices("chat_in", {
-                "msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey,
-                "recipient_pubkey": self.public_key, "group_id": payload.get("group_id"),
+                "msg_id": msg_id, "sender_pubkey": peer_pubkey,
+                "recipient_pubkey": self.public_key, "group_id": group_id,
                 "body": text, "delivered": True, "status": "delivered",
                 "reply_to": reply_to,
             })
@@ -3012,7 +3033,7 @@ class QuantumNode:
         # fan-out signs per member (a multicast member cannot replay a frame
         # addressed to someone else because the relay stamps `from` from the
         # authenticated connection), and 1:1 sends stamp the sole recipient.
-        for peer in targets:
+        async def deliver_delete(peer: str) -> None:
             try:
                 per_peer = self.signed_payload("message_delete", {
                     "from": self.public_key, "to": peer,
@@ -3021,6 +3042,9 @@ class QuantumNode:
                 await self.send_relay(peer, per_peer, queue_on_failure=True)
             except Exception as exc:
                 LOG.warning("Delete-for-everywhere fan-out to %s failed: %s", short_key(peer), exc)
+
+        if targets:
+            await asyncio.gather(*(deliver_delete(peer) for peer in targets))
 
         await self.broadcast_ui({
             "type": "message_tombstoned", "msg_id": msg_id, "deleted_at": deleted_at,
@@ -3132,10 +3156,14 @@ class QuantumNode:
                     "type": "message_tombstoned", "msg_id": msg_id, "deleted_at": deleted_at,
                 })
         elif event == "reaction":
-            msg_id = str(data.get("msg_id", ""))
-            peer = str(data.get("peer", ""))
-            emoji = str(data.get("emoji", ""))
+            msg_id = str(data.get("msg_id") or "").strip()
+            if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
+                raise ValueError("Invalid synced reaction target")
+            peer = validate_public_key(data.get("peer", ""))
+            emoji = validate_emoji(data.get("emoji"))
             action = str(data.get("action", "add"))
+            if action not in ("add", "remove"):
+                raise ValueError("Reaction action must be 'add' or 'remove'")
             if action == "add":
                 self.db.add_reaction(msg_id, peer, emoji, direction="out" if peer == self.public_key else "in")
             else:
@@ -3146,10 +3174,9 @@ class QuantumNode:
                 "emoji": emoji, "action": action,
             })
         elif event == "read_local":
-            peer = str(data.get("peer_pubkey", ""))
-            if peer:
-                self.db.clear_unread(peer)
-                await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
+            peer = validate_public_key(data.get("peer_pubkey", ""))
+            self.db.clear_unread(peer)
+            await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
 
     # ── Voice/video calls (WebRTC signaling over the authenticated relay) ───
 
@@ -3318,6 +3345,7 @@ class QuantumNode:
         no longer in group_members (e.g. just removed) are not sent the new
         key and lose the ability to read anything encrypted after this point,
         even though they may still hold prior epoch keys for old history."""
+        group_id = validate_file_id(group_id)
         if self.db.group_role(group_id, self.public_key) != "owner":
             raise ValueError("Only the group owner can rotate the group key")
         groups = {g["group_id"]: g for g in self.db.groups_for(self.public_key)}
@@ -3361,6 +3389,7 @@ class QuantumNode:
                         short_key(member), exc)
 
     async def remove_group_member(self, group_id: str, pubkey: str) -> None:
+        group_id = validate_file_id(group_id)
         if self.db.group_role(group_id, self.public_key) != "owner":
             raise ValueError("Only the group owner can remove members")
         if pubkey == self.public_key:
@@ -3373,6 +3402,7 @@ class QuantumNode:
 
     async def send_group_chat(self, group_id: str, text: str,
                               reply_to: str | None = None) -> None:
+        group_id = validate_file_id(group_id)
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
@@ -3439,6 +3469,7 @@ class QuantumNode:
 
     async def send_group_file(self, group_id: str, filename: str, encoded: str,
                               content_type: str | None = None) -> None:
+        group_id = validate_file_id(group_id)
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
@@ -3733,7 +3764,8 @@ class QuantumNode:
         meta = payload.get("meta", {})
         if meta.get("from") != peer_pubkey:
             raise ValueError("Group message sender mismatch")
-        group_id = str(meta.get("group_id", ""))
+        group_id = validate_file_id(str(meta.get("group_id", "")))
+        msg_id = validate_msg_id(meta.get("msg_id", ""), "Message id")
         if self.public_key not in self.db.group_members(group_id):
             raise ValueError("Group message for unknown group")
         group_key = self.db.get_group_key(group_id, int(meta.get("epoch", 0)))
@@ -3748,7 +3780,7 @@ class QuantumNode:
         reply_to = str(reply_to).strip() if reply_to else None
         if reply_to is not None:
             reply_to = validate_msg_id(reply_to, "Reply target")
-        inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
+        inserted = self.db.save_message(msg_id, peer_pubkey, text, "in", group_id=group_id,
                                         delivered=True, status="delivered", reply_to=reply_to)
         if inserted:
             # Group traffic deliberately does NOT bump the sender's 1:1 unread
@@ -3756,14 +3788,14 @@ class QuantumNode:
             # this friend, and a group message must not light it up (the UI
             # tracks per-group unread badges itself).
             await self.broadcast_ui({"type": "message", "message": {
-                "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
+                "msg_id": msg_id, "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": None, "group_id": group_id, "body": text,
                 "direction": "in", "timestamp": utc_ts(), "delivered": 1,
                 "status": "delivered", "reactions": [], "read_at": None,
                 "reply_to": reply_to, "edited_at": None, "deleted_at": None,
             }})
             await self.sync_to_devices("chat_in", {
-                "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
+                "msg_id": msg_id, "sender_pubkey": peer_pubkey,
                 "recipient_pubkey": self.public_key, "group_id": group_id,
                 "body": text, "delivered": True, "status": "delivered",
                 "reply_to": reply_to,
@@ -3856,7 +3888,11 @@ class QuantumNode:
                     self.crypto.derive_message_key(session_key, peer_pubkey, self.public_key, int(data.get("counter", 0)), "group-key"),
                     payload["packet"], canonical_json(data)
                 )
+                if len(group_key) != 32:
+                    raise ValueError("Invalid group key length")
                 epoch = int(data.get("epoch", 1))
+                if epoch < 1:
+                    raise ValueError("Invalid group epoch")
                 current = self.db.get_group_key(group_id)
                 redundant = False
                 if current is not None and epoch <= int(current["epoch"]):
@@ -4051,7 +4087,7 @@ class QuantumNode:
                         asyncio.ensure_future(self._handshake_for_group_keys(member))
             await self.broadcast_ui(self.state_payload())
         elif typ == "add_group_member":
-            group_id = str(msg["group_id"])
+            group_id = validate_file_id(str(msg.get("group_id", "")))
             if self.db.group_role(group_id, self.public_key) != "owner":
                 raise ValueError("Only the group owner can add members")
             member = self.validate_peer_key(msg["pubkey"])
@@ -4060,9 +4096,10 @@ class QuantumNode:
             self.db.add_group_member(group_id, member)
             await self.rotate_group_key(group_id)
         elif typ == "remove_group_member":
-            await self.remove_group_member(str(msg["group_id"]), self.validate_peer_key(msg["pubkey"]))
+            await self.remove_group_member(validate_file_id(str(msg.get("group_id", ""))),
+                                           self.validate_peer_key(msg["pubkey"]))
         elif typ == "rotate_group_key":
-            await self.rotate_group_key(str(msg["group_id"]))
+            await self.rotate_group_key(validate_file_id(str(msg.get("group_id", ""))))
         elif typ == "export_backup":
             passphrase = str(msg.get("passphrase") or "")
             if len(passphrase) < 8:
@@ -4205,6 +4242,7 @@ class QuantumNode:
                         # register that can only be rejected.
                         raise ValueError("Signaling server did not issue a registration challenge")
                     try:
+                        await self.broadcast_ui({"type": "signaling_status", "connected": True})
                         await self.broadcast_ui({
                             "type": "notice", "level": "success",
                             "text": "Connected to signaling server"
@@ -4224,6 +4262,8 @@ class QuantumNode:
                     # to the outbox during the backoff window instead of
                     # raising ConnectionClosed into a dead socket.
                     self.signaling_ws = None
+                    if not getattr(self, "_shutting_down", False):
+                        await self.broadcast_ui({"type": "signaling_status", "connected": False})
                     # A relay that accept-then-closes in a loop (overload,
                     # crash-looping deploy) used to produce a hot reconnect
                     # spin: the exception path backs off, this one didn't.
@@ -4251,6 +4291,7 @@ class QuantumNode:
                 import random as _random
                 jitter = _random.uniform(0, 0.3 * delay)
                 wait = delay + jitter
+                await self.broadcast_ui({"type": "signaling_status", "connected": False})
                 await self.broadcast_ui({
                     "type": "notice", "level": "warning",
                     "text": f"Disconnected from relay — reconnecting in {wait:.1f}s…"
@@ -4297,7 +4338,10 @@ class QuantumNode:
                 self.online_peers = set(raw_peers) - {self.public_key}
             await self.broadcast_ui(self.state_payload())
             for peer in list(self.online_peers):
-                await self.flush_outbox(peer)
+                try:
+                    await self.flush_outbox(peer)
+                except Exception as exc:
+                    LOG.warning("Failed to flush outbox for %s: %s", short_key(peer), exc)
         elif msg.get("type") == "relay":
             await self.handle_relay_payload(msg["from"], msg["payload"])
         elif msg.get("type") == "error":
@@ -4318,6 +4362,7 @@ class SignalingServer:
         self.clients: dict[str, set[Any]] = {}
         self.aliases: dict[str, str] = {}
         self.peer_meta: dict[str, dict[str, Any]] = {}
+        self.socket_meta: dict[Any, dict[str, Any]] = {}
         self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), timeout=30.0, check_same_thread=False)
         self.relay_db.execute("PRAGMA journal_mode=WAL")
         self.relay_db.execute("PRAGMA synchronous=NORMAL")
@@ -4331,8 +4376,30 @@ class SignalingServer:
         # own once one identity can hold several simultaneous connections —
         # an attacker who registers many device sockets under one signed
         # identity could otherwise multiply their effective send rate. This
-        # tracks an aggregate ceiling per pubkey across all of its sockets.
+        # Multi-device: tracks aggregate ceiling per pubkey across all sockets.
         self.pubkey_rate: dict[str, list[int]] = {}
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.relay_db.close()
+
+    def _refresh_peer_meta(self, pubkey: str) -> None:
+        sockets = self.clients.get(pubkey)
+        if not sockets:
+            self.peer_meta.pop(pubkey, None)
+            return
+        relay_alias = None
+        direct_url = None
+        for sock in sockets:
+            meta = self.socket_meta.get(sock) or {}
+            if relay_alias is None and meta.get("relay_alias"):
+                relay_alias = meta["relay_alias"]
+            if direct_url is None and meta.get("direct_url"):
+                direct_url = meta["direct_url"]
+        self.peer_meta[pubkey] = {
+            "relay_alias": relay_alias or hashlib.sha256(pubkey.encode()).hexdigest(),
+            "direct_url": direct_url,
+        }
 
     def _rate_ok(self, ws: Any, limit: int = 120, window: int = 60) -> bool:
         now = utc_ts()
@@ -4500,8 +4567,9 @@ class SignalingServer:
                         # can stay online at the same time as the first (see
                         # 'Multi-device support').
                         self.clients.setdefault(pubkey, set()).add(ws)
+                        self.socket_meta[ws] = {"relay_alias": relay_alias, "direct_url": direct_url}
                         self.aliases[relay_alias] = pubkey
-                        self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
+                        self._refresh_peer_meta(pubkey)
                         await self._drain_offline_queue(ws, pubkey)
                         await self.broadcast_peers()
                     elif msg.get("type") == "relay":
@@ -4583,6 +4651,7 @@ class SignalingServer:
             LOG.debug("Signaling connection closed: %s", exc)
         finally:
             self.rate.pop(ws, None)
+            self.socket_meta.pop(ws, None)
             if pubkey and pubkey in self.clients:
                 sockets = self.clients[pubkey]
                 sockets.discard(ws)
@@ -4594,9 +4663,13 @@ class SignalingServer:
                         if owner == pubkey:
                             self.aliases.pop(alias, None)
                     await self.broadcast_peers()
-                # If other device sockets are still registered for this
-                # identity, leave peer_meta/aliases/online-peers state alone
-                # — the identity as a whole is still online.
+                else:
+                    # Recompute aggregated peer_meta so a departing device that
+                    # advertised direct_url doesn't leave a stale endpoint.
+                    prev_meta = self.peer_meta.get(pubkey)
+                    self._refresh_peer_meta(pubkey)
+                    if self.peer_meta.get(pubkey) != prev_meta:
+                        await self.broadcast_peers()
 
 
 # ─── HTTP Server ──────────────────────────────────────────────────────────────
@@ -5681,6 +5754,10 @@ body {
   overflow-wrap: break-word;
   transition: box-shadow 0.2s;
 }
+.msg-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .msg-group.in .msg-bubble {
   background: var(--in-bg);
   backdrop-filter: blur(14px) saturate(1.1);
@@ -5705,12 +5782,15 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  width: 100%;
   max-width: 420px;
   padding: 5px 10px 6px;
   margin: -1px 0 7px;
+  border: 0;
   border-left: 3px solid var(--accent);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.26);
+  color: inherit;
   cursor: pointer;
   transition: background 0.15s, transform 0.15s;
   text-align: left;
@@ -5836,15 +5916,21 @@ body {
 }
 @media (hover: none), (max-width: 768px) {
   .msg-tools {
+    display: none;
     opacity: 1; visibility: visible; transform: none;
     position: static;
     margin: 0 0 8px;
     padding: 3px 4px;
     flex-wrap: wrap;
+    width: fit-content;
     max-width: 100%;
-    background: rgba(7, 12, 22, 0.42);
+    background: rgba(7, 12, 22, 0.55);
     box-shadow: none;
     align-self: flex-start;
+  }
+  .msg-group.tools-open .msg-tools,
+  .msg-bubble:focus-within .msg-tools {
+    display: flex;
   }
   .msg-group.out .msg-tools { align-self: flex-end; }
   .msg-tools .reaction-btn,
@@ -5998,6 +6084,7 @@ body {
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--glass-border);
+  color: var(--text1);
   font-size: 13px;
   cursor: pointer;
   transition: all 0.2s;
@@ -6584,7 +6671,7 @@ body {
   background: rgba(255, 93, 125, 0.2);
   box-shadow: 0 4px 14px rgba(255, 93, 125, 0.2);
 }
-.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 9px; }
+.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 9px; line-height: 1.25; min-height: 32px; }
 
 /* ── Inputs ────────────────────────────────────────────────────────────── */
 .field {
@@ -6693,9 +6780,9 @@ body {
 .drop-overlay.active { display: flex; animation: fadeIn 0.2s; }
 
 /* ── Header menu ───────────────────────────────────────────────────────── */
-.chat-header-actions { min-width: 0; flex-wrap: nowrap; }
-.header-menu { position: relative; }
-.header-menu > summary { list-style: none; cursor: pointer; }
+.chat-header-actions { min-width: 0; flex-wrap: nowrap; flex-shrink: 0; }
+.header-menu { position: relative; display: inline-flex; align-items: center; }
+.header-menu > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
 .header-menu > summary::-webkit-details-marker { display: none; }
 .header-menu-items {
   position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; min-width: 200px; padding: 6px;
@@ -6749,6 +6836,72 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   100% { box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38); }
 }
 
+/* Scroll-to-bottom button, search scope & safety comparison */
+#main { position: relative; }
+.scroll-bottom-btn {
+  position: fixed;
+  right: 326px;
+  bottom: 108px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--glass-border-hover);
+  background: rgba(15, 21, 33, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  z-index: 20;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.scroll-bottom-btn:hover {
+  border-color: var(--accent);
+  background: var(--s3);
+  transform: translateY(-2px);
+}
+.scroll-bottom-btn[hidden] { display: none; }
+@media (max-width: 1080px) {
+  .scroll-bottom-btn { right: 20px; }
+}
+.search-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text2);
+  margin-bottom: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.search-scope-row input { accent-color: var(--accent); cursor: pointer; }
+.safety-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.safety-box {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--glass-border);
+}
+.safety-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text3);
+  margin-bottom: 4px;
+}
+.safety-fp {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--accent);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
 /* ── Responsive ────────────────────────────────────────────────────────── */
 @media (max-width: 960px) {
   #panel { display: none; }
@@ -6778,31 +6931,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 @media (max-width: 768px) {
   #sidebar { width: 300px; min-width: 300px; }
 }
-@media (max-width: 640px) {
-  #sidebar { width: 72px; min-width: 72px; }
-  .friend-info, .id-key, .search-wrap, .mode-tabs,
-  .section-label span, .friend-name, .unread-badge { display: none; }
-  .friend-avatar { margin: 0 auto; }
-  .sidebar-head .conn-badge span { display: none; }
-  .app-logo h1, .app-logo .ver { display: none; }
-  .app-logo { justify-content: center; }
-  .section-label { justify-content: center; padding: 12px 0; }
-  .id-card { padding: 12px; }
-  .id-card-head { justify-content: center; }
-  .id-card-head > div:last-child { display: none; }
-  .composer { padding: 12px; }
-  .composer-context { padding: 0 12px 6px; }
-  .messages-wrap { padding-left: 12px; padding-right: 12px; }
-  .msg-bubble { max-width: 88%; }
-  .attachment-card { width: min(310px, 76vw); }
-  .reply-quote { max-width: 200px; }
-  .reply-quote .rq-body { max-width: 190px; }
-}
 @media (max-width: 720px) {
   body { overflow: hidden; }
   #app { position: relative; }
   #sidebar { width: 100%; min-width: 0; border-right: 0; }
-  #main { display: none; width: 100%; }
+  #main { display: none; width: 100%; min-width: 0; overflow: hidden; }
   #app.mobile-chat-open #sidebar { display: none; }
   #app.mobile-chat-open #main { display: flex; }
   .sidebar-head { padding: 16px; }
@@ -6813,25 +6946,32 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   .friend-info { display: block; }
   .friend-name, .search-wrap { display: block; }
   .section-label span { display: inline; }
-  .section-label { justify-content: space-between; }
+  .section-label { justify-content: space-between; padding-left: 16px; padding-right: 16px; }
   .mode-tabs { display: flex; }
-  .unread-badge { display: block; }
-  .app-logo h1, .app-logo .ver, .sidebar-head .conn-badge span { display: block; }
-  .id-card-head > div:last-child { display: block; }
-  .section-label { padding-left: 16px; padding-right: 16px; }
-  .chat-header { padding: 12px 14px; gap: 10px; min-height: 64px; }
-  .mobile-back { display: inline-flex; flex: 0 0 auto; }
-  .chat-header-actions .btn:not(.mobile-primary):not(.mobile-info-btn) { display: none; }
-  .header-menu { display: block; }
-  .chat-header-actions .header-menu > summary { display: inline-flex; }
+  .unread-badge { display: flex; }
+  .chat-header { padding: 10px 10px; gap: 6px; min-height: 58px; max-width: 100%; }
+  .chat-header-avatar { width: 34px; height: 34px; font-size: 14px; }
+  .mobile-back { display: inline-flex; flex: 0 0 auto; padding: 4px 6px; }
+  .chat-header-actions { gap: 4px; flex-shrink: 0; }
+  .chat-header-actions > .btn, .chat-header-actions .header-menu > summary { padding: 5px 8px; font-size: 12px; min-height: 30px; }
+  .chat-header-actions > .btn:not(.mobile-primary):not(.mobile-info-btn) { display: none; }
+  .header-menu { display: inline-flex; }
+  .chat-header-actions .header-menu > summary { display: inline-flex !important; }
   .chat-header-actions .header-menu-items .btn { display: flex; }
   .messages-wrap { padding: 16px 12px; }
   .msg-bubble { max-width: 88%; }
   .composer { padding: 10px 12px 12px; }
+  .composer-context { padding: 0 12px 6px; }
   .composer-inner { padding: 8px 10px; }
   #text { font-size: 16px; }
   .drop-overlay { border-radius: 12px; }
+  .scroll-bottom-btn { right: 14px; bottom: 98px; }
   #toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+}
+@media (max-width: 640px) {
+  .attachment-card { width: min(310px, 76vw); }
+  .reply-quote { max-width: 240px; }
+  .reply-quote .rq-body { max-width: 220px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -6863,7 +7003,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     </div>
 
     <!-- Identity card -->
-    <div class="id-card" onclick="toggleId()">
+    <div class="id-card" id="idCard" role="button" tabindex="0" aria-expanded="false" aria-controls="myKey"
+      onclick="toggleId()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleId()}">
       <div class="id-card-head">
         <div class="id-avatar">⚛</div>
         <div>
@@ -6942,6 +7083,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
     <!-- Typing indicator -->
     <div id="typing-indicator"></div>
     <div id="recIndicator"></div>
+
+    <button type="button" class="scroll-bottom-btn" id="scrollBottomBtn" hidden
+      title="Scroll to latest messages" aria-label="Scroll to latest messages"
+      onclick="scrollBottom(true)">↓</button>
 
     <!-- Drop overlay -->
     <div class="drop-overlay" id="dropOverlay">
@@ -7048,12 +7193,66 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
   <div class="modal">
     <h2 id="searchModalTitle">Search messages</h2>
     <p class="hint" id="searchScopeHint">Searching this conversation.</p>
+    <label class="search-scope-row">
+      <input type="checkbox" id="searchAllScope" onchange="updateSearchScopeHint();runSearch()">
+      Search across all conversations
+    </label>
     <input class="field" id="searchInput" type="text" placeholder="Search…"
            aria-label="Search message text" oninput="debounceSearch()"
            onkeydown="if(event.key==='Enter') runSearch()">
     <div id="searchResults" class="search-results" aria-live="polite"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" style="flex:1" onclick="closeSearchModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Safety fingerprint comparison modal -->
+<div class="modal-overlay" id="safetyModal" role="dialog" aria-modal="true" aria-labelledby="safetyModalTitle">
+  <div class="modal">
+    <h2 id="safetyModalTitle">Safety number verification</h2>
+    <p class="hint">
+      Compare these fingerprints over a trusted channel (in person or voice call) to verify there is no person-in-the-middle interception.
+    </p>
+    <div class="safety-grid">
+      <div class="safety-box">
+        <div class="safety-label">Your fingerprint</div>
+        <div class="safety-fp" id="safetyMyFp">—</div>
+      </div>
+      <div class="safety-box">
+        <div class="safety-label" id="safetyPeerLabel">Friend fingerprint</div>
+        <div class="safety-fp" id="safetyPeerFp">—</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" style="flex:1" onclick="closeSafetyModal()">Cancel</button>
+      <button class="btn btn-primary" style="flex:1" id="safetyVerifyBtn" onclick="confirmSafetyVerify()">Mark Verified</button>
+    </div>
+  </div>
+</div>
+
+<!-- In-app confirmation modal -->
+<div class="modal-overlay" id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+  <div class="modal">
+    <h2 id="confirmModalTitle">Confirm</h2>
+    <p class="hint" id="confirmModalText"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" style="flex:1" id="confirmModalCancel" onclick="resolveConfirmModal(false)">Cancel</button>
+      <button class="btn btn-primary" style="flex:1" id="confirmModalOk" onclick="resolveConfirmModal(true)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- In-app prompt modal -->
+<div class="modal-overlay" id="promptModal" role="dialog" aria-modal="true" aria-labelledby="promptModalTitle">
+  <div class="modal">
+    <h2 id="promptModalTitle">Edit value</h2>
+    <p class="hint" id="promptModalHint"></p>
+    <input class="field" id="promptModalInput" type="text"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();resolvePromptModal(true);}">
+    <div class="modal-actions">
+      <button class="btn btn-secondary" style="flex:1" onclick="resolvePromptModal(false)">Cancel</button>
+      <button class="btn btn-primary" style="flex:1" id="promptModalOk" onclick="resolvePromptModal(true)">Save</button>
     </div>
   </div>
 </div>
@@ -7100,7 +7299,7 @@ const MAX_FILE_BYTES_UI = 512*1024*1024;
 const MAX_TEXT_BYTES_UI = 64*1024;
 
 let state = {
-  public_key: '', fingerprint: '', signaling_url: '',
+  public_key: '', fingerprint: '', signaling_url: '', signaling_connected: false,
   online: [], friends: [], groups: [], messages: [],
   files: [], sessions: {}, has_more_messages: false,
   storage_bytes: 0, max_storage_bytes: 0,
@@ -7136,7 +7335,7 @@ let uploadInProgress = false;
 let pendingUploadName = '';
 let loadingMore = false;
 let searchDebounceTimer = null;
-// Composer context: null, or {mode:'reply', msgId, peer} / {mode:'edit', msgId, peer}
+// Composer context: null, or {mode:'reply', msgId, peer} / {mode:'edit', msgId, peer, draftBeforeEdit}
 // for the bar shown above the composer while composing a reply or an edit.
 let composerCtx = null;
 // Call state: at most one call in flight at a time in this UI.
@@ -7300,8 +7499,13 @@ function toggleInfoPanel(force) {
 
 function setConn(connected, retrySeconds=0) {
   const b = $('connBadge'), t = $('connText');
+  const relayUp = state.signaling_connected !== false;
   b.className = 'conn-badge' + (connected ? ' connected' : '');
-  t.textContent = connected ? 'connected' : (retrySeconds ? `retrying in ${retrySeconds}s` : 'disconnected');
+  if(!connected) {
+    t.textContent = retrySeconds ? `retrying in ${retrySeconds}s` : 'disconnected';
+  } else {
+    t.textContent = relayUp ? 'connected' : 'relay reconnecting…';
+  }
   updateSendBtn();
 }
 
@@ -7332,6 +7536,10 @@ function handle(d) {
     saveGroupUnread();
     reconcileSelection();
     render();
+    setConn(ws?.readyState === WebSocket.OPEN);
+  } else if(d.type === 'signaling_status') {
+    state.signaling_connected = !!d.connected;
+    setConn(ws?.readyState === WebSocket.OPEN);
   } else if(d.type === 'friends') {
     state.friends = d.friends;
     renderSidebar();
@@ -7495,7 +7703,9 @@ function render() {
 
 function dedupeMessages(messages) {
   const seen = new Set();
-  return messages.filter(m => m && m.msg_id && !seen.has(m.msg_id) && seen.add(m.msg_id));
+  return messages
+    .filter(m => m && m.msg_id && !seen.has(m.msg_id) && seen.add(m.msg_id))
+    .sort((a,b) => (a.timestamp-b.timestamp) || ((a.id ?? 1e15) - (b.id ?? 1e15)));
 }
 
 function reconcileSelection() {
@@ -7584,6 +7794,11 @@ function renderSidebar() {
     groups.forEach(g => {
       const isSelected = selectedTarget?.type === 'group' && selectedTarget?.id === g.group_id;
       const unread = groupUnread[g.group_id] || 0;
+      const lastMsg = [...state.messages].reverse().find(m => m.group_id === g.group_id);
+      const lastPreview = lastMsg
+        ? (lastMsg.deleted_at ? '🚫 Message deleted'
+          : `${displayName(lastMsg.sender_pubkey)}: ${lastMsg.body.slice(0,32)}${lastMsg.edited_at ? ' ✎' : ''}`)
+        : `${(g.members||[]).length} members`;
       const div = document.createElement('div');
       div.className = 'friend-item' + (isSelected ? ' active' : '');
       div.setAttribute('role', 'button');
@@ -7597,9 +7812,12 @@ function renderSidebar() {
         </div>
         <div class="friend-info">
           <div class="friend-name">${esc(g.name)}</div>
-          <div class="friend-preview">${(g.members||[]).length} members</div>
+          <div class="friend-preview">${esc(lastPreview)}</div>
         </div>
-        ${unread ? `<div class="friend-meta"><div class="unread-badge">${unread}</div></div>` : ''}
+        <div class="friend-meta">
+          ${unread ? `<div class="unread-badge">${unread}</div>` : ''}
+          ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
+        </div>
       `;
       el.appendChild(div);
     });
@@ -7659,18 +7877,18 @@ function replyQuoteHtml(m) {
   if(!m.reply_to) return '';
   const quoted = findMessageAny(m.reply_to);
   if(!quoted) {
-    return `<div class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+    return `<button type="button" class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
       <span class="rq-missing">Original message not loaded</span>
-    </div>`;
+    </button>`;
   }
   const isFile = !!quoted._isFile;
   const body = isFile ? `📎 ${quoted._file?.filename || 'Attachment'}` : (quoted.body || '');
   const snippet = body.length > 140 ? body.slice(0, 140) + '…' : body;
   const deleted = quoted.deleted_at;
-  return `<div class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+  return `<button type="button" class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
     <span class="rq-sender">${esc(displayName(quoted.sender_pubkey))}</span>
     <span class="rq-body">${deleted ? '<i>Message was deleted</i>' : esc(snippet)}</span>
-  </div>`;
+  </button>`;
 }
 
 // One message row. Used by the full timeline render AND the live-append fast
@@ -7694,7 +7912,7 @@ function messageRowHtml(m, opts) {
   });
   const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
     canReact
-      ? `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')">${emoji} ${info.count}</span>`
+      ? `<button type="button" class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')" aria-label="Toggle reaction ${emoji} (${info.count})">${emoji} ${info.count}</button>`
       : `<span class="reaction-chip ${info.mine?'mine':''}">${emoji} ${info.count}</span>`
   ).join('');
 
@@ -7725,7 +7943,7 @@ function messageRowHtml(m, opts) {
   } else if(m._isFile) {
     bodyHtml = renderAttachment(m);
   } else {
-    bodyHtml = `<span>${linkify(esc(m.body))}</span>${editedLabel}`;
+    bodyHtml = `<span class="msg-text">${linkify(esc(m.body))}</span>${editedLabel}`;
   }
 
   const sameGroup = m.sender_pubkey === lastSender;
@@ -7741,7 +7959,7 @@ function messageRowHtml(m, opts) {
   return `
     <div class="msg-group ${isOut?'out':'in'}${live?' live':''}${sameGroup?' same-sender':''}" data-msg-id="${esc(m.msg_id)}" data-sender="${esc(m.sender_pubkey)}" data-ts="${m.timestamp}">
       ${showSender ? `<div class="msg-sender" title="${esc(m.sender_pubkey)}" style="color:${senderColor(m.sender_pubkey)}">${esc(displayName(m.sender_pubkey))}</div>` : ''}
-      <div class="msg-bubble${tombstone?' tombstone':''}">
+      <div class="msg-bubble${tombstone?' tombstone':''}" onclick="toggleMsgTools(this, event)">
         ${toolsHtml}
         ${replyQuoteHtml(m)}
         ${bodyHtml}
@@ -7755,6 +7973,16 @@ function messageRowHtml(m, opts) {
       </div>
     </div>
   `;
+}
+
+function toggleMsgTools(bubbleEl, ev) {
+  if(!bubbleEl || !matchMedia('(hover: none), (max-width: 768px)').matches) return;
+  if(ev && ev.target && ev.target.closest('button, a, audio, video, img, .msg-tools')) return;
+  const grp = bubbleEl.closest('.msg-group');
+  if(!grp) return;
+  const wasOpen = grp.classList.contains('tools-open');
+  document.querySelectorAll('.msg-group.tools-open').forEach(g => g.classList.remove('tools-open'));
+  if(!wasOpen) grp.classList.add('tools-open');
 }
 
 function renderMessages() {
@@ -7999,6 +8227,7 @@ function renderChatHeader() {
         <details class="header-menu">
           <summary class="btn btn-secondary btn-sm" title="Conversation actions" aria-label="Conversation actions">&#8943;</summary>
           <div class="header-menu-items">
+            <button class="btn btn-secondary btn-sm" onclick="connectPeer()">Rekey session</button>
             <button class="btn btn-secondary btn-sm" onclick="renameFriend()">Rename</button>
             ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Remove verification</button>`:`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(true)">Verify safety number</button>`}
             ${f?.blocked
@@ -8077,18 +8306,19 @@ function renderGroupManage() {
 }
 
 function addGroupMember(group_id) {
-  const pk = ($('addMemberKey')?.value||'').trim();
+  const input = $('addMemberKey');
+  const pk = (input?.value||'').trim();
   if(!pk) return;
-  send({type:'add_group_member', group_id, pubkey:pk});
+  if(send({type:'add_group_member', group_id, pubkey:pk}) && input) input.value = '';
 }
 
-function removeGroupMember(group_id, pubkey) {
-  if(!confirm('Remove this member and rotate the group key? They will lose access to future messages.')) return;
+async function removeGroupMember(group_id, pubkey) {
+  if(!await showConfirm('Remove group member', 'Remove this member and rotate the group key? They will lose access to future messages.', {confirmText:'Remove', danger:true})) return;
   send({type:'remove_group_member', group_id, pubkey});
 }
 
-function rotateGroupKey(group_id) {
-  if(!confirm('Generate a new group key and redistribute it to current members?')) return;
+async function rotateGroupKey(group_id) {
+  if(!await showConfirm('Rotate group key', 'Generate a new group key and redistribute it to current members?', {confirmText:'Rotate key'})) return;
   send({type:'rotate_group_key', group_id});
 }
 
@@ -8158,12 +8388,76 @@ function setMode(m) {
   updateSendBtn();
 }
 
+// ─── In-app dialogs (never native alert/confirm/prompt) ──────────────────────
+let confirmResolve = null;
+function showConfirm(title, text, opts={}) {
+  if(confirmResolve) confirmResolve(false);
+  $('confirmModalTitle').textContent = title || 'Confirm';
+  $('confirmModalText').textContent = text || '';
+  const okBtn = $('confirmModalOk');
+  okBtn.textContent = opts.confirmText || 'Confirm';
+  okBtn.className = 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary');
+  $('confirmModal').classList.add('open');
+  return new Promise(resolve => {
+    confirmResolve = resolve;
+    setTimeout(() => okBtn.focus(), 30);
+  });
+}
+function resolveConfirmModal(accepted) {
+  $('confirmModal').classList.remove('open');
+  const fn = confirmResolve;
+  confirmResolve = null;
+  if(fn) fn(!!accepted);
+}
+
+let promptResolve = null;
+function showPrompt(title, hint, defaultVal='', okText='Save') {
+  if(promptResolve) promptResolve(null);
+  $('promptModalTitle').textContent = title || 'Input';
+  $('promptModalHint').textContent = hint || '';
+  $('promptModalOk').textContent = okText;
+  const input = $('promptModalInput');
+  input.value = defaultVal ?? '';
+  $('promptModal').classList.add('open');
+  return new Promise(resolve => {
+    promptResolve = resolve;
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
+}
+function resolvePromptModal(accepted) {
+  $('promptModal').classList.remove('open');
+  const val = $('promptModalInput').value;
+  const fn = promptResolve;
+  promptResolve = null;
+  if(fn) fn(accepted ? val : null);
+}
+
+let safetyPeer = null;
+function openSafetyModal(pubkey) {
+  const f = state.friends.find(x=>x.pubkey===pubkey);
+  safetyPeer = pubkey;
+  $('safetyMyFp').textContent = state.fingerprint || short(state.public_key) || '—';
+  $('safetyPeerLabel').textContent = `${f?.nickname || short(pubkey)} fingerprint`;
+  $('safetyPeerFp').textContent = f?.fingerprint || pubkey;
+  $('safetyModal').classList.add('open');
+}
+function closeSafetyModal() {
+  $('safetyModal').classList.remove('open');
+  safetyPeer = null;
+}
+function confirmSafetyVerify() {
+  const peer = safetyPeer;
+  closeSafetyModal();
+  if(peer) send({type:'verify_friend', pubkey:peer, verified:true});
+}
+
 // ─── Actions ──────────────────────────────────────────────────────────────────
 function toggleId() {
-  const k = $('myKey'), a = $('idActions');
+  const k = $('myKey'), a = $('idActions'), card = $('idCard');
   const show = !k.classList.contains('visible');
   k.classList.toggle('visible', show);
   a.style.display = show ? 'flex' : 'none';
+  if(card) card.setAttribute('aria-expanded', show ? 'true' : 'false');
 }
 
 function copyTextToClipboard(text, successMsg) {
@@ -8218,8 +8512,8 @@ function addFriend() {
   setMode('friends');
 }
 
-function removeFriend(pubkey) {
-  if(!confirm('Remove this friend and their local session?')) return;
+async function removeFriend(pubkey) {
+  if(!await showConfirm('Remove friend', 'Remove this friend and their local session?', {confirmText:'Remove', danger:true})) return;
   if(!send({type:'remove_friend', pubkey})) return;
   cancelComposerContext();
   selectedTarget = null;
@@ -8235,29 +8529,25 @@ function connectPeer() {
 
 function verifyFriend(verified) {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
-  const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
-  if(verified && !confirm(`Verify this safety fingerprint?
-
-${f?.fingerprint||selectedTarget.id}`)) return;
-  send({type:'verify_friend', pubkey:selectedTarget.id, verified});
+  if(verified) { openSafetyModal(selectedTarget.id); return; }
+  send({type:'verify_friend', pubkey:selectedTarget.id, verified:false});
 }
 
-function renameFriend() {
+async function renameFriend() {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
   const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
   const current = f?.nickname || '';
-  // prompt() is intentionally simple — it lets the user clear the nickname
-  // (Cancel keeps the existing one, OK with empty input clears it).
-  const newName = prompt('Nickname for this friend (leave blank to clear):', current);
+  const newName = await showPrompt('Rename friend', 'Set a local nickname (leave blank to clear):', current);
   if(newName === null) return;
   send({type:'rename_friend', pubkey:selectedTarget.id, nickname:newName.trim()});
 }
 
-function blockFriend(blocked) {
+async function blockFriend(blocked) {
   if(!selectedTarget || selectedTarget.type !== 'friend') return;
-  const verb = blocked ? 'block' : 'unblock';
-  if(blocked && !confirm(`Block this friend? Their active session will be dropped and they won't be able to send you further messages until you unblock them.`)) return;
-  if(!blocked && !confirm(`Unblock this friend? They will be able to initiate a new session handshake.`)) return;
+  const ok = blocked
+    ? await showConfirm('Block friend', 'Block this friend? Their active session will be dropped and they won\'t be able to send you further messages until you unblock them.', {confirmText:'Block', danger:true})
+    : await showConfirm('Unblock friend', 'Unblock this friend? They will be able to initiate a new session handshake.', {confirmText:'Unblock'});
+  if(!ok) return;
   send({type:'block_friend', pubkey:selectedTarget.id, blocked});
 }
 
@@ -8267,15 +8557,15 @@ function copyMessage(msgId) {
   copyTextToClipboard(m.body, 'Message copied');
 }
 
-function deleteMessageLocally(msgId) {
-  if(!confirm('Delete this message from this device? The other participant and your other devices may still have their copies.')) return;
+async function deleteMessageLocally(msgId) {
+  if(!await showConfirm('Delete locally', 'Delete this message from this device? The other participant and your other devices may still have their copies.', {confirmText:'Delete locally', danger:true})) return;
   send({type:'delete_message', msg_id:msgId});
 }
 
-function deleteMessageEverywhereUi(msgId) {
+async function deleteMessageEverywhereUi(msgId) {
   const m = findMessageAny(msgId);
   if(!m || m._isFile) return;
-  if(!confirm('Delete this message for EVERYONE? It will be erased from the conversation on every participant\'s device (their copies of any quotes will show a placeholder).')) return;
+  if(!await showConfirm('Delete for everyone', 'Delete this message for EVERYONE? It will be erased from the conversation on every participant\'s device.', {confirmText:'Delete everywhere', danger:true})) return;
   send({type:'delete_message_everywhere', msg_id:msgId});
 }
 
@@ -8303,14 +8593,14 @@ function setComposerContext(ctx) {
   bar.classList.toggle('editing', ctx.mode === 'edit');
   wrap.hidden = false;
   if(ctx.mode === 'edit' && m && !m._isFile) {
-    $('text').value = m.body || '';
-    onTextInput();
+    text.value = m.body || '';
+    onTextInput(true);
     sendBtn.classList.add('saving');
     sendBtn.textContent = '✓';
     sendBtn.title = 'Save edit';
   }
   updateSendBtn();
-  $('text').focus();
+  text.focus();
 }
 
 function startReply(msgId) {
@@ -8322,9 +8612,8 @@ function startReply(msgId) {
   if(m._isFile) { toast('Replies to file attachments are not supported yet', 'info'); return; }
   if(!selectedTarget) { toast('Select a conversation first', 'warning'); return; }
   if(composerCtx && composerCtx.mode === 'edit') {
-    // Switching out of edit mode must restore the empty composer.
-    $('text').value = '';
-    onTextInput();
+    $('text').value = composerCtx.draftBeforeEdit || '';
+    onTextInput(true);
   }
   const peer = selectedTarget.type === 'friend' ? selectedTarget.id : m.sender_pubkey;
   setComposerContext({mode:'reply', msgId, peer});
@@ -8339,13 +8628,14 @@ function startEdit(msgId) {
   }
   if(m.deleted_at) { toast('This message was deleted', 'warning'); return; }
   const peer = m.recipient_pubkey || (selectedTarget && selectedTarget.type === 'friend' ? selectedTarget.id : null);
-  setComposerContext({mode:'edit', msgId, peer});
+  const draftBeforeEdit = (composerCtx && composerCtx.mode === 'edit') ? (composerCtx.draftBeforeEdit || '') : $('text').value;
+  setComposerContext({mode:'edit', msgId, peer, draftBeforeEdit});
 }
 
 function cancelComposerContext() {
   if(composerCtx && composerCtx.mode === 'edit') {
-    $('text').value = '';
-    onTextInput();
+    $('text').value = composerCtx.draftBeforeEdit || '';
+    onTextInput(true);
   }
   setComposerContext(null);
 }
@@ -8363,12 +8653,20 @@ function editLastOwnMessage() {
 }
 
 // ─── Message search ───────────────────────────────────────────────────────────
-function openSearchModal() {
-  if(!selectedTarget) { toast('Select a friend or group first', 'warning'); return; }
+function updateSearchScopeHint() {
+  const allScope = $('searchAllScope')?.checked;
+  if(allScope || !selectedTarget) {
+    $('searchScopeHint').textContent = 'Searching across all encrypted conversations.';
+    return;
+  }
   const label = selectedTarget.type === 'friend'
     ? (state.friends.find(f=>f.pubkey===selectedTarget.id)?.nickname || short(selectedTarget.id))
     : (state.groups.find(g=>g.group_id===selectedTarget.id)?.name || 'this group');
   $('searchScopeHint').textContent = `Searching your conversation with ${label}.`;
+}
+function openSearchModal() {
+  if($('searchAllScope')) $('searchAllScope').checked = !selectedTarget;
+  updateSearchScopeHint();
   $('searchResults').innerHTML = '';
   $('searchInput').value = '';
   $('searchModal').classList.add('open');
@@ -8386,10 +8684,13 @@ function debounceSearch() {
 let searchSeq = 0;
 function runSearch() {
   const query = $('searchInput').value.trim();
-  if(!query || !selectedTarget) { $('searchResults').innerHTML = ''; return; }
+  const allScope = $('searchAllScope')?.checked;
+  if(!query || (!selectedTarget && !allScope)) { $('searchResults').innerHTML = ''; return; }
   const payload = {type:'search_messages', query, seq: ++searchSeq};
-  if(selectedTarget.type === 'group') payload.group_id = selectedTarget.id;
-  else payload.pubkey = selectedTarget.id;
+  if(!allScope && selectedTarget) {
+    if(selectedTarget.type === 'group') payload.group_id = selectedTarget.id;
+    else payload.pubkey = selectedTarget.id;
+  }
   send(payload);
 }
 function renderSearchResults(query, results, seq) {
@@ -8405,14 +8706,31 @@ function renderSearchResults(query, results, seq) {
     const body = String(m.body ?? '');
     const snippet = body.length > 160 ? body.slice(0, 160) + '…' : body;
     const who = m.direction === 'out' ? 'You' : displayName(m.sender_pubkey);
-    return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}')">
-      <div class="search-result-meta">${esc(who)} · ${relTime(m.timestamp)}</div>
+    const convType = m.group_id ? 'group' : 'friend';
+    const convId = m.group_id || (m.sender_pubkey === state.public_key ? m.recipient_pubkey : m.sender_pubkey) || '';
+    const convLabel = m.group_id ? (state.groups.find(g=>g.group_id===m.group_id)?.name || 'Group') : friendName(convId);
+    const showScope = $('searchAllScope')?.checked && convLabel;
+    return `<button class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}','${esc(convType)}','${esc(convId)}')">
+      <div class="search-result-meta">${esc(who)}${showScope ? ` · in ${esc(convLabel)}` : ''} · ${relTime(m.timestamp)}</div>
       ${esc(snippet)}
     </button>`;
   }).join('');
 }
-function jumpToMessage(msgId) {
+function jumpToMessage(msgId, convType, convId) {
   closeSearchModal();
+  if(convType && convId && (!selectedTarget || selectedTarget.type !== convType || selectedTarget.id !== convId)) {
+    if(convType === 'group') {
+      mode = 'groups';
+      $('tabFriends').className = 'mode-tab';
+      $('tabGroups').className = 'mode-tab active';
+      selectGroup(convId);
+    } else {
+      mode = 'friends';
+      $('tabFriends').className = 'mode-tab active';
+      $('tabGroups').className = 'mode-tab';
+      selectFriend(convId);
+    }
+  }
   const node = document.querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
   if(!node) {
     toast("That message isn't loaded yet — try 'Load older messages' first", 'info');
@@ -8686,7 +9004,10 @@ function sendMessage() {
   if(composerCtx && composerCtx.mode === 'edit') {
     // Edit in place: replace the existing message everywhere it is held.
     sent = send({type:'edit_message', msg_id:composerCtx.msgId, text});
-    if(sent) cancelComposerContext();
+    if(sent) {
+      composerCtx.draftBeforeEdit = '';
+      cancelComposerContext();
+    }
     return;
   }
   const replyTo = composerCtx && composerCtx.mode === 'reply' ? composerCtx.msgId : undefined;
@@ -8785,7 +9106,13 @@ async function toggleVoiceRecording() {
     recorder.ondataavailable = e => { if(e.data.size > 0) session.chunks.push(e.data); };
     recorder.onerror = () => {
       session.discard = true;
+      clearInterval(session.timer);
       stream.getTracks().forEach(t => t.stop());
+      if(mediaRecorder === recorder) {
+        $('recIndicator').innerHTML = '';
+        $('micBtn').classList.remove('recording');
+        mediaRecorder = null;
+      }
       toast('Voice recording failed', 'error');
     };
     recorder.onstop = () => {
@@ -8869,11 +9196,11 @@ function copyBackupResult() {
     legacyCopy();
   }
 }
-function importBackup() {
+async function importBackup() {
   const backup = $('backupImportBlob').value.trim();
   const passphrase = $('backupImportPass').value;
   if(!backup || !passphrase) { toast('Paste a backup and enter its passphrase', 'error'); return; }
-  if(!confirm('This replaces your current identity in place. Only do this on a brand-new install with no friends or history yet. Continue?')) return;
+  if(!await showConfirm('Import identity backup', 'This replaces your current identity in place. Only do this on a brand-new install with no friends or history yet. Continue?', {confirmText:'Import identity', danger:true})) return;
   send({type:'import_backup', backup, passphrase});
   closeBackupModal();
 }
@@ -8943,14 +9270,16 @@ function stopTyping() {
   clearTimeout(myTypingTimeout);
 }
 
-function onTextInput() {
+function onTextInput(suppressTyping=false) {
   const v = $('text').value;
   const bytes = new TextEncoder().encode(v).length;
   $('charHint').textContent = `${bytes.toLocaleString()} / 65,536`;
   $('charHint').classList.toggle('danger', bytes > MAX_TEXT_BYTES_UI);
   updateSendBtn();
   autoResize($('text'));
-  if(v.trim()) startTyping(); else stopTyping();
+  if(!suppressTyping) {
+    if(v.trim()) startTyping(); else stopTyping();
+  }
 }
 
 function onTextKey(e) {
@@ -8982,13 +9311,18 @@ function updateSendBtn() {
 // ─── Scroll ───────────────────────────────────────────────────────────────────
 function scrollBottom(instant) {
   const el = $('messages');
+  const btn = $('scrollBottomBtn');
+  if(btn) btn.hidden = true;
   if(instant) {
     // CSS sets scroll-behavior:smooth, which would animate (and visibly
     // glide through) every programmatic jump — conversation switches and
     // history restores must land immediately.
     el.scrollTo({top: el.scrollHeight, behavior: 'instant'});
   } else {
-    setTimeout(() => el.scrollTo({top: el.scrollHeight, behavior: 'instant'}), 50);
+    setTimeout(() => {
+      el.scrollTo({top: el.scrollHeight, behavior: 'instant'});
+      if(btn) btn.hidden = true;
+    }, 50);
   }
 }
 
@@ -9045,6 +9379,29 @@ mainEl.addEventListener('drop', e => {
   sendFileBlob(file, file.name, target);
 });
 
+$('messages').addEventListener('scroll', () => {
+  const btn = $('scrollBottomBtn');
+  if(btn) btn.hidden = !selectedTarget || isNearBottom();
+});
+
+$('text').addEventListener('paste', e => {
+  const target = snapshotTarget();
+  if(!target) return;
+  const items = e.clipboardData?.items;
+  if(!items) return;
+  for(const item of items) {
+    if(item.kind === 'file' && item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if(file) {
+        e.preventDefault();
+        const ext = (file.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+        sendFileBlob(file, file.name && file.name !== 'image.png' ? file.name : `pasted-image-${Date.now()}.${ext}`, target);
+        return;
+      }
+    }
+  }
+});
+
 // Focus on window return — clear title unread
 window.addEventListener('focus', () => {
   unreadTitle = 0;
@@ -9061,12 +9418,15 @@ document.addEventListener('click', event => {
   });
 });
 document.addEventListener('keydown', event => {
-  // Ctrl/Cmd+F opens the conversation search from anywhere in the app.
+  // Ctrl/Cmd+F opens the conversation/global search from anywhere in the app.
   if((event.ctrlKey || event.metaKey) && (event.key === 'f' || event.key === 'F')) {
-    if(selectedTarget) { event.preventDefault(); openSearchModal(); }
+    event.preventDefault(); openSearchModal();
     return;
   }
   if(event.key !== 'Escape') return;
+  if($('confirmModal').classList.contains('open')) { resolveConfirmModal(false); return; }
+  if($('promptModal').classList.contains('open')) { resolvePromptModal(false); return; }
+  if($('safetyModal').classList.contains('open')) { closeSafetyModal(); return; }
   // Canceling an in-flight reply or edit takes precedence over everything
   // else Escape does — it is the primary affordance of the context bar.
   if(composerCtx) { cancelComposerContext(); return; }
@@ -9286,6 +9646,8 @@ async def run_node(args: argparse.Namespace) -> None:
             await asyncio.to_thread(httpd.join_workers, 5.0)
         except Exception as exc:
             LOG.warning("Timed out waiting for HTTP handlers to finish: %s", exc)
+        if hasattr(node, "cancel_typing_timers"):
+            node.cancel_typing_timers()
         try:
             await node.close_direct_pool()
         except Exception as exc:
@@ -9301,6 +9663,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=f"Quantum Chat v{VERSION} — post-quantum P2P encrypted chat"
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command")
     signal_cmd = sub.add_parser("signal", help="run only the signaling/relay server")
     signal_cmd.add_argument("--host", default=SIGNALING_HOST)
