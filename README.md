@@ -1,6 +1,6 @@
 # Quantum Chat
 
-**v4.2.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
+**v4.3.0** — a single-file, browser-based, post-quantum end-to-end encrypted peer-to-peer chat application.
 
 Quantum Chat ships a refined dark-glass web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, small group fan-out, **message replies with quoted previews**, **edit-your-own-messages**, **delete-for-everyone**, typing indicators, read receipts, emoji reactions, unread counts, voice messages, voice/video calls, full-text message search, multi-device sync, identity backup/restore, a configurable storage quota, and JSON health/version endpoints — all in one Python file.
 
@@ -20,6 +20,7 @@ Quantum Chat ships a refined dark-glass web UI, a local UI WebSocket API, an opt
 ---
 ## Table of contents
 
+- [What's new in v4.3.0](#whats-new-in-v430)
 - [What's new in v4.2.0](#whats-new-in-v420)
 - [What's new in v4.1.0](#whats-new-in-v410)
 - [What's new in v4.0.0](#whats-new-in-v400)
@@ -47,6 +48,37 @@ Quantum Chat ships a refined dark-glass web UI, a local UI WebSocket API, an opt
 - [Packaging and development](#packaging-and-development)
 - [Historical changelog](#historical-changelog)
 - [License](#license)
+
+---
+
+## What's new in v4.3.0
+
+v4.3.0 consolidates the improvements and fixes made since v4.0.0. Versions v4.1 and v4.2 were skipped rather than released independently.
+
+### Security improvements
+
+- **Eliminated dynamic inline `onclick` XSS vectors in the embedded browser UI.** Dynamic template interpolations in attachment previews, reply quotes, message action toolbars, reactions, header controls, group member management, and search results now bind structured `data-action` and `data-*` attributes handled by a single delegated click dispatcher (`textContent`/escaped attributes only; HTML entity decoding inside `onclick="..."` cannot evaluate script).
+- **Group invite ownership & membership reconciliation.** Inbound `group_invite` frames against an existing group now verify `existing_group.owner_pubkey == peer_pubkey` (and require an encrypted key packet when a group key exists) before mutating state, and reconcile `group_members` atomically so removed members are pruned when owners rotate or update membership.
+- **Replay hardening for counterless signed relay frames.** Outgoing `delivery_ack`, `read_receipt`, 1:1/group `reaction`, `message_delete`, `call_offer`, `call_answer`, `call_end`, and `group_leave` envelopes carry a random `nonce` (`secrets.token_hex(12)`), and inbound handlers validate nonces before mutating state and consume them only after full validation. `call_offer` additionally carries `sent_at` (checked against `PENDING_OFFER_TTL`) and rejects duplicate `(peer_pubkey, call_id)` offers. Legacy v3.5–v4.2 frames without a `nonce` remain accepted for backward compatibility.
+- **HTTP→UI WebSocket bridge CRLF guard.** `_bridge_websocket` now rejects CR/LF characters in request lines or forwarded headers with `400 Bad Request` before opening the backend bridge socket.
+- **UI dispatch input validation.** `read_receipt`, `delete_message`, `create_group`, and `search_messages` validate target keys/UUIDs and skip self-membership in `create_group`.
+
+### Bug fixes
+
+- **Complete member list on group creation.** `create_group` now persists all validated friends into `group_members` before dispatching invites, ensuring every initially invited member receives the full membership list instead of partial prefixes.
+- **Clean direct-peer disconnects.** `handle_direct_peer` re-raises `websockets.exceptions.ConnectionClosed` ahead of its generic error handler so normal client closes (`ConnectionClosedOK`) no longer increment `direct_rejected` or log rejection warnings.
+- **Static typing compliance.** Resolved all 24 pre-existing `mypy` errors across `chat.py` (narrowing optional guards in `LocalKeyStore`, `Database`, `QuantumNode`, `_handle_device_sync`, `send_group_chat`, and `run_node`).
+
+### Reliability, TLS & diagnostics
+
+- **Non-blocking identity backup/restore.** `export_backup` and `import_backup` offload 32,768-round Scrypt KDF/AEAD work via `asyncio.to_thread(...)` so the asyncio event loop remains responsive.
+- **First-class TLS support (`HTTPS` / `WSS`).** Added `--tls-cert`, `--tls-key`, and `--tls-ca` (plus `--tls-cert` / `--tls-key` on the `signal` subcommand) covering HTTP/API listeners, UI WebSockets, direct peer WebSocket servers/clients, bundled/standalone signaling relays, and TLS-aware `_bridge_websocket` proxying.
+- **Non-interactive self-diagnostics (`--check`).** Verifies Python >=3.10 runtime compatibility, `cryptography`, `websockets`, `pqcrypto` ML-DSA signing/tamper rejection + ML-KEM-512 encapsulation + AES-256-GCM roundtrips, SQLite schema v6 initialization, optional TLS certificate/key paths, and database directory writability.
+
+### Testing & documentation
+
+- **255 unit tests passing** across 10 pytest modules, adding `test_v430_audit_and_upgrade.py` (9 tests covering version consistency, inline-onclick XSS elimination, group ownership/reconciliation, counterless replay protection + legacy compatibility, clean direct-peer close metrics, WebSocket bridge CRLF guards, in-place v5→v6 database migration, `--check` CLI + HTTPS/`wss://` roundtrip, and protocol fuzzing + multi-thread SQLite stress).
+- Verified live two-node headless Chromium end-to-end flows, live HTTP smoke tests (`smoke_test.py`), end-to-end protocol tests (`e2e_test.py`), and multi-device/call/parallel-file integration tests (`new_features_test.py`), alongside `ruff check .` and `mypy chat.py`.
 
 ---
 
@@ -402,7 +434,7 @@ If you're upgrading from v3.0.0, these affect core security and correctness:
 
 ## Requirements
 
-- Python 3.10+ (tested on 3.12)
+- Python 3.10+ (verified on Python 3.10.12 and 3.11.2; primary development target 3.12)
 - Packages listed in `requirements.txt`:
   - `cryptography>=44.0.1`
   - `websockets>=12.0`
@@ -590,11 +622,15 @@ Useful node options:
 | `--max-storage-mb` | `4096` | Disk quota in MB for received/sent file bytes. `0` disables enforcement. |
 | `--ice-servers` | STUN-only default | JSON list of WebRTC ICE servers for voice/video calls, e.g. `'[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]'`. Also settable via `QUANTUM_CHAT_ICE_SERVERS`. STUN alone won't traverse every NAT; add a TURN server for reliable connectivity. |
 | `--log-level` | `WARNING` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--tls-cert` | disabled | Path to PEM TLS certificate chain for HTTPS, UI WebSocket (`wss://`), direct peer (`wss://`), and `--with-signaling` listeners. |
+| `--tls-key` | disabled | Path to PEM private key matching `--tls-cert`. |
+| `--tls-ca` | system CAs | Optional CA bundle PEM used when verifying peer/relay `wss://` certificates. |
+| `--check` | disabled | Run non-interactive environment, crypto (`ML-DSA`, `ML-KEM-512`, `AES-256-GCM`), SQLite schema, and TLS diagnostic checks and exit. |
 
-Run only the signaling server:
+Run only the signaling server (optionally with TLS):
 
 ```bash
-python chat.py signal --host 0.0.0.0 --port 8766
+python chat.py signal --host 0.0.0.0 --port 8766 [--tls-cert cert.pem --tls-key key.pem]
 ```
 
 ---
@@ -629,6 +665,7 @@ test_v350_fixes.py                     # v3.5.0 security/reliability/correctness
 test_v400_features.py                  # v4.0.0 replies/edit/delete, platform & audit regression tests (50 cases)
 test_v410_enhancements.py              # v4.1.0 validation, fan-out, relay metadata & UI contracts (9 cases)
 test_v420_reactions_and_fixes.py       # v4.2.0 bidirectional reactions, cursor hardening, HTTP flags (4 cases)
+test_v430_audit_and_upgrade.py         # v4.3.0 audit hardening, TLS, --check, XSS & migration tests (9 cases)
 smoke_test.py                          # Live HTTP smoke test (15 checks)
 e2e_test.py                            # End-to-end protocol test (15 checks)
 new_features_test.py                   # Multi-device sync, calls, search, parallel file transfer (14 checks)
@@ -663,7 +700,7 @@ Important remaining limits:
 ### Unit tests
 
 ```bash
-pytest                                       # all unit suites (246 cases)
+pytest                                       # all unit suites (255 cases)
 pytest test_validation_and_database.py       # validation, storage, HTTP (49 cases)
 pytest test_node_relay_and_signaling.py      # node/relay protocol behavior (63 cases)
 pytest test_enhancements.py                  # v3.4.0 security/reliability fixes (36 cases)
@@ -672,6 +709,7 @@ pytest test_v350_fixes.py                    # v3.5.0 security/reliability/corre
 pytest test_v400_features.py                 # v4.0.0 replies/edit/delete + audit hardening (50 cases)
 pytest test_v410_enhancements.py             # v4.1.0 validation, fan-out & UI contracts (9 cases)
 pytest test_v420_reactions_and_fixes.py      # v4.2.0 reactions, cursor hardening, HTTP flags (4 cases)
+pytest test_v430_audit_and_upgrade.py        # v4.3.0 audit hardening, TLS, --check, XSS & migration (9 cases)
 ```
 
 `test_validation_and_database.py` — 49 cases covering: public-key/file-id/label validation, at-rest encryption of identity/session/message/file rows, persistent local message deletion, replay-window behavior, group keys/chunks/metrics, HTTP auth and CSP, UI WebSocket auth (modern + legacy shapes), Scrypt key-file wrapping and legacy rejection, group member removal + key rotation, file-chunk encryption at rest + cleanup, storage quota, identity backup round-trip, message pagination, group fingerprint on UUIDs, the v3.1.0 verify regression, nickname rename, block-drops-session, OPTIONS/HEAD handlers, the `/version` probe, direct-rate GC, the save-before-send order, `mark_remote_read`, message padding round-trip, device-sync key derivation, message search (global and target-scoped), multi-socket-per-identity relay bookkeeping, per-identity rate limiting, ICE server configuration, signed registration challenge validation, direct URL validation, host-header protection, and blocked-peer filtering.
@@ -694,6 +732,8 @@ SQLite persistence are exercised without a network or subprocesses.
 `test_v410_enhancements.py` — 9 cases pinning the v4.1.0 hardening: control-character stripping in `safe_filename`, `msg_id` validation before replay-counter consumption, group-invite key-length enforcement, device-sync reaction/read validation, per-peer outbox failure isolation, concurrent-and-isolated group delete fan-out, relay multi-device metadata preserving direct URLs, the state payload's signaling/CLI fields, and embedded-UI dialog/accessibility/responsive contracts.
 
 `test_v420_reactions_and_fixes.py` — 4 cases driving bidirectional 1:1 and group reactions (add and remove, with real database effects), the `--no-http-auth` / `--allow-iframe` HTTP header matrix, the UI contracts for reaction ownership, pagination cursors, draft restoration, and the group friend picker, and a regression pinning that a synchronous direct-delivery ack is not overwritten by the post-send optimistic UI broadcast.
+
+`test_v430_audit_and_upgrade.py` — 9 cases pinning v4.3.0 release consistency (`chat.py`, `pyproject.toml`, `package.json`, CLI `--version`, HTTP `/version` & `/health`, UI banner), elimination of interpolated `onclick` XSS attributes, group invite owner enforcement & membership reconciliation, replay nonces + `call_offer` `sent_at` TTL/dedup (with v3.5–v4.2 legacy compatibility), clean direct-peer close metrics, `_bridge_websocket` CRLF header-injection rejection, in-place v5→v6 database migration, CLI `--check` diagnostics + real self-signed TLS (`HTTPS` / `wss://`) roundtrip, and protocol fuzzing + multi-threaded SQLite stress.
 
 ### Error-propagation tests
 

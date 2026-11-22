@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """
-Quantum Chat v4.2.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
+Quantum Chat v4.3.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
 
-New in v4.2.0:
+New in v4.3.0 (consolidating all improvements since v4.0.0; v4.1 and v4.2 skipped as standalone releases):
+- Security: eliminated HTML-attribute inline-JS XSS vectors in the embedded UI via
+  delegated event dispatch; enforced owner-only authorization and removed-member
+  reconciliation on group invites; added nonce/freshness replay protection to
+  counterless signed relay frames and call offers; sanitized WebSocket bridge request
+  and header lines against CRLF smuggling
+- Reliability & Performance: stopped clean direct-peer disconnects from logging
+  false frame rejections; offloaded Scrypt identity backup pack/unpack off the
+  asyncio event loop; validated UI command target/message IDs consistently; fixed
+  all strict mypy type issues across chat.py
+- Operations: added `--check` self-diagnostic mode and optional stdlib TLS support
+  (`--tls-cert`, `--tls-key`, `--tls-ca`) for HTTP, UI WebSocket, signaling, and
+  direct peer transports
+
+New in v4.2.0 (internal milestone):
 - Reactions work in both directions (1:1 and groups), including removal, with
   signed-frame validation before any local mutation
 - Reliability: staged uploads/downloads are written to a temp file and only
@@ -171,6 +185,8 @@ import secrets
 import select
 import socket
 import sqlite3
+import ssl
+import sys
 import threading
 import time
 import uuid
@@ -183,7 +199,7 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "Quantum Chat"
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -281,6 +297,8 @@ MAX_OFFLINE_QUEUE_PER_TARGET = 500
 DEFAULT_MAX_STORAGE_MB = 4096      # default disk quota for received/sent file bytes
 MESSAGE_PAGE_SIZE = 200            # messages sent on initial state sync / per page
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1    # passphrase KDF work factor
+MAX_SEEN_RELAY_NONCES = 8192       # bounded replay-dedup cache for signed counterless frames
+RELAY_NONCE_TTL = 7 * 24 * 3600
 LOG = logging.getLogger("quantum_chat")
 
 FAVICON_SVG: bytes = (
@@ -794,12 +812,16 @@ class LocalKeyStore:
         self.passphrase = os.environ.get("QUANTUM_CHAT_PASSPHRASE")
 
     def _wrap_key(self, key: bytes, salt: bytes) -> bytes:
+        if not self.passphrase:
+            raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required")
         AESGCM, _, _ = require_cryptography()
         wrapping = scrypt_derive(self.passphrase, salt)
         nonce = secrets.token_bytes(12)
         return nonce + AESGCM(wrapping).encrypt(nonce, key, b"quantum-chat-local-key")
 
     def _unwrap_key(self, blob: bytes, salt: bytes) -> bytes:
+        if not self.passphrase:
+            raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required")
         AESGCM, _, _ = require_cryptography()
         wrapping = scrypt_derive(self.passphrase, salt)
         return AESGCM(wrapping).decrypt(blob[:12], blob[12:], b"quantum-chat-local-key")
@@ -879,12 +901,16 @@ class LocalKeyStore:
             LOG.warning("Could not restrict permissions on %s to 0600 — the local encryption key may be readable by other users: %s", path, exc)
 
     def _write_raw(self, key: bytes) -> None:
+        if self.path is None:
+            raise RuntimeError("No key file path for in-memory database")
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(b64e(key), encoding="ascii")
         self._restrict_permissions(tmp)
         tmp.replace(self.path)
 
     def _write_wrapped(self, key: bytes) -> None:
+        if self.path is None:
+            raise RuntimeError("No key file path for in-memory database")
         salt = secrets.token_bytes(16)
         blob = self._wrap_key(key, salt)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -1213,7 +1239,7 @@ class Database:
             self.conn.execute("UPDATE friends SET verified=? WHERE pubkey=?", (int(verified), pubkey))
             self.conn.commit()
 
-    def rename_friend(self, pubkey: str, nickname: str | None) -> str:
+    def rename_friend(self, pubkey: str, nickname: str | None) -> str | None:
         """Update the nickname of an existing friend. Returns the stored
         nickname (None if cleared). Validates the label so a too-long or
         illegal nickname never reaches the DB."""
@@ -1408,6 +1434,39 @@ class Database:
                 (group_id, pubkey, role, utc_ts())
             )
             self.conn.commit()
+
+    def get_group(self, group_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT group_id, name, created_at, owner_pubkey, epoch FROM groups WHERE group_id=?",
+                (group_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def reconcile_group_members(self, group_id: str, members: list[str], owner_pubkey: str) -> list[str]:
+        """Synchronize group membership with an authoritative owner update."""
+        desired = set(members) | {owner_pubkey}
+        now = utc_ts()
+        with self.lock:
+            existing = [
+                r["pubkey"] for r in self.conn.execute(
+                    "SELECT pubkey FROM group_members WHERE group_id=?", (group_id,)
+                )
+            ]
+            removed = [pk for pk in existing if pk not in desired]
+            for pk in removed:
+                self.conn.execute(
+                    "DELETE FROM group_members WHERE group_id=? AND pubkey=?", (group_id, pk)
+                )
+            for pk in desired:
+                role = "owner" if pk == owner_pubkey else "member"
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (group_id, pk, role, now)
+                )
+            self.conn.commit()
+            return removed
 
     def remove_group_member(self, group_id: str, pubkey: str) -> bool:
         with self.lock:
@@ -2059,7 +2118,8 @@ class PendingOffer:
 class QuantumNode:
     def __init__(self, db_path: str = DB_FILE, signaling_url: str = DEFAULT_SIGNALING_URL,
                  direct_url: str | None = None, enable_direct: bool = True,
-                 max_storage_bytes: int = DEFAULT_MAX_STORAGE_MB * 1024 * 1024) -> None:
+                 max_storage_bytes: int = DEFAULT_MAX_STORAGE_MB * 1024 * 1024,
+                 ssl_context: ssl.SSLContext | None = None) -> None:
         self.crypto = QuantumCrypto()
         # Separate nodes commonly run from one checkout during local testing.
         # Giving every custom database its own file root prevents one node from
@@ -2091,10 +2151,16 @@ class QuantumNode:
         self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
         self.direct_url = direct_url
         self.enable_direct = enable_direct
+        self.ssl_context = ssl_context
+        self.allow_remote_ui: bool = False
+        self._http_shutdown: Any = None
+        self._shutting_down: bool = False
         self.peer_direct: dict[str, str] = {}
         self._typing_timers: dict[str, asyncio.TimerHandle] = {}
         self.max_storage_bytes = max_storage_bytes
         self._direct_rate: dict[str, list[int]] = {}
+        self._seen_relay_nonces: dict[tuple[str, str, str], int] = {}
+        self._seen_call_ids: dict[tuple[str, str], int] = {}
         # Pooled keep-alive direct-peer connections: direct_url -> open
         # WebSocket, reused across payloads so each file chunk doesn't pay a
         # fresh TCP+WS handshake. _direct_send_locks serializes send+ack per
@@ -2342,6 +2408,11 @@ class QuantumNode:
         # turning the keep-alive pool back into dial-per-chunk.
         conn_authed = False
         try:
+            import websockets.exceptions as _ws_exc
+            conn_closed_exc: tuple[type[BaseException], ...] = (_ws_exc.ConnectionClosed,)
+        except Exception:
+            conn_closed_exc = ()
+        try:
             async for raw in ws:
                 # Per-frame rate limiting keeps a single keep-alive
                 # connection from carrying an unbounded frame stream.
@@ -2372,6 +2443,8 @@ class QuantumNode:
                     await self.handle_relay_payload(peer, msg.get("payload"))
                     await ws.send(json.dumps({"type": "direct_ack"}))
                     self.db.metric_inc("direct_received")
+                except conn_closed_exc:
+                    raise
                 except Exception as exc:
                     self.db.metric_inc("direct_rejected")
                     LOG.warning("Rejected direct peer frame from %s: %s: %s", remote_host, type(exc).__name__, exc)
@@ -2415,7 +2488,10 @@ class QuantumNode:
                 pooled = None
             if pooled is None:
                 websockets = require_websockets()
-                pooled = await websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2)
+                kwargs: dict[str, Any] = {"max_size": MAX_FILE_BYTES * 2}
+                if direct_url.startswith("wss://"):
+                    kwargs["ssl"] = getattr(self, "ssl_context", None) or True
+                pooled = await websockets.connect(direct_url, **kwargs)
                 self._direct_pool[direct_url] = pooled
             return pooled
 
@@ -2931,6 +3007,7 @@ class QuantumNode:
             ack = self.signed_payload("delivery_ack", {
                 "from": self.public_key, "to": peer_pubkey,
                 "msg_id": msg_id, "delivered_at": utc_ts(),
+                "nonce": secrets.token_hex(12),
             })
             await self.send_relay(peer_pubkey, ack, queue_on_failure=True)
             await self.broadcast_ui({
@@ -3010,6 +3087,37 @@ class QuantumNode:
 
     # ── Read Receipts ─────────────────────────────────────────────────────────
 
+    def _validate_relay_nonce(self, kind: str, peer_pubkey: str, payload: dict[str, Any]) -> str | None:
+        raw_nonce = payload.get("nonce")
+        if raw_nonce is None:
+            return None
+        if not isinstance(raw_nonce, str) or not raw_nonce or len(raw_nonce) > 64:
+            raise ValueError("Invalid frame nonce")
+        seen = getattr(self, "_seen_relay_nonces", None)
+        if seen is None:
+            seen = {}
+            self._seen_relay_nonces = seen
+        if (kind, peer_pubkey, raw_nonce) in seen:
+            raise ValueError("Duplicate replayed frame")
+        return raw_nonce
+
+    def _mark_relay_nonce(self, kind: str, peer_pubkey: str, nonce: str | None) -> None:
+        if not nonce:
+            return
+        seen = getattr(self, "_seen_relay_nonces", None)
+        if seen is None:
+            seen = {}
+            self._seen_relay_nonces = seen
+        now = utc_ts()
+        if len(seen) >= MAX_SEEN_RELAY_NONCES:
+            cutoff = now - RELAY_NONCE_TTL
+            stale = [k for k, ts in seen.items() if ts <= cutoff]
+            for k in stale:
+                seen.pop(k, None)
+            while len(seen) >= MAX_SEEN_RELAY_NONCES:
+                seen.pop(next(iter(seen)))
+        seen[(kind, peer_pubkey, nonce)] = now
+
     async def send_read_receipt(self, peer_pubkey: str, msg_id: str) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
@@ -3018,6 +3126,7 @@ class QuantumNode:
             await self.send_relay(peer_pubkey, self.signed_payload("read_receipt", {
                 "from": self.public_key, "to": peer_pubkey,
                 "msg_id": msg_id, "read_at": utc_ts(),
+                "nonce": secrets.token_hex(12),
             }), queue_on_failure=True)
         except Exception as exc:
             LOG.debug("Failed to send read receipt: %s", exc)
@@ -3030,6 +3139,7 @@ class QuantumNode:
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Read receipt routing mismatch")
+        nonce = self._validate_relay_nonce("read_receipt", peer_pubkey, payload)
         msg_id = validate_msg_id(payload.get("msg_id", ""), "Read receipt target")
         row = self.db.get_message(msg_id)
         if row is None:
@@ -3037,6 +3147,7 @@ class QuantumNode:
             # nothing to update; storing an unvalidated id would just let a
             # peer park arbitrary strings in the receipts table.
             LOG.debug("Read receipt for unknown message %s", msg_id)
+            self._mark_relay_nonce("read_receipt", peer_pubkey, nonce)
             return
         if row.get("sender_pubkey") != self.public_key:
             raise ValueError("Read receipt targets a message this node did not send")
@@ -3045,6 +3156,7 @@ class QuantumNode:
                 raise ValueError("Read receipt from a non-member")
         elif row.get("recipient_pubkey") != peer_pubkey:
             raise ValueError("Read receipt routing mismatch")
+        self._mark_relay_nonce("read_receipt", peer_pubkey, nonce)
         # Use the receipt's own timestamp so the read_at column reflects
         # when the *reader* actually read it, not when we happened to
         # process the receipt (which can lag by seconds under load or
@@ -3098,6 +3210,7 @@ class QuantumNode:
                         "from": self.public_key, "to": peer,
                         "group_id": group_id, "msg_id": msg_id,
                         "emoji": emoji, "action": action,
+                        "sent_at": utc_ts(), "nonce": secrets.token_hex(12),
                     })
                     await self.send_relay(peer, frame, queue_on_failure=True)
                 except Exception as exc:
@@ -3113,6 +3226,7 @@ class QuantumNode:
             await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
                 "from": self.public_key, "to": peer_pubkey,
                 "msg_id": msg_id, "emoji": emoji, "action": action,
+                "sent_at": utc_ts(), "nonce": secrets.token_hex(12),
             }), queue_on_failure=True)
             if action == "add":
                 self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
@@ -3138,6 +3252,7 @@ class QuantumNode:
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Reaction routing mismatch")
+        nonce = self._validate_relay_nonce("reaction", peer_pubkey, payload)
         emoji = validate_emoji(payload.get("emoji", ""))
         action = payload.get("action", "add")
         if action not in ("add", "remove"):
@@ -3154,6 +3269,7 @@ class QuantumNode:
                 raise ValueError("Group reaction target mismatch")
         elif row is not None and row.get("group_id") is not None:
             raise ValueError("Cannot apply a 1:1 reaction to a group message")
+        self._mark_relay_nonce("reaction", peer_pubkey, nonce)
         if row is not None and row.get("deleted_at"):
             return
         if action == "add":
@@ -3367,6 +3483,7 @@ class QuantumNode:
                 per_peer = self.signed_payload("message_delete", {
                     "from": self.public_key, "to": peer,
                     "msg_id": msg_id, "deleted_at": deleted_at,
+                    "nonce": secrets.token_hex(12),
                 })
                 await self.send_relay(peer, per_peer, queue_on_failure=True)
             except Exception as exc:
@@ -3389,6 +3506,7 @@ class QuantumNode:
         payload = data.get("payload", {})
         if payload.get("from") != peer_pubkey:
             raise ValueError("Message deletion sender mismatch")
+        nonce = self._validate_relay_nonce("message_delete", peer_pubkey, payload)
         msg_id = validate_msg_id(payload.get("msg_id", ""), "Delete target")
         row = self.db.get_message(msg_id)
         if row is None:
@@ -3396,6 +3514,7 @@ class QuantumNode:
             # history window. Nothing to tombstone, and rejecting would only
             # force a pointless retry — accept and move on.
             LOG.debug("Delete notice for unknown message %s", msg_id)
+            self._mark_relay_nonce("message_delete", peer_pubkey, nonce)
             return
         # Routing: the frame must be addressed to us (per-recipient fan-out
         # stamps each copy), and only the message's stored author may delete
@@ -3405,6 +3524,7 @@ class QuantumNode:
             raise ValueError("Message deletion routing mismatch")
         if row.get("sender_pubkey") != peer_pubkey:
             raise ValueError("Only the message author may delete it for everyone")
+        self._mark_relay_nonce("message_delete", peer_pubkey, nonce)
         deleted_at = clamp_remote_timestamp(payload.get("deleted_at"), now=utc_ts())
         if self.db.tombstone_message(msg_id, deleted_at=deleted_at):
             await self.broadcast_ui({
@@ -3491,7 +3611,7 @@ class QuantumNode:
             if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
                 raise ValueError("Invalid synced reaction target")
             peer = validate_public_key(data.get("peer", ""))
-            emoji = validate_emoji(data.get("emoji"))
+            emoji = validate_emoji(str(data.get("emoji") or ""))
             action = str(data.get("action", "add"))
             if action not in ("add", "remove"):
                 raise ValueError("Reaction action must be 'add' or 'remove'")
@@ -3525,6 +3645,7 @@ class QuantumNode:
         await self.send_relay(peer_pubkey, self.signed_payload("call_offer", {
             "from": self.public_key, "to": peer_pubkey, "call_id": call_id,
             "media": media, "sdp": sdp, "sent_at": utc_ts(),
+            "nonce": secrets.token_hex(12),
         }))
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey, "call_id": call_id,
@@ -3540,7 +3661,24 @@ class QuantumNode:
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Call offer routing mismatch")
+        nonce = self._validate_relay_nonce("call_offer", peer_pubkey, payload)
+        if payload.get("sent_at") is not None:
+            sent_at = int(payload.get("sent_at") or 0)
+            if abs(utc_ts() - sent_at) > PENDING_OFFER_TTL:
+                raise ValueError("Call offer is stale or from the future")
+        call_id = str(payload.get("call_id") or "").strip()
+        seen_calls = getattr(self, "_seen_call_ids", None)
+        if seen_calls is None:
+            seen_calls = {}
+            self._seen_call_ids = seen_calls
+        if call_id and (peer_pubkey, call_id) in seen_calls:
+            raise ValueError("Duplicate call offer rejected")
         media = payload.get("media") if payload.get("media") in ("audio", "video") else "video"
+        self._mark_relay_nonce("call_offer", peer_pubkey, nonce)
+        if call_id:
+            if len(seen_calls) >= MAX_SEEN_RELAY_NONCES:
+                seen_calls.pop(next(iter(seen_calls)))
+            seen_calls[(peer_pubkey, call_id)] = utc_ts()
         if peer_pubkey in self.active_calls:
             # Already ringing/active with this peer (or with someone else,
             # scoped per-peer here) — tell the caller we're busy instead of
@@ -3549,6 +3687,7 @@ class QuantumNode:
                 await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
                     "from": self.public_key, "to": peer_pubkey,
                     "call_id": payload.get("call_id"), "reason": "busy",
+                    "sent_at": utc_ts(), "nonce": secrets.token_hex(12),
                 }))
             except Exception as exc:
                 LOG.warning("Could not tell %s we are busy: %s", short_key(peer_pubkey), exc)
@@ -3568,7 +3707,7 @@ class QuantumNode:
             raise ValueError("No incoming call from this friend to answer")
         await self.send_relay(peer_pubkey, self.signed_payload("call_answer", {
             "from": self.public_key, "to": peer_pubkey, "call_id": call["call_id"],
-            "sdp": sdp, "sent_at": utc_ts(),
+            "sdp": sdp, "sent_at": utc_ts(), "nonce": secrets.token_hex(12),
         }))
         call["state"] = "active"
         await self.broadcast_ui({
@@ -3582,9 +3721,11 @@ class QuantumNode:
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Call answer routing mismatch")
+        nonce = self._validate_relay_nonce("call_answer", peer_pubkey, payload)
         call = self.active_calls.get(peer_pubkey)
         if not call or call["call_id"] != payload.get("call_id") or call["role"] != "caller":
             raise ValueError("Call answer does not match an active outgoing call")
+        self._mark_relay_nonce("call_answer", peer_pubkey, nonce)
         call["state"] = "active"
         await self.broadcast_ui({
             "type": "call_answered", "peer": peer_pubkey,
@@ -3628,6 +3769,7 @@ class QuantumNode:
             await self.send_relay(peer_pubkey, self.signed_payload("call_end", {
                 "from": self.public_key, "to": peer_pubkey,
                 "call_id": call["call_id"], "reason": reason,
+                "sent_at": utc_ts(), "nonce": secrets.token_hex(12),
             }))
         except Exception as exc:
             # Best-effort — the local call state is already cleared either way,
@@ -3649,10 +3791,13 @@ class QuantumNode:
         payload = data.get("payload", {})
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Call end routing mismatch")
+        nonce = self._validate_relay_nonce("call_end", peer_pubkey, payload)
         call = self.active_calls.get(peer_pubkey)
         if call and call.get("call_id") != payload.get("call_id"):
             LOG.debug("Ignoring call_end for a stale call_id from %s", short_key(peer_pubkey))
+            self._mark_relay_nonce("call_end", peer_pubkey, nonce)
             return
+        self._mark_relay_nonce("call_end", peer_pubkey, nonce)
         self.active_calls.pop(peer_pubkey, None)
         await self.broadcast_ui({
             "type": "call_state", "peer": peer_pubkey,
@@ -3751,6 +3896,7 @@ class QuantumNode:
                     "from": self.public_key,
                     "to": owner,
                     "left_at": utc_ts(),
+                    "nonce": secrets.token_hex(12),
                 }), queue_on_failure=True)
             except Exception as exc:
                 LOG.warning("Could not notify group owner %s of departure: %s", short_key(owner), exc)
@@ -3766,9 +3912,12 @@ class QuantumNode:
         payload = data.get("payload", {})
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Group leave routing mismatch")
+        nonce = self._validate_relay_nonce("group_leave", peer_pubkey, payload)
         group_id = validate_file_id(str(payload.get("group_id", "")))
         if self.db.group_role(group_id, self.public_key) != "owner":
+            self._mark_relay_nonce("group_leave", peer_pubkey, nonce)
             return
+        self._mark_relay_nonce("group_leave", peer_pubkey, nonce)
         if self.db.remove_group_member(group_id, peer_pubkey):
             await self.rotate_group_key(group_id)
             await self.broadcast_ui({
@@ -3804,6 +3953,8 @@ class QuantumNode:
             key = secrets.token_bytes(32)
             self.db.save_group_key(group_id, 1, key, self.public_key)
             group_key = self.db.get_group_key(group_id)
+        if not group_key:
+            raise RuntimeError("Failed to load newly created group key")
         epoch = int(group_key["epoch"])
         msg_id = str(uuid.uuid4())
         meta = {"msg_id": msg_id, "from": self.public_key, "group_id": group_id,
@@ -4335,13 +4486,20 @@ class QuantumNode:
             if self.db.is_blocked(peer_pubkey) or not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid delivery acknowledgement")
             data = payload.get("payload", {})
+            if not isinstance(data, dict):
+                raise ValueError("Delivery ack payload is malformed")
+            nonce = self._validate_relay_nonce("delivery_ack", peer_pubkey, data)
             if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
                 raise ValueError("Delivery ack routing mismatch")
-            self.db.update_message_status(str(data.get("msg_id", "")),
+            ack_msg_id = str(data.get("msg_id") or "").strip()
+            if not ack_msg_id or len(ack_msg_id) > MAX_REPLY_TO_CHARS:
+                raise ValueError("Invalid delivery ack message id")
+            self._mark_relay_nonce("delivery_ack", peer_pubkey, nonce)
+            self.db.update_message_status(ack_msg_id,
                                           "delivered_to_peer", delivered=True)
             await self.broadcast_ui({
                 "type": "status_update",
-                "msg_id": str(data.get("msg_id", "")),
+                "msg_id": ack_msg_id,
                 "status": "delivered_to_peer",
             })
         elif kind == "group_leave":
@@ -4366,9 +4524,15 @@ class QuantumNode:
             group_id = validate_file_id(str(data.get("group_id", "")))
             group_name = validate_label(data.get("name") or f"Group {group_id[:8]}",
                                         "Group name", MAX_GROUP_NAME_CHARS, required=True)
-            validated_members = [self.validate_peer_key(member) for member in members]
+            validated_members = list(dict.fromkeys(self.validate_peer_key(member) for member in members))
             if peer_pubkey not in validated_members:
                 raise ValueError("Group invite is missing its inviter")
+            existing_group = self.db.get_group(group_id)
+            if existing_group is not None:
+                if existing_group.get("owner_pubkey") != peer_pubkey:
+                    raise ValueError("Only the group owner can update group membership or keys")
+                if not payload.get("packet") and self.db.get_group_key(group_id) is not None:
+                    raise ValueError("Group update requires encrypted key packet")
             # Validate key material and epoch monotonicity BEFORE mutating any
             # local group state: a replayed or conflicting invite must not be
             # able to re-add removed members or rewrite the group name before
@@ -4404,16 +4568,10 @@ class QuantumNode:
                     else:
                         raise ValueError("Group invite epoch is older than or conflicts with the known epoch")
             # All validation passed — commit local state.
-            # The INVITER owns the group. Recording the recipient as owner
-            # (the old behavior) let whoever received an invite locally
-            # rotate the group key and fan a divergent epoch out to every
-            # other member, splitting the group's key state. INSERT OR
-            # IGNORE keeps this idempotent for re-delivered invites to a
-            # group we already belong to (our own ownership, if any, wins).
+            # The INVITER owns the group. Reconcile membership atomically so
+            # owner updates/rotations also prune removed non-owner members.
             self.db.create_group(group_id, group_name, peer_pubkey)
-            for member in validated_members:
-                self.db.add_group_member(group_id, member,
-                                         role="owner" if member == peer_pubkey else "member")
+            self.db.reconcile_group_members(group_id, validated_members, owner_pubkey=peer_pubkey)
             if group_key is not None:
                 # Consume the replay counter only after every validation
                 # above succeeded, so a rejected invite can be re-sent
@@ -4572,25 +4730,31 @@ class QuantumNode:
             self.db.create_group(group_id, name, self.public_key)
             group_key = secrets.token_bytes(32)
             self.db.save_group_key(group_id, 1, group_key, self.public_key)
-            for member in members_raw:
-                member = self.validate_peer_key(member)
+            invited_friends: list[str] = []
+            for raw_member in members_raw:
+                member = self.validate_peer_key(raw_member)
+                if member == self.public_key or member in invited_friends:
+                    continue
                 if self.db.is_friend(member):
                     self.db.add_group_member(group_id, member)
-                    if member in self.sessions and self.session_fresh(member):
-                        invite = {
-                            "group_id": group_id, "name": name,
-                            "members": self.db.group_members(group_id),
-                            "from": self.public_key, "to": member, "epoch": 1,
-                        }
-                        await self.send_group_invite(member, invite, group_key)
-                    else:
-                        # No live pairwise session: the invite can't be sealed
-                        # yet. Start the PQ handshake now instead of skipping
-                        # the member — once the session establishes,
-                        # _deliver_group_keys_to re-sends the current epoch
-                        # key automatically, so this member actually joins the
-                        # group rather than silently dropping every message.
-                        asyncio.ensure_future(self._handshake_for_group_keys(member))
+                    invited_friends.append(member)
+            full_members = self.db.group_members(group_id)
+            for member in invited_friends:
+                if member in self.sessions and self.session_fresh(member):
+                    invite = {
+                        "group_id": group_id, "name": name,
+                        "members": full_members,
+                        "from": self.public_key, "to": member, "epoch": 1,
+                    }
+                    await self.send_group_invite(member, invite, group_key)
+                else:
+                    # No live pairwise session: the invite can't be sealed
+                    # yet. Start the PQ handshake now instead of skipping
+                    # the member — once the session establishes,
+                    # _deliver_group_keys_to re-sends the current epoch
+                    # key automatically, so this member actually joins the
+                    # group rather than silently dropping every message.
+                    asyncio.ensure_future(self._handshake_for_group_keys(member))
             await self.broadcast_ui(self.state_payload())
         elif typ == "add_group_member":
             group_id = validate_file_id(str(msg.get("group_id", "")))
@@ -4612,7 +4776,7 @@ class QuantumNode:
             passphrase = str(msg.get("passphrase") or "")
             if len(passphrase) < 8:
                 raise ValueError("Choose a backup passphrase of at least 8 characters")
-            blob = pack_identity_backup(self.public_key, self.secret_key, passphrase)
+            blob = await asyncio.to_thread(pack_identity_backup, self.public_key, self.secret_key, passphrase)
             # Sent directly to the requesting client only — never broadcast,
             # since this blob (with the passphrase) reconstructs the identity.
             await ws.send(json.dumps({"type": "identity_backup", "backup": blob}))
@@ -4622,7 +4786,9 @@ class QuantumNode:
                     "Refusing to import over an identity that already has friends or "
                     "message history. Import backups only into a brand-new install."
                 )
-            new_pk, new_sk = unpack_identity_backup(str(msg.get("backup") or ""), str(msg.get("passphrase") or ""))
+            new_pk, new_sk = await asyncio.to_thread(
+                unpack_identity_backup, str(msg.get("backup") or ""), str(msg.get("passphrase") or "")
+            )
             self.public_key, self.secret_key = new_pk, new_sk
             self.db.save_identity(self.public_key, self.secret_key)
             self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
@@ -4644,8 +4810,11 @@ class QuantumNode:
         elif typ == "typing":
             await self.send_typing(msg["pubkey"], bool(msg.get("active", True)))
         elif typ == "read_receipt":
-            msg_id = str(msg["msg_id"])
-            await self.send_read_receipt(msg["pubkey"], msg_id)
+            peer_pubkey = self.validate_peer_key(msg["pubkey"])
+            msg_id = str(msg.get("msg_id") or "").strip()
+            if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
+                raise ValueError("Valid message ID required")
+            await self.send_read_receipt(peer_pubkey, msg_id)
             # Persist the read locally too: without this the "mark read"
             # action cleared the sidebar badge but never stamped the
             # incoming message's read_at, so the button reappeared after
@@ -4654,7 +4823,7 @@ class QuantumNode:
             msg_row = self.db.get_message(msg_id)
             is_group_msg = bool(msg.get("group_id") or (msg_row and msg_row.get("group_id")))
             if not is_group_msg:
-                self.db.clear_unread(msg["pubkey"])
+                self.db.clear_unread(peer_pubkey)
             await self.broadcast_ui({
                 "type": "read_receipt", "msg_id": msg_id,
                 "peer": self.public_key, "read_at": utc_ts(),
@@ -4662,7 +4831,7 @@ class QuantumNode:
             })
             if not is_group_msg:
                 await self.broadcast_ui({"type": "friends", "friends": self.db.get_friends()})
-                await self.sync_to_devices("read_local", {"peer_pubkey": msg["pubkey"], "msg_id": msg_id})
+                await self.sync_to_devices("read_local", {"peer_pubkey": peer_pubkey, "msg_id": msg_id})
         elif typ == "reaction":
             await self.send_reaction(
                 msg.get("pubkey"), str(msg["msg_id"]),
@@ -4670,7 +4839,9 @@ class QuantumNode:
                 group_id=msg.get("group_id"),
             )
         elif typ == "delete_message":
-            msg_id = str(msg.get("msg_id") or "")
+            msg_id = str(msg.get("msg_id") or "").strip()
+            if not msg_id or len(msg_id) > MAX_REPLY_TO_CHARS:
+                raise ValueError("Valid message ID required")
             if not self.db.delete_message(msg_id):
                 raise ValueError("Message is no longer available")
             await self.broadcast_ui({"type": "message_deleted", "msg_id": msg_id})
@@ -4699,8 +4870,11 @@ class QuantumNode:
         elif typ == "search_messages":
             query = str(msg.get("query") or "")
             target = msg.get("pubkey") or msg.get("group_id")
+            target_str = str(target).strip() if target is not None else None
+            if target_str is not None and len(target_str) > 10000:
+                raise ValueError("Invalid search target")
             results = self._with_message_metadata(
-                self.db.search_messages(query, target=str(target) if target else None)
+                self.db.search_messages(query, target=target_str or None)
             )
             reply: dict[str, Any] = {
                 "type": "search_results", "query": query, "results": results
@@ -4734,8 +4908,11 @@ class QuantumNode:
         # of leaving the reconnect loop running after the UI WS task is gone.
         while not getattr(self, "_shutting_down", False):
             try:
+                ws_kwargs: dict[str, Any] = {"max_size": MAX_FILE_BYTES * 2}
+                if str(self.signaling_url).startswith("wss://"):
+                    ws_kwargs["ssl"] = getattr(self, "ssl_context", None) or True
                 async with websockets.connect(
-                    self.signaling_url, max_size=MAX_FILE_BYTES * 2
+                    self.signaling_url, **ws_kwargs
                 ) as ws:
                     self.signaling_ws = ws
                     delay = 1.0  # reset backoff on success
@@ -5326,10 +5503,23 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         UI WebSocket server (127.0.0.1:ui_ws_port). This enables the browser
         UI to connect over the same port/host as the HTTP interface, which is
         essential in reverse-proxy, container, and single-port environments."""
-        backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if ("\r" in str(self.command or "") or "\n" in str(self.command or "")
+                or "\r" in str(self.path or "") or "\n" in str(self.path or "")
+                or "\r" in str(self.request_version or "") or "\n" in str(self.request_version or "")
+                or any("\r" in str(k) or "\n" in str(k) or "\r" in str(v) or "\n" in str(v)
+                       for k, v in self.headers.items())):
+            self.send_error(400, "Bad Request")
+            return
+
+        backend: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             backend.settimeout(5.0)
             backend.connect(("127.0.0.1", self.ui_ws_port))
+            if getattr(self.server, "ui_ws_ssl", False):
+                internal_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                internal_ctx.check_hostname = False
+                internal_ctx.verify_mode = ssl.CERT_NONE
+                backend = internal_ctx.wrap_socket(backend, server_hostname="127.0.0.1")
             backend.settimeout(None)
         except Exception as exc:
             LOG.debug("WebSocket bridge failed to connect to backend: %s", exc)
@@ -5387,7 +5577,18 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                 wwatch = [s for s in (client_sock, backend) if pending[s]]
                 if not rwatch and not wwatch:
                     break
-                rlist, wlist, xlist = select.select(rwatch, wwatch, [client_sock, backend], 2.0)
+                has_ssl_pending = any(
+                    getattr(s, "pending", lambda: 0)() > 0
+                    for s in (client_sock, backend) if s not in eof_from
+                )
+                rlist, wlist, xlist = select.select(
+                    rwatch, wwatch, [client_sock, backend], 0.0 if has_ssl_pending else 2.0
+                )
+                if has_ssl_pending:
+                    rlist = list(dict.fromkeys([
+                        *rlist,
+                        *[s for s in rwatch if getattr(s, "pending", lambda: 0)() > 0],
+                    ]))
                 if xlist:
                     break
                 for s in wlist:
@@ -5396,7 +5597,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                         continue
                     try:
                         sent = s.send(buf)
-                    except (BlockingIOError, InterruptedError):
+                    except (BlockingIOError, InterruptedError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
                         continue
                     except Exception:
                         buf.clear()
@@ -5410,7 +5611,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                     other = backend if s is client_sock else client_sock
                     try:
                         data = s.recv(65536)
-                    except (BlockingIOError, InterruptedError):
+                    except (BlockingIOError, InterruptedError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
                         continue
                     except Exception:
                         data = b""
@@ -5425,7 +5626,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                             sent = other.send(data)
                             if sent < len(data):
                                 buf.extend(data[sent:])
-                        except (BlockingIOError, InterruptedError):
+                        except (BlockingIOError, InterruptedError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
                             buf.extend(data)
                         except Exception:
                             eof_from.update((client_sock, backend))
@@ -8624,12 +8825,12 @@ function renderAttachment(m) {
       <span class="attachment-name" title="${esc(f.filename)}">${esc(f.filename)}</span>
       <span class="attachment-meta">${fmt(f.size)}</span>
     </span>
-    <a class="attachment-download" href="${downloadUrl}" download title="Download ${esc(f.filename)}" aria-label="Download ${esc(f.filename)}" onclick="event.stopPropagation()">${icon('download')}</a>
+    <a class="attachment-download" href="${downloadUrl}" download title="Download ${esc(f.filename)}" aria-label="Download ${esc(f.filename)}" data-stop-prop="1">${icon('download')}</a>
   </div>`;
   const hasBytes = (Number(f.size) || 0) > 0;
   if(hasBytes && isImage(f.filename)) {
     return `<div class="attachment-card">
-      <button type="button" class="attachment-preview-btn" onclick="openLightbox('${esc(viewUrl)}','${esc(downloadUrl)}','${esc(f.filename)}')" aria-label="Preview ${esc(f.filename)}">
+      <button type="button" class="attachment-preview-btn" data-action="open-lightbox" data-view-url="${esc(viewUrl)}" data-download-url="${esc(downloadUrl)}" data-filename="${esc(f.filename)}" aria-label="Preview ${esc(f.filename)}">
         <img class="msg-image" src="${viewUrl}" alt="${esc(f.filename)}" loading="lazy">
       </button>${head}</div>`;
   }
@@ -8665,7 +8866,7 @@ function replyQuoteHtml(m) {
   if(!m.reply_to) return '';
   const quoted = findMessageAny(m.reply_to);
   if(!quoted) {
-    return `<button type="button" class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+    return `<button type="button" class="reply-quote" data-action="jump-to-message" data-msg-id="${esc(m.reply_to)}" title="Jump to the original message">
       <span class="rq-missing">Original message not loaded</span>
     </button>`;
   }
@@ -8673,7 +8874,7 @@ function replyQuoteHtml(m) {
   const body = isFile ? `File: ${quoted._file?.filename || 'Attachment'}` : (quoted.body || '');
   const snippet = body.length > 140 ? body.slice(0, 140) + '…' : body;
   const deleted = quoted.deleted_at;
-  return `<button type="button" class="reply-quote" onclick="jumpToMessage('${esc(m.reply_to)}')" title="Jump to the original message">
+  return `<button type="button" class="reply-quote" data-action="jump-to-message" data-msg-id="${esc(m.reply_to)}" title="Jump to the original message">
     <span class="rq-sender">${esc(displayName(quoted.sender_pubkey))}</span>
     <span class="rq-body">${deleted ? '<i>Message was deleted</i>' : esc(snippet)}</span>
   </button>`;
@@ -8706,8 +8907,8 @@ function messageRowHtml(m, opts) {
   });
   const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
     canReact
-      ? `<button type="button" class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}" aria-pressed="${info.mine?'true':'false'}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${emoji}')" aria-label="Toggle reaction ${emoji} (${info.count})">${emoji} ${info.count}</button>`
-      : `<span class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}">${emoji} ${info.count}</span>`
+      ? `<button type="button" class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}" aria-pressed="${info.mine?'true':'false'}" data-action="toggle-reaction" data-msg-id="${esc(m.msg_id)}" data-peer="${esc(reactionPeer)}" data-emoji="${esc(emoji)}" aria-label="Toggle reaction ${esc(emoji)} (${info.count})">${esc(emoji)} ${info.count}</button>`
+      : `<span class="reaction-chip ${info.mine?'mine':''}" title="${esc(info.peers.join(', '))}">${esc(emoji)} ${info.count}</span>`
   ).join('');
 
   const statusIcon = isOut ? msgStatus(m) : '';
@@ -8716,13 +8917,13 @@ function messageRowHtml(m, opts) {
   const canEdit = canReply && isOut;
   const canDeleteEverywhere = canReply && isOut;
   const toolsHtml = (m._isFile || (!canReact && !canReply)) ? '' : `<div class="msg-tools">
-    ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button type="button" class="reaction-btn${reactMap[e]?.mine?' mine':''}" title="React ${e}" aria-label="React ${e}" aria-pressed="${reactMap[e]?.mine?'true':'false'}" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(reactionPeer)}','${e}')">${e}</button>`).join('') : ''}
+    ${canReact ? ['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button type="button" class="reaction-btn${reactMap[e]?.mine?' mine':''}" title="React ${e}" aria-label="React ${e}" aria-pressed="${reactMap[e]?.mine?'true':'false'}" data-action="toggle-reaction" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}" data-peer="${esc(reactionPeer)}" data-emoji="${e}">${e}</button>`).join('') : ''}
     ${(canReact && canReply) ? '<span class="tools-sep"></span>' : ''}
-    ${canReply ? `<button type="button" class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" onclick="event.stopPropagation();startReply('${esc(m.msg_id)}')">${icon('reply')}</button>` : ''}
-    ${canReply ? `<button type="button" class="msg-tool-btn" title="Copy text" aria-label="Copy message text" onclick="event.stopPropagation();copyMessage('${esc(m.msg_id)}')">${icon('copy')}</button>` : ''}
-    ${canEdit ? `<button type="button" class="msg-tool-btn" title="Edit message" aria-label="Edit this message" onclick="event.stopPropagation();startEdit('${esc(m.msg_id)}')">${icon('edit')}</button>` : ''}
-    ${canDeleteEverywhere ? `<button type="button" class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" onclick="event.stopPropagation();deleteMessageEverywhereUi('${esc(m.msg_id)}')">${icon('trash')}</button>` : ''}
-    ${!m._isFile && !tombstone ? `<button type="button" class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" onclick="event.stopPropagation();deleteMessageLocally('${esc(m.msg_id)}')">${icon('x')}</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Reply (quote this message)" aria-label="Reply to this message" data-action="reply" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}">${icon('reply')}</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-tool-btn" title="Copy text" aria-label="Copy message text" data-action="copy" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}">${icon('copy')}</button>` : ''}
+    ${canEdit ? `<button type="button" class="msg-tool-btn" title="Edit message" aria-label="Edit this message" data-action="edit" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}">${icon('edit')}</button>` : ''}
+    ${canDeleteEverywhere ? `<button type="button" class="msg-tool-btn danger" title="Delete for everyone" aria-label="Delete this message for everyone" data-action="delete-everywhere" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}">${icon('trash')}</button>` : ''}
+    ${!m._isFile && !tombstone ? `<button type="button" class="msg-tool-btn danger" title="Delete locally only" aria-label="Delete this message locally" data-action="delete-local" data-stop-prop="1" data-msg-id="${esc(m.msg_id)}">${icon('x')}</button>` : ''}
   </div>`;
 
   const editedLabel = (!m._isFile && m.edited_at && !tombstone)
@@ -8740,11 +8941,11 @@ function messageRowHtml(m, opts) {
   const sameGroup = m.sender_pubkey === lastSender;
 
   const metaActions = (m._isFile || tombstone) ? '' : `<div class="msg-actions">
-    ${canReply ? `<button type="button" class="msg-action-btn" title="Reply to this message" onclick="startReply('${esc(m.msg_id)}')">Reply</button>` : ''}
-    ${canReply ? `<button type="button" class="msg-action-btn" title="Copy message text" onclick="copyMessage('${esc(m.msg_id)}')">Copy</button>` : ''}
-    ${canEdit ? `<button type="button" class="msg-action-btn" title="Edit this message" onclick="startEdit('${esc(m.msg_id)}')">Edit</button>` : ''}
-    ${canDeleteEverywhere ? `<button type="button" class="msg-action-btn" title="Delete for everyone" onclick="deleteMessageEverywhereUi('${esc(m.msg_id)}')">Delete all</button>` : ''}
-    <button type="button" class="msg-action-btn" title="Delete from this device only" onclick="deleteMessageLocally('${esc(m.msg_id)}')">Local</button>
+    ${canReply ? `<button type="button" class="msg-action-btn" title="Reply to this message" data-action="reply" data-msg-id="${esc(m.msg_id)}">Reply</button>` : ''}
+    ${canReply ? `<button type="button" class="msg-action-btn" title="Copy message text" data-action="copy" data-msg-id="${esc(m.msg_id)}">Copy</button>` : ''}
+    ${canEdit ? `<button type="button" class="msg-action-btn" title="Edit this message" data-action="edit" data-msg-id="${esc(m.msg_id)}">Edit</button>` : ''}
+    ${canDeleteEverywhere ? `<button type="button" class="msg-action-btn" title="Delete for everyone" data-action="delete-everywhere" data-msg-id="${esc(m.msg_id)}">Delete all</button>` : ''}
+    <button type="button" class="msg-action-btn" title="Delete from this device only" data-action="delete-local" data-msg-id="${esc(m.msg_id)}">Local</button>
   </div>`;
 
   return `
@@ -8759,7 +8960,7 @@ function messageRowHtml(m, opts) {
       <div class="msg-meta">
         <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
         ${statusIcon}
-        ${!isOut && !m.read_at && !tombstone ? `<button type="button" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}','${esc(m.group_id||'')}')">mark read</button>` : ''}
+        ${!isOut && !m.read_at && !tombstone ? `<button type="button" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" data-action="mark-read" data-msg-id="${esc(m.msg_id)}" data-peer="${esc(m.sender_pubkey)}" data-group-id="${esc(m.group_id||'')}">mark read</button>` : ''}
         ${metaActions}
       </div>
     </div>
@@ -9044,7 +9245,7 @@ function renderChatHeader() {
             ${f?.blocked
               ? `<button type="button" class="btn btn-secondary btn-sm" onclick="blockFriend(false)">Unblock</button>`
               : `<button type="button" class="btn btn-danger btn-sm" onclick="blockFriend(true)">Block</button>`}
-            <button type="button" class="btn btn-danger btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove contact</button>
+            <button type="button" class="btn btn-danger btn-sm" data-action="remove-friend" data-peer="${esc(selectedTarget.id)}">Remove contact</button>
           </div>
         </details>
       </div>
@@ -9067,8 +9268,8 @@ function renderChatHeader() {
           <summary class="btn btn-secondary btn-sm" title="Group actions" aria-label="Group actions">${icon('dots')}</summary>
           <div class="header-menu-items">
             <button type="button" class="btn btn-secondary btn-sm" onclick="toggleGroupManage()">Manage members</button>
-            ${isOwner ? `<button type="button" class="btn btn-secondary btn-sm" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate group key</button>` : ''}
-            ${!isOwner ? `<button type="button" class="btn btn-danger btn-sm" onclick="leaveGroup('${esc(g.group_id)}')">Leave group</button>` : ''}
+            ${isOwner ? `<button type="button" class="btn btn-secondary btn-sm" data-action="rotate-group-key" data-group-id="${esc(g.group_id)}">Rotate group key</button>` : ''}
+            ${!isOwner ? `<button type="button" class="btn btn-danger btn-sm" data-action="leave-group" data-group-id="${esc(g.group_id)}">Leave group</button>` : ''}
           </div>
         </details>` : ''}
       </div>
@@ -9102,7 +9303,7 @@ function renderActiveInspector() {
       </div>
       <div class="inspector-actions">
         <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="connectPeer()">${secure?'Rekey':'Connect'}</button>
-        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="openSafetyModal('${esc(selectedTarget.id)}')">Safety #</button>
+        <button type="button" class="btn btn-secondary btn-sm" style="flex:1" data-action="open-safety" data-peer="${esc(selectedTarget.id)}">Safety #</button>
       </div>
     `;
   } else {
@@ -9120,8 +9321,8 @@ function renderActiveInspector() {
       <div class="inspector-actions">
         <button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="toggleGroupManage()">Members</button>
         ${isOwner
-          ? `<button type="button" class="btn btn-secondary btn-sm" style="flex:1" onclick="rotateGroupKey('${esc(g.group_id)}')">Rotate key</button>`
-          : `<button type="button" class="btn btn-danger btn-sm" style="flex:1" onclick="leaveGroup('${esc(g.group_id)}')">Leave</button>`}
+          ? `<button type="button" class="btn btn-secondary btn-sm" style="flex:1" data-action="rotate-group-key" data-group-id="${esc(g.group_id)}">Rotate key</button>`
+          : `<button type="button" class="btn btn-danger btn-sm" style="flex:1" data-action="leave-group" data-group-id="${esc(g.group_id)}">Leave</button>`}
       </div>
     `;
   }
@@ -9152,7 +9353,7 @@ function renderGroupManage() {
     return `<div class="member-row">
       <span class="role-tag">${role}</span>
       <span class="mono" title="${esc(pubkey)}">${esc(label)}</span>
-      ${canRemove ? `<button type="button" class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" onclick="removeGroupMember('${esc(g.group_id)}','${esc(pubkey)}')">${icon('x')}</button>` : ''}
+      ${canRemove ? `<button type="button" class="rm-btn" title="Remove from group" aria-label="Remove ${esc(label)} from group" data-action="remove-group-member" data-group-id="${esc(g.group_id)}" data-peer="${esc(pubkey)}">${icon('x')}</button>` : ''}
     </div>`;
   }).join('');
   if(isOwner) {
@@ -9167,7 +9368,7 @@ function renderGroupManage() {
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
         ${selectHtml}
         <input class="field" id="addMemberKey" placeholder="Or paste contact public key" style="flex:1;min-width:160px">
-        <button type="button" class="btn btn-primary btn-sm" onclick="addGroupMember('${esc(g.group_id)}')">Add member</button>
+        <button type="button" class="btn btn-primary btn-sm" data-action="add-group-member" data-group-id="${esc(g.group_id)}">Add member</button>
       </div>
     `;
   }
@@ -9672,7 +9873,7 @@ function renderSearchResults(query, results, seq) {
     const convId = m.group_id || (m.sender_pubkey === state.public_key ? m.recipient_pubkey : m.sender_pubkey) || '';
     const convLabel = m.group_id ? (state.groups.find(g=>g.group_id===m.group_id)?.name || 'Group') : friendName(convId);
     const showScope = $('searchAllScope')?.checked && convLabel;
-    return `<button type="button" class="search-result-item" onclick="jumpToMessage('${esc(m.msg_id)}','${esc(convType)}','${esc(convId)}')">
+    return `<button type="button" class="search-result-item" data-action="jump-to-message" data-msg-id="${esc(m.msg_id)}" data-conv-type="${esc(convType)}" data-conv-id="${esc(convId)}">
       <div class="search-result-meta">${esc(who)}${showScope ? ` · in ${esc(convLabel)}` : ''} · ${relTime(m.timestamp)}</div>
       <div>${highlightQuery(snippet, query)}</div>
     </button>`;
@@ -10468,6 +10669,45 @@ document.addEventListener('click', event => {
   document.querySelectorAll('.header-menu[open]').forEach(menu => {
     if(!menu.contains(event.target)) menu.removeAttribute('open');
   });
+  const stopEl = event.target?.closest?.('[data-stop-prop="1"]');
+  if(stopEl) event.stopPropagation();
+  const actionEl = event.target?.closest?.('[data-action]');
+  if(!actionEl) return;
+  const action = actionEl.dataset.action;
+  const msgId = actionEl.dataset.msgId || '';
+  const peer = actionEl.dataset.peer || '';
+  const groupId = actionEl.dataset.groupId || '';
+  if(action === 'open-lightbox') {
+    openLightbox(actionEl.dataset.viewUrl || '', actionEl.dataset.downloadUrl || '', actionEl.dataset.filename || 'attachment');
+  } else if(action === 'jump-to-message') {
+    jumpToMessage(msgId, actionEl.dataset.convType || '', actionEl.dataset.convId || '');
+  } else if(action === 'toggle-reaction') {
+    toggleReaction(msgId, peer, actionEl.dataset.emoji || '');
+  } else if(action === 'reply') {
+    startReply(msgId);
+  } else if(action === 'copy') {
+    copyMessage(msgId);
+  } else if(action === 'edit') {
+    startEdit(msgId);
+  } else if(action === 'delete-everywhere') {
+    deleteMessageEverywhereUi(msgId);
+  } else if(action === 'delete-local') {
+    deleteMessageLocally(msgId);
+  } else if(action === 'mark-read') {
+    markRead(msgId, peer, groupId);
+  } else if(action === 'remove-friend') {
+    removeFriend(peer);
+  } else if(action === 'rotate-group-key') {
+    rotateGroupKey(groupId);
+  } else if(action === 'leave-group') {
+    leaveGroup(groupId);
+  } else if(action === 'open-safety') {
+    openSafetyModal(peer);
+  } else if(action === 'remove-group-member') {
+    removeGroupMember(groupId, peer);
+  } else if(action === 'add-group-member') {
+    addGroupMember(groupId);
+  }
 });
 document.addEventListener('keydown', event => {
   // Ctrl/Cmd+F opens the conversation/global search from anywhere in the app.
@@ -10497,9 +10737,32 @@ wsConnect();
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
+def _build_ssl_server_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+    cert = Path(cert_path)
+    key = Path(key_path)
+    if not cert.is_file():
+        raise ValueError(f"TLS certificate file not found: {cert}")
+    if not key.is_file():
+        raise ValueError(f"TLS private key file not found: {key}")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+    return ctx
+
+
+def _build_ssl_client_context(ca_path: str | None) -> ssl.SSLContext:
+    if ca_path is not None:
+        ca = Path(ca_path)
+        if not ca.is_file():
+            raise ValueError(f"TLS CA bundle not found: {ca}")
+        return ssl.create_default_context(cafile=str(ca))
+    return ssl.create_default_context()
+
+
 def start_http(node: QuantumNode, host: str, port: int,
                ui_ws_port: int = UI_WS_PORT, require_http_auth: bool = False,
-               allow_iframe: bool = False) -> ThreadedHTTPServer:
+               allow_iframe: bool = False,
+               ssl_context: ssl.SSLContext | None = None) -> ThreadedHTTPServer:
     httpd = ThreadedHTTPServer((host, port), ChatHTTPHandler)
     # State lives on the server instance, not on the handler class: class
     # attributes are process-global, so starting a second node used to
@@ -10508,29 +10771,46 @@ def start_http(node: QuantumNode, host: str, port: int,
     httpd.ui_ws_port = ui_ws_port  # type: ignore[attr-defined]
     httpd.require_http_auth = require_http_auth  # type: ignore[attr-defined]
     httpd.allow_iframe = allow_iframe  # type: ignore[attr-defined]
+    httpd.ui_ws_ssl = ssl_context is not None  # type: ignore[attr-defined]
+    if ssl_context is not None:
+        httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
 
-async def start_ui_ws(node: QuantumNode, host: str, port: int) -> None:
+async def start_ui_ws(node: QuantumNode, host: str, port: int,
+                      ssl_context: ssl.SSLContext | None = None) -> None:
     websockets = require_websockets()
-    async with websockets.serve(node.handle_ui, host, port, max_size=MAX_FILE_BYTES * 2):
+    serve_kwargs: dict[str, Any] = {"max_size": MAX_FILE_BYTES * 2}
+    if ssl_context is not None:
+        serve_kwargs["ssl"] = ssl_context
+    async with websockets.serve(node.handle_ui, host, port, **serve_kwargs):
         await asyncio.Future()
 
 
-async def start_direct_peer(node: QuantumNode, host: str, port: int) -> None:
+async def start_direct_peer(node: QuantumNode, host: str, port: int,
+                            ssl_context: ssl.SSLContext | None = None) -> None:
     websockets = require_websockets()
-    async with websockets.serve(node.handle_direct_peer, host, port, max_size=MAX_FILE_BYTES * 2):
-        LOG.info("Direct peer listener on ws://%s:%d", host, port)
+    serve_kwargs: dict[str, Any] = {"max_size": MAX_FILE_BYTES * 2}
+    if ssl_context is not None:
+        serve_kwargs["ssl"] = ssl_context
+    scheme = "wss" if ssl_context is not None else "ws"
+    async with websockets.serve(node.handle_direct_peer, host, port, **serve_kwargs):
+        LOG.info("Direct peer listener on %s://%s:%d", scheme, host, port)
         await asyncio.Future()
 
 
-async def start_signaling(host: str, port: int) -> SignalingServer:
+async def start_signaling(host: str, port: int,
+                          ssl_context: ssl.SSLContext | None = None) -> SignalingServer:
     websockets = require_websockets()
     server = SignalingServer()
-    async with websockets.serve(server.handle, host, port, max_size=MAX_FILE_BYTES * 2):
-        LOG.info("Signaling server listening on ws://%s:%d", host, port)
-        print(f"Signaling server listening on ws://{host}:{port}")
+    serve_kwargs: dict[str, Any] = {"max_size": MAX_FILE_BYTES * 2}
+    if ssl_context is not None:
+        serve_kwargs["ssl"] = ssl_context
+    scheme = "wss" if ssl_context is not None else "ws"
+    async with websockets.serve(server.handle, host, port, **serve_kwargs):
+        LOG.info("Signaling server listening on %s://%s:%d", scheme, host, port)
+        print(f"Signaling server listening on {scheme}://{host}:{port}")
         try:
             await asyncio.Future()
         finally:
@@ -10575,25 +10855,52 @@ async def run_node(args: argparse.Namespace) -> None:
         except json.JSONDecodeError as exc:
             raise SystemExit(f"--ice-servers is not valid JSON: {exc}")
         os.environ["QUANTUM_CHAT_ICE_SERVERS"] = args.ice_servers
+    tls_cert = getattr(args, "tls_cert", None)
+    tls_key = getattr(args, "tls_key", None)
+    tls_ca = getattr(args, "tls_ca", None)
+    if bool(tls_cert) != bool(tls_key):
+        raise SystemExit("--tls-cert and --tls-key must be specified together")
+    server_ssl: ssl.SSLContext | None = None
+    client_ssl: ssl.SSLContext | None = None
+    try:
+        if tls_cert and tls_key:
+            server_ssl = _build_ssl_server_context(tls_cert, tls_key)
+        if tls_ca:
+            client_ssl = _build_ssl_client_context(tls_ca)
+    except ValueError as exc:
+        raise SystemExit(f"TLS configuration error: {exc}") from exc
+
     direct_url = None
+    direct_scheme = "wss" if server_ssl is not None else "ws"
     if args.enable_direct:
         advertised_host = args.direct_advertise_host or args.direct_host
-        direct_url = f"ws://{advertised_host}:{args.direct_port}"
+        direct_url = f"{direct_scheme}://{advertised_host}:{args.direct_port}"
     if args.max_storage_mb < 0:
         raise SystemExit("--max-storage-mb must be >= 0 (0 disables the quota)")
-    node = QuantumNode(args.db, args.signaling_url, direct_url=direct_url, enable_direct=args.enable_direct,
-                      max_storage_bytes=args.max_storage_mb * 1024 * 1024)
+    node_kwargs: dict[str, Any] = {
+        "direct_url": direct_url,
+        "enable_direct": args.enable_direct,
+        "max_storage_bytes": args.max_storage_mb * 1024 * 1024,
+    }
+    if client_ssl is not None:
+        node_kwargs["ssl_context"] = client_ssl
+    node = QuantumNode(args.db, args.signaling_url, **node_kwargs)
     httpd = None
+    ui_scheme = "https" if server_ssl is not None else "http"
     try:
         node.allow_remote_ui = args.allow_remote_ui
         require_http_auth = bool(args.allow_remote_ui and not getattr(args, "no_http_auth", False))
         allow_iframe = bool(getattr(args, "allow_iframe", False))
-        ui_url = f"http://{args.http_host}:{args.http_port}"
+        ui_url = f"{ui_scheme}://{args.http_host}:{args.http_port}"
         if require_http_auth:
             ui_url = f"{ui_url}?token={quote(node.ui_token)}"
-        httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
-                           require_http_auth=require_http_auth,
-                           allow_iframe=allow_iframe)
+        http_kwargs: dict[str, Any] = {
+            "require_http_auth": require_http_auth,
+            "allow_iframe": allow_iframe,
+        }
+        if server_ssl is not None:
+            http_kwargs["ssl_context"] = server_ssl
+        httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port, **http_kwargs)
     except BaseException:
         # A failed bind (port already in use is the classic case) used to
         # propagate before the cleanup below ever ran, leaving the node's
@@ -10608,7 +10915,7 @@ async def run_node(args: argparse.Namespace) -> None:
     print(f"Identity:  {node.public_key}")
     print(f"Fingerprint: {key_fingerprint(node.public_key)}")
     print(f"UI:        {ui_url}")
-    print(f"Health:    http://{args.http_host}:{args.http_port}/health")
+    print(f"Health:    {ui_scheme}://{args.http_host}:{args.http_port}/health")
     print("Press Ctrl+C to shut down cleanly.")
     if args.open_browser:
         try:
@@ -10617,15 +10924,24 @@ async def run_node(args: argparse.Namespace) -> None:
             # Headless or no default browser — not fatal, but the user asked
             # for a browser, so say why one didn't appear.
             print(f"Could not open a browser automatically ({exc}). Open {ui_url} manually.")
-    tasks = []
+    tasks: list[asyncio.Task[Any]] = []
     if args.with_signaling:
-        tasks.append(asyncio.create_task(start_signaling(args.signaling_host, args.signaling_port)))
+        sig_kwargs: dict[str, Any] = {}
+        if server_ssl is not None:
+            sig_kwargs["ssl_context"] = server_ssl
+        tasks.append(asyncio.create_task(start_signaling(args.signaling_host, args.signaling_port, **sig_kwargs)))
+    ui_ws_kwargs: dict[str, Any] = {}
+    if server_ssl is not None:
+        ui_ws_kwargs["ssl_context"] = server_ssl
     tasks.extend([
-        asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
+        asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port, **ui_ws_kwargs)),
         asyncio.create_task(node.connect_signaling_loop()),
     ])
     if args.enable_direct:
-        tasks.append(asyncio.create_task(start_direct_peer(node, args.direct_host, args.direct_port)))
+        direct_kwargs: dict[str, Any] = {}
+        if server_ssl is not None:
+            direct_kwargs["ssl_context"] = server_ssl
+        tasks.append(asyncio.create_task(start_direct_peer(node, args.direct_host, args.direct_port, **direct_kwargs)))
 
     # Install SIGINT/SIGTERM handlers so Ctrl+C and `kill <pid>` shut the
     # node down cleanly: set the cooperative shutdown flag, cancel the
@@ -10680,35 +10996,37 @@ async def run_node(args: argparse.Namespace) -> None:
             except (OSError, RuntimeError, ValueError):
                 pass
 
+    gather_task: asyncio.Future[Any] | None = None
+    stop_task: asyncio.Task[bool] | None = None
     try:
         # Race the long-lived task gather against the stop event so a
         # signal can interrupt the otherwise-blocking gather. Using gather
         # alone would let a single Ctrl+C turn into a noisy traceback.
         gather_task = asyncio.ensure_future(asyncio.gather(*tasks))
-        stop_task = asyncio.ensure_future(stop_event.wait())
-        done, pending = await asyncio.wait({gather_task, stop_task},
-                                           return_when=asyncio.FIRST_COMPLETED)
+        stop_task = asyncio.create_task(stop_event.wait())
+        wait_set: set[asyncio.Future[Any]] = {gather_task, stop_task}
+        done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
         # If gather completed (e.g. one task errored), surface its exception.
         for d in done:
             if d is gather_task and not d.cancelled():
-                exc = d.exception()
-                if exc:
-                    raise exc
+                task_exc = d.exception()
+                if task_exc:
+                    raise task_exc
     except (KeyboardInterrupt, asyncio.CancelledError):
         _request_stop()
     finally:
         # Cancel the stop helper if it's still pending (signal didn't fire).
-        if 'stop_task' in locals() and not stop_task.done():
+        if stop_task is not None and not stop_task.done():
             stop_task.cancel()
         await _cleanup_runtime_tasks(tasks)
         # If the stop event won the race while a long-lived task failed at the
         # same moment, its exception would otherwise never be retrieved
         # ("Task exception was never retrieved" noise at loop close).
-        if 'gather_task' in locals() and gather_task.done() and not gather_task.cancelled():
-            exc = gather_task.exception()
-            if exc:
+        if gather_task is not None and gather_task.done() and not gather_task.cancelled():
+            bg_exc = gather_task.exception()
+            if bg_exc:
                 LOG.warning("Background task failed during shutdown: %s: %s",
-                            type(exc).__name__, exc)
+                            type(bg_exc).__name__, bg_exc)
         # Shutdown steps are independent: one failure must not skip the rest,
         # but a database that refuses to close can mean unflushed writes, so
         # none of these are swallowed silently.
@@ -10740,15 +11058,115 @@ async def run_node(args: argparse.Namespace) -> None:
         print("Goodbye.")
 
 
+def run_self_check(args: argparse.Namespace) -> int:
+    """Verify runtime environment, post-quantum cryptography, AEAD, and local storage."""
+    print(f"{APP_NAME} v{VERSION} — self-check")
+    failures = 0
+
+    py_ver = sys.version_info
+    py_str = f"{py_ver.major}.{py_ver.minor}.{py_ver.micro}"
+    if py_ver >= (3, 10):
+        print(f"[ok] Python {py_str}")
+    else:
+        print(f"[fail] Python {py_str} (< 3.10)")
+        failures += 1
+
+    try:
+        import cryptography as _crypto_pkg
+        print(f"[ok] cryptography {getattr(_crypto_pkg, '__version__', 'installed')}")
+    except Exception as exc:
+        print(f"[fail] cryptography unavailable: {exc}")
+        failures += 1
+
+    try:
+        ws_mod = require_websockets()
+        print(f"[ok] websockets {getattr(ws_mod, '__version__', 'installed')}")
+    except SystemExit as exc:
+        print(f"[fail] websockets unavailable: {exc}")
+        failures += 1
+
+    try:
+        pq = PQModule()
+        print(f"[ok] pqcrypto signing={pq.sign_mod.__name__} kem={pq.kem_mod.__name__}")
+        pk, sk = pq.sign_keypair()
+        msg = b"quantum-chat-self-check-signature"
+        sig = pq.sign(sk, msg)
+        if not pq.verify(pk, msg, sig):
+            raise RuntimeError("Valid signature failed verification")
+        if pq.verify(pk, msg + b"x", sig):
+            raise RuntimeError("Tampered message unexpectedly verified")
+        print("[ok] ML-DSA signature & tamper-rejection roundtrip")
+        kem_pk, kem_sk = pq.kem_keypair()
+        ct, ss1 = pq.encapsulate(kem_pk)
+        ss2 = pq.decapsulate(kem_sk, ct)
+        if ss1 != ss2 or len(ss1) < 16:
+            raise RuntimeError("ML-KEM encapsulation mismatch")
+        print("[ok] ML-KEM-512 key encapsulation roundtrip")
+        suite = QuantumCrypto()
+        aead_key = secrets.token_bytes(32)
+        blob = suite.encrypt(aead_key, b"self-check-payload", b"self-check-aad")
+        if suite.decrypt(aead_key, blob, b"self-check-aad") != b"self-check-payload":
+            raise RuntimeError("AES-256-GCM roundtrip mismatch")
+        print("[ok] AES-256-GCM authenticated encryption roundtrip")
+    except (Exception, SystemExit) as exc:
+        print(f"[fail] Post-quantum cryptography check failed: {exc}")
+        failures += 1
+
+    try:
+        db = Database(":memory:", master_key=secrets.token_bytes(32))
+        db.close()
+        print(f"[ok] SQLite schema v{SCHEMA_VERSION} initialization & encrypted DB handle")
+    except Exception as exc:
+        print(f"[fail] SQLite self-check failed: {exc}")
+        failures += 1
+
+    tls_cert = getattr(args, "tls_cert", None)
+    tls_key = getattr(args, "tls_key", None)
+    tls_ca = getattr(args, "tls_ca", None)
+    if tls_cert or tls_key:
+        if not (tls_cert and tls_key):
+            print("[fail] --tls-cert and --tls-key must be passed together")
+            failures += 1
+        else:
+            try:
+                _build_ssl_server_context(tls_cert, tls_key)
+                print("[ok] TLS server certificate & key validated")
+            except ValueError as exc:
+                print(f"[fail] TLS server config invalid: {exc}")
+                failures += 1
+    if tls_ca:
+        try:
+            _build_ssl_client_context(tls_ca)
+            print("[ok] TLS CA bundle validated")
+        except ValueError as exc:
+            print(f"[fail] TLS CA bundle invalid: {exc}")
+            failures += 1
+
+    db_path = Path(args.db)
+    parent = db_path.parent if str(db_path.parent) else Path(".")
+    if db_path.exists():
+        print(f"[info] Configured DB exists: {db_path}")
+    elif parent.exists() and os.access(parent, os.W_OK):
+        print(f"[ok] Configured DB parent writable: {parent}")
+    else:
+        print(f"[warn] Configured DB directory not writable or missing: {parent}")
+
+    return 0 if failures == 0 else 1
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=f"Quantum Chat v{VERSION} — post-quantum P2P encrypted chat"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--check", action="store_true",
+                        help="run environment, post-quantum cryptography, and database self-checks and exit")
     sub = parser.add_subparsers(dest="command")
     signal_cmd = sub.add_parser("signal", help="run only the signaling/relay server")
     signal_cmd.add_argument("--host", default=SIGNALING_HOST)
     signal_cmd.add_argument("--port", type=int, default=SIGNALING_PORT)
+    signal_cmd.add_argument("--tls-cert", default=None, help="PEM certificate file for WSS relay server")
+    signal_cmd.add_argument("--tls-key", default=None, help="PEM private key file for WSS relay server")
 
     parser.add_argument("--db", default=DB_FILE)
     parser.add_argument("--signaling-url", default=None)
@@ -10760,6 +11178,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--http-port", type=int, default=HTTP_PORT)
     parser.add_argument("--ui-ws-host", default=UI_WS_HOST)
     parser.add_argument("--ui-ws-port", type=int, default=UI_WS_PORT)
+    parser.add_argument("--tls-cert", default=None, help="PEM certificate file to enable HTTPS/WSS listeners")
+    parser.add_argument("--tls-key", default=None, help="PEM private key file to enable HTTPS/WSS listeners")
+    parser.add_argument("--tls-ca", default=None, help="PEM CA bundle for verifying peer/relay WSS certificates")
     parser.add_argument("--allow-remote-ui", action="store_true",
                         help="allow binding HTTP/UI WebSocket to non-local interfaces and require token auth for non-root HTTP routes")
     parser.add_argument("--no-http-auth", action="store_true",
@@ -10794,10 +11215,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(open_browser=True)
     args = parser.parse_args(argv)
+    tls_scheme = "wss" if (getattr(args, "tls_cert", None) and getattr(args, "tls_key", None)) else "ws"
     if args.signaling_url is None:
         if args.with_signaling:
             sig_host = "127.0.0.1" if args.signaling_host in {"0.0.0.0", "::"} else args.signaling_host
-            args.signaling_url = f"ws://{sig_host}:{args.signaling_port}"
+            args.signaling_url = f"{tls_scheme}://{sig_host}:{args.signaling_port}"
         else:
             args.signaling_url = DEFAULT_SIGNALING_URL
     return args
@@ -10809,8 +11231,15 @@ def main(argv: list[str] | None = None) -> None:
         level=getattr(logging, args.log_level, logging.WARNING),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    if getattr(args, "check", False):
+        raise SystemExit(run_self_check(args))
     if args.command == "signal":
-        asyncio.run(start_signaling(args.host, args.port))
+        sig_cert = getattr(args, "tls_cert", None)
+        sig_key = getattr(args, "tls_key", None)
+        if bool(sig_cert) != bool(sig_key):
+            raise SystemExit("--tls-cert and --tls-key must be specified together")
+        sig_ssl = _build_ssl_server_context(sig_cert, sig_key) if (sig_cert and sig_key) else None
+        asyncio.run(start_signaling(args.host, args.port, ssl_context=sig_ssl))
     else:
         asyncio.run(run_node(args))
 
